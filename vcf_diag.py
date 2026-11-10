@@ -54,7 +54,7 @@ import time
 import urllib.parse
 import webbrowser
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 # ----------------------------------------------------------------------------
 # Diagnostic catalog
@@ -431,6 +431,8 @@ INVENTORY_TEMPLATE = """\
 #   kubectl    = /path/to/kubectl   k8s only; default "kubectl"
 
 [settings]
+# anonymize = no      keep real names and addresses in reports (secrets are still redacted)
+# max_lines = 200     output lines kept per check
 # Extra DNS domains to scrub (domains of inventory hosts are learned automatically).
 extra_domains =
 # Extra words to scrub everywhere: company name, site codes, project names ...
@@ -706,8 +708,10 @@ OBJECT_CATS = {"datastore": "datastore", "portgroup": "portgroup", "dvs": "dvs",
 
 
 class Scrubber:
-    def __init__(self, mapping, extra_domains=(), terms=(), keep_literals=(), keep_namespaces=()):
+    def __init__(self, mapping, extra_domains=(), terms=(), keep_literals=(), keep_namespaces=(),
+                 anonymize=True):
         self.m = mapping
+        self.anonymize = anonymize      # False: only secrets are redacted
         self.env_domains = set()
         self.keep_literals = set(keep_literals)
         self.version_literals = set()
@@ -971,6 +975,9 @@ class Scrubber:
         t = RX_HASH.sub(lambda m: self._tok("[REDACTED-HASH]"), t)
         t = RX_SSHKEY.sub(lambda m: self._tok("[REDACTED-KEY]"), t)
         t = RX_BLOB.sub(lambda m: self._tok("[REDACTED-ENCODED-DATA]"), t)
+        if not self.anonymize:
+            toks = self._toks
+            return TOK_RX.sub(lambda m: toks[int(m.group(0)[1:-1])], t)
         t = self._sub(RX_SSHFP, lambda m: self._tok(self.m.get("thumbprint", m.group(0))), t)
         # 2. identifiers that may contain a host name: replace them as a whole first
         t = self._sub(RX_IQN, lambda m: self._tok(self.m.get("iqn", m.group(0))), t)
@@ -1779,7 +1786,9 @@ def run_plan(ctx, plan, scrubber, ui=None):
         sec = item["sec"]
         targets = []
         for addr in item["hosts"]:
-            if is_ip(addr):
+            if not scrubber.anonymize:
+                ph = addr
+            elif is_ip(addr):
                 ph = scrubber.m.get("target", addr, prefix=sec["prefix"], width=2)
                 if is_plain_ipv4(addr):
                     scrubber.m.ipv4(addr)
@@ -1879,7 +1888,8 @@ def mgmt_followup(ctx, item, targets, cluster_groups, cred, scrubber, progress):
         if ip and ip not in known:
             known.add(ip)
             scrubber.m.ipv4(ip) if is_plain_ipv4(ip) else None
-            ph = scrubber.learn_host(cols[0], prefix=sec["prefix"] + "-worker") or ip
+            ph = (scrubber.learn_host(cols[0], prefix=sec["prefix"] + "-worker") if scrubber.anonymize
+                  else "%s (%s)" % (cols[0], ip)) or ip
             w = Target(ctx, sec, ip, ph)
             w.user, w.password, w.su_password = cred
             workers.append(w)
@@ -1963,11 +1973,18 @@ An UPPERCASE placeholder means the original was written in upper case. Loopback,
 multicast addresses and netmasks are left as they are."""
 
 
+LEGEND_PLAIN = """\
+This report is **not anonymized**: host names, domains and addresses are real. Only secrets
+(passwords, tokens, keys, certificate bodies) are replaced by `[REDACTED...]`. Keep it inside
+the organisation."""
+
+
 def build_report(ctx, done, scrubber, started, max_lines, kind="health", title=""):
     S = scrubber.scrub
     out = []
     w = out.append
-    w("# VCF anonymized %s report" % ("follow-up" if kind == "followup" else "diagnostic"))
+    w("# VCF %s%s report" % ("anonymized " if scrubber.anonymize else "",
+                            "follow-up" if kind == "followup" else "diagnostic"))
     w("")
     w("- Generated: %s UTC" % started.strftime("%Y-%m-%d %H:%M:%S"))
     w("- Tool: vcf_diag %s, Python %s, %s" % (VERSION, sys.version.split()[0], ctx.ssh_banner))
@@ -1978,11 +1995,11 @@ def build_report(ctx, done, scrubber, started, max_lines, kind="health", title="
     w("")
     w("## How to read this report")
     w("")
-    w(LEGEND)
+    w(LEGEND if scrubber.anonymize else LEGEND_PLAIN)
     w("")
     w("## How to reply (for the analyst)")
     w("")
-    w(ANALYST_GUIDE)
+    w(ANALYST_GUIDE if scrubber.anonymize else ANALYST_GUIDE.replace(ANALYST_INTRO, ANALYST_INTRO_PLAIN))
     w("")
     w("## Summary")
     w("")
@@ -2034,6 +2051,8 @@ def build_report(ctx, done, scrubber, started, max_lines, kind="health", title="
                 name = scrubber.m.lookup("host", short) or t.ph
                 if dom:
                     name += "." + (scrubber.m.lookup("domain", dom) or "domain-unknown")
+                if not scrubber.anonymize:
+                    name = t.identity[0]
                 info.append("reports its own name as `%s`" % name)
             w("Connection: " + ", ".join(info) + ".")
             for note in t.notes:
@@ -2053,7 +2072,7 @@ def build_report(ctx, done, scrubber, started, max_lines, kind="health", title="
                 w("**%s** (%s, %.1fs)" % (S(r["label"]), status, r["dur"]))
                 w("")
                 w("`$ %s`" % S(r["cmd"]).replace("`", "'"))
-                body = S(clip(r["out"], r["spec"]["max_lines"] or max_lines)).strip("\n")
+                body = S(clip(r["out"], max(r["spec"]["max_lines"] or max_lines, max_lines))).strip("\n")
                 if not body.strip():
                     body = "(no output)"
                 f = fence(body)
@@ -2073,16 +2092,22 @@ def build_report(ctx, done, scrubber, started, max_lines, kind="health", title="
 def review_data(scrubber, text):
     """Local privacy check of finished text. The result contains real values:
     show it to the person running the tool, never put it in a report."""
+    if not scrubber.anonymize:
+        return {"hits": [], "quads": [], "known": 0, "anonymized": False}
     quads = {}
     for m in RX_DOTTED_QUAD.finditer(text):
         if is_plain_ipv4(m.group(0)):
             quads[m.group(0)] = quads.get(m.group(0), 0) + 1
-    return {"hits": sorted(scrubber.leak_check(text).items(), key=lambda kv: -kv[1]),
+    return {"anonymized": True, "hits": sorted(scrubber.leak_check(text).items(), key=lambda kv: -kv[1]),
             "quads": sorted(quads.items()),
             "known": sum(len(v) for c, v in scrubber.m.maps.items() if c != "ipv4net")}
 
 
 def print_review(data):
+    if not data.get("anonymized", True):
+        print("\nNot anonymized: the report contains real host names and addresses (secrets are redacted).")
+        print("  Keep it inside the organisation.")
+        return
     print("\nPrivacy check of the written report")
     if data["hits"]:
         print("  WARNING: %d known real value(s) are still present. Review before sharing:" % len(data["hits"]))
@@ -2107,7 +2132,19 @@ def review(scrubber, text):
 # ----------------------------------------------------------------------------
 # Commands
 # ----------------------------------------------------------------------------
+def anonymize_enabled(args, settings):
+    if getattr(args, "no_anonymize", False):
+        return False
+    return (settings.get("anonymize") or "yes").strip().lower() not in ("no", "false", "off", "0")
+
+
+def max_lines_for(args, settings):
+    return args.max_lines or _clamp(settings.get("max_lines"), 200, 20, 100000)
+
+
 def make_scrubber(args, settings):
+    if not anonymize_enabled(args, settings):
+        return Scrubber(Mapping(None), anonymize=False)     # no mapping is kept either
     os.makedirs(args.private_dir, mode=0o700, exist_ok=True)
     mapping = Mapping(os.path.join(args.private_dir, "mapping.json"))
     return Scrubber(mapping,
@@ -2224,7 +2261,7 @@ def collect_and_report(args, settings, sections, plan, ui, on_context=None, kind
         if ctx.cancel.is_set():
             return None
         learn_from_results(done, scrubber)
-        report = build_report(ctx, done, scrubber, started, args.max_lines, kind=kind, title=title)
+        report = build_report(ctx, done, scrubber, started, max_lines_for(args, settings), kind=kind, title=title)
         scrubber.m.save()
         os.makedirs(args.output_dir, exist_ok=True)
         path = os.path.join(args.output_dir, "vcf-%s-%s.md" % (
@@ -2292,7 +2329,8 @@ def print_result(args, res):
     print("Hosts:   %d collected, %d not collected" % (res["total"] - res["failed"], res["failed"]))
     if len(report) > 1500000:
         print("Note:    this is a large report. Consider collecting one component group at a time.")
-    print("Mapping: %s  (PRIVATE - never share)" % os.path.join(args.private_dir, "mapping.json"))
+    if res["review"].get("anonymized", True):
+        print("Mapping: %s  (PRIVATE - never share)" % os.path.join(args.private_dir, "mapping.json"))
     print("\nOpen the report and skim it before sharing. Use --decode to translate an analysis back.")
 
 
@@ -2300,10 +2338,14 @@ def print_result(args, res):
 # Analyst replies: follow-up diagnostics (run, read-only) and fixes (translated
 # for the person to apply by hand - this tool never runs a fix)
 # ----------------------------------------------------------------------------
-ANALYST_GUIDE = """\
+ANALYST_INTRO = """\
 The person who sent this report works in an isolated environment. Their tool translates your
 reply back to real names, so always refer to hosts, addresses, domains and objects by the
-placeholders exactly as they appear here. Write your analysis as normal prose. When you need
+placeholders exactly as they appear here."""
+ANALYST_INTRO_PLAIN = """\
+The person who sent this report works in an isolated environment. Refer to hosts by the names
+used in the section headings of this report (the names in the inventory)."""
+ANALYST_GUIDE = ANALYST_INTRO + """ Write your analysis as normal prose. When you need
 more data, or want to propose changes, add one fenced block like this to your reply:
 
 ````text
@@ -2328,7 +2370,7 @@ note: vCenter is unavailable for about two minutes. No rollback needed.
 
 Rules for the block:
 
-- `target=` takes one or more host placeholders from this report, comma separated, or
+- `target=` takes one or more hosts from this report, comma separated, or
   `@group` for every host of a group (the group names are the `[...]` section headings below).
 - `[collect]` steps must only read. The tool shows them to the person, runs them after they
   confirm, and returns the anonymized output as a follow-up report. A step that looks as if it
@@ -2510,13 +2552,20 @@ def prepare_plan(args, text):
     if not inv:
         die("no inventory file found - the reply refers to hosts in your inventory")
     settings, sections, _ = load_inventory(inv)
-    mapping = Mapping(os.path.join(args.private_dir, "mapping.json"))
-    dec = Decoder(mapping)
-    if not dec.rev:
+    plain = not anonymize_enabled(args, settings)
+    mapping = Mapping(None if plain else os.path.join(args.private_dir, "mapping.json"))
+    dec = (lambda x: x) if plain else Decoder(mapping)
+    if not plain and not dec.rev:
         die("no mapping found in %s - run a collection first" % args.private_dir)
     known, by_addr = {}, {}
     for s in sections:
         for addr in s["hosts"]:
+            if plain:
+                by_addr[(s["name"], addr)] = addr
+                known.setdefault(addr.lower(), (s, addr, addr))
+                if not is_ip(addr):
+                    known.setdefault(addr.lower().split(".")[0], (s, addr, addr))
+                continue
             ph = mapping.lookup("target", addr) or (None if is_ip(addr) else mapping.lookup("host", addr.split(".")[0]))
             by_addr[(s["name"], addr)] = ph or "not in a report yet"
             if ph:
@@ -2538,8 +2587,8 @@ def prepare_plan(args, text):
                     resolved += [(sec, a, by_addr[(sec["name"], a)]) for a in sec["hosts"]]
                 else:
                     unknown.append(tok)
-            elif tok.lower().split(".")[0] in known:
-                resolved.append(known[tok.lower().split(".")[0]])
+            elif tok.lower() in known or (not is_ip(tok) and tok.lower().split(".")[0] in known):
+                resolved.append(known.get(tok.lower()) or known[tok.lower().split(".")[0]])
             else:
                 unknown.append(tok)
         resolved = list({(s["name"], a): (s, a, ph) for s, a, ph in resolved}.values())
@@ -2744,6 +2793,8 @@ td.mono { font-family: ui-monospace, Menlo, monospace; font-size: 13px; overflow
 
 <section id="tab-collect">
   <div id="problem" class="note bad" hidden></div>
+  <div id="plainMode" class="note warn" hidden>Anonymization is off (<code>anonymize = no</code> in the
+    inventory): reports keep real host names and addresses. Only secrets are redacted.</div>
   <div id="empty" class="note warn" hidden>
     The inventory has no hosts yet. Click <b>Edit inventory</b> and list your hosts under the matching sections.
   </div>
@@ -2757,7 +2808,7 @@ td.mono { font-family: ui-monospace, Menlo, monospace; font-size: 13px; overflow
         <label class="f">Hosts contacted at the same time
           <input type="number" id="optParallel" min="1" max="16" value="4"></label>
         <label class="f">Output lines kept per check
-          <input type="number" id="optLines" min="20" max="5000" value="200"></label>
+          <input type="number" id="optLines" min="20" max="100000" value="200"></label>
         <label class="f" style="display:flex;gap:8px;align-items:center;margin-top:22px;color:var(--ink)">
           <input type="checkbox" id="optStrict"> Only connect to hosts already in known_hosts</label>
       </div>
@@ -2956,6 +3007,7 @@ async function loadState() {
   $("#empty").hidden = !!st.error || sections.length > 0;
   $("#optParallel").value = st.parallel;
   $("#optLines").value = st.max_lines;
+  $("#plainMode").hidden = st.anonymize !== false;
   renderGroups();
   updateHint();
   if (st.busy) startPolling();
@@ -3034,7 +3086,10 @@ $("#credSkip").onclick = () => { api("answer", { skip: true }).catch(() => {}); 
 
 function privacyNote(box, rv) {
   box.textContent = "";
-  if (rv.hits.length) {
+  if (rv.anonymized === false) {
+    box.append(el("div", { className: "note warn", textContent: "Not anonymized: this text contains real host " +
+      "names and addresses. Only secrets were redacted. Keep it inside the organisation." }));
+  } else if (rv.hits.length) {
     const n = el("div", { className: "note bad" },
       el("b", { textContent: rv.hits.length + " known real value" + (rv.hits.length === 1 ? " is" : "s are") +
         " still readable. Do not share yet." }),
@@ -3273,7 +3328,8 @@ class Gui:
     # ---- API ---------------------------------------------------------------
     def api_state(self):
         out = {"version": VERSION, "sections": [], "error": "", "busy": self.state == "running",
-               "parallel": self.args.parallel or 4, "max_lines": self.args.max_lines}
+               "parallel": self.args.parallel or 4, "max_lines": self.args.max_lines or 200,
+               "anonymize": True}
         if ssh_version()[0] is None:
             out["error"] = "The OpenSSH client 'ssh' was not found on this machine."
             return out
@@ -3287,6 +3343,8 @@ class Gui:
             return out
         if not self.args.parallel:
             out["parallel"] = int(settings.get("parallel", 4))
+        out["max_lines"] = max_lines_for(self.args, settings)
+        out["anonymize"] = anonymize_enabled(self.args, settings)
         for s in sections:
             out["sections"].append({
                 "name": s["name"], "title": COMPONENTS[s["type"]]["title"], "user": s["user"],
@@ -3357,7 +3415,7 @@ class Gui:
         opt = body.get("options") or {}
         args = argparse.Namespace(**vars(self.args))
         args.parallel = _clamp(opt.get("parallel") or settings.get("parallel", 4), 4, 1, 16)
-        args.max_lines = _clamp(opt.get("max_lines") or self.args.max_lines, 200, 20, 5000)
+        args.max_lines = _clamp(opt.get("max_lines") or max_lines_for(self.args, settings), 200, 20, 100000)
         args.strict_host_keys = bool(opt.get("strict")) or self.args.strict_host_keys
         return args
 
@@ -3666,7 +3724,10 @@ def main(argv=None):
     ap.add_argument("--parallel", type=int, help="hosts contacted at the same time (default 4)")
     ap.add_argument("--connect-timeout", type=int, default=15, help="SSH connect timeout in seconds")
     ap.add_argument("--timeout-scale", type=float, help="multiply every command timeout by this factor")
-    ap.add_argument("--max-lines", type=int, default=200, help="output lines kept per check (default 200)")
+    ap.add_argument("--max-lines", type=int,
+                    help="output lines kept per check (default: max_lines in the inventory, else 200)")
+    ap.add_argument("--no-anonymize", action="store_true",
+                    help="keep real names and addresses in the report (secrets are still redacted)")
     ap.add_argument("--strict-host-keys", action="store_true",
                     help="only connect to hosts already in known_hosts (default: trust on first use)")
     ap.add_argument("--scrub-file", nargs="+", metavar="FILE",

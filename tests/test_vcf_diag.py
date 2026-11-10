@@ -469,6 +469,47 @@ class ManagementCluster(unittest.TestCase):
             self.assertIn(keep, out)
 
 
+class NotAnonymized(unittest.TestCase):
+    def test_only_secrets_are_redacted(self):
+        sc = v.Scrubber(v.Mapping(None), anonymize=False)
+        sc.learn_host("esx01.corp.example-widgets.com", prefix="esxi")
+        text = "esx01.corp.example-widgets.com 10.1.1.5 00:50:56:ab:cd:ef password=hunter2 token: abc123\n"
+        sc.prescan(text)
+        sc.compile()
+        out = sc.scrub(text)
+        self.assertEqual(out, "esx01.corp.example-widgets.com 10.1.1.5 00:50:56:ab:cd:ef "
+                              "password=[REDACTED] token: [REDACTED]\n")
+        self.assertFalse(v.review_data(sc, out)["anonymized"])
+
+    def test_switch_and_line_limit_from_settings(self):
+        import argparse
+        args = argparse.Namespace(no_anonymize=False, max_lines=None, private_dir="unused")
+        self.assertTrue(v.anonymize_enabled(args, {}))
+        self.assertFalse(v.anonymize_enabled(args, {"anonymize": "no"}))
+        self.assertFalse(v.make_scrubber(args, {"anonymize": "no"}).anonymize)
+        self.assertEqual(v.max_lines_for(args, {"max_lines": "5000"}), 5000)
+        self.assertEqual(v.max_lines_for(args, {}), 200)
+        args.no_anonymize, args.max_lines = True, 300
+        self.assertFalse(v.anonymize_enabled(args, {}))
+        self.assertEqual(v.max_lines_for(args, {"max_lines": "5000"}), 300)
+
+    def test_plan_uses_real_names_without_a_mapping(self):
+        import argparse
+        with tempfile.TemporaryDirectory() as d:
+            inv = os.path.join(d, "inventory.ini")
+            with open(inv, "w") as fh:
+                fh.write("[settings]\nanonymize = no\n[vcenter]\nhosts = vc01.corp.example-widgets.com\n"
+                         "[esxi]\nhosts = 10.1.1.5, 10.1.1.6\n")
+            args = argparse.Namespace(inventory=inv, private_dir=os.path.join(d, "none"))
+            reply = ("```vcf-plan\n[collect] target=vc01\nrun: uptime\n[collect] target=10.1.1.6\nrun: uptime\n"
+                     "[fix] target=@esxi\nrun: /etc/init.d/hostd restart\n```")
+            prep = v.prepare_plan(args, reply)
+            self.assertEqual(prep["problems"], [])
+            self.assertEqual([e["targets"][0]["address"] for e in prep["collect"]],
+                             ["vc01.corp.example-widgets.com", "10.1.1.6"])
+            self.assertEqual([t["address"] for t in prep["manual"][0]["targets"]], ["10.1.1.5", "10.1.1.6"])
+
+
 class GuiApi(unittest.TestCase):
     """The browser GUI's local web API, without contacting any host."""
 

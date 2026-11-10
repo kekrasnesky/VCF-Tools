@@ -197,6 +197,26 @@ version numbers so you can confirm none is an address.
 Anonymization is pattern based. It is thorough, not infallible: free text can contain an
 identifying word the tool has never seen. **Read the report before you send it.**
 
+### Turning anonymization off
+
+When reports stay inside your organisation (for example for an internal AI), set in the
+inventory:
+
+```ini
+[settings]
+anonymize = no
+max_lines = 5000
+```
+
+or run once with `--no-anonymize`. Reports then keep real host names, domains and addresses,
+headings use the inventory names, and workers appear with their real VM names. Passwords,
+tokens, keys and certificate bodies are **still redacted**. No private mapping is written, and
+analyst replies are read with real names directly. The window shows a banner while this is on.
+
+`max_lines` is the number of output lines kept **per check** (default 200; checks such as the
+pod list keep more by default). With 5000, a full collection over many hosts can run to tens of
+thousands of lines in total; select fewer groups or checks if that is too much for one prompt.
+
 ### Privacy and credentials
 
 - Passwords are typed at a hidden prompt (or a password field in the window) and held in
@@ -268,7 +288,8 @@ python3 vcf_diag.py --scrub-file vpxd-excerpt.log
     --parallel N         hosts contacted at once (default 4)
     --connect-timeout S  SSH connect timeout (default 15)
     --timeout-scale X    multiply all command time limits
-    --max-lines N        output lines kept per check (default 200)
+    --max-lines N        output lines kept per check (default: max_lines setting, else 200)
+    --no-anonymize       keep real names and addresses (secrets are still redacted)
     --strict-host-keys   refuse hosts not already in known_hosts
     --plan FILE          read an analyst reply: show fixes (never run), offer read-only follow-ups
     --scrub-file FILE..  anonymize existing text files
