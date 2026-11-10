@@ -519,6 +519,7 @@ class FollowUps(unittest.TestCase):
         worker = v.Target(ctx, sec, "10.9.0.21", "w", discovered=True)
         cp = v.Target(ctx, sec, "10.9.0.11", "c")
         worker.user = cp.user = "u"
+        worker.ctl = cp.ctl = "/run/x/c1"
         self.assertIn("UserKnownHostsFile=/run/x/known_hosts_workers", worker._base())
         self.assertFalse(any("UserKnownHostsFile" in a for a in cp._base()))
         ctx.args.strict_host_keys = True
