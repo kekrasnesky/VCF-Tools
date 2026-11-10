@@ -510,6 +510,38 @@ class NotAnonymized(unittest.TestCase):
             self.assertEqual([t["address"] for t in prep["manual"][0]["targets"]], ["10.1.1.5", "10.1.1.6"])
 
 
+class FollowUps(unittest.TestCase):
+    def test_workers_get_a_per_run_known_hosts_file(self):
+        import argparse
+        import types
+        ctx = types.SimpleNamespace(rundir="/run/x", args=argparse.Namespace(strict_host_keys=False))
+        sec = {"type": "vcfmgmt", "port": 22, "ssh_options": []}
+        worker = v.Target(ctx, sec, "10.9.0.21", "w", discovered=True)
+        cp = v.Target(ctx, sec, "10.9.0.11", "c")
+        worker.user = cp.user = "u"
+        self.assertIn("UserKnownHostsFile=/run/x/known_hosts_workers", worker._base())
+        self.assertFalse(any("UserKnownHostsFile" in a for a in cp._base()))
+        ctx.args.strict_host_keys = True
+        self.assertFalse(any("UserKnownHostsFile" in a for a in worker._base()))
+
+    def test_follow_up_steps_use_sudo_and_old_placeholders_still_work(self):
+        import argparse
+        with tempfile.TemporaryDirectory() as d:
+            inv = os.path.join(d, "inventory.ini")
+            with open(inv, "w") as fh:
+                fh.write("[settings]\nanonymize = no\n[vcfmgmt:mgmt]\ncontrol_planes = 10.9.0.11\n")
+            m = v.Mapping(os.path.join(d, "private", "mapping.json"))
+            m.get("target", "10.9.0.11", prefix="vcfmgmt-mgmt", width=2)
+            m.save()
+            args = argparse.Namespace(inventory=inv, private_dir=os.path.join(d, "private"))
+            prep = v.prepare_plan(args, "```vcf-plan\n[collect] target=vcfmgmt-mgmt-01\n"
+                                        "run: journalctl -u kubelet --no-pager | tail -n 20\n```")
+            self.assertEqual(prep["problems"], [])
+            step = prep["plan"][0]["host_groups"]["10.9.0.11"][0][2][0]
+            self.assertTrue(step["sudo"])
+            self.assertEqual(step["mode"], "sh")
+
+
 class GuiApi(unittest.TestCase):
     """The browser GUI's local web API, without contacting any host."""
 

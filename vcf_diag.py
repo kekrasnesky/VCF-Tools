@@ -54,7 +54,7 @@ import time
 import urllib.parse
 import webbrowser
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 
 # ----------------------------------------------------------------------------
 # Diagnostic catalog
@@ -1298,7 +1298,8 @@ class PtyShell:
 
 
 class Target:
-    def __init__(self, ctx, section, address, placeholder):
+    def __init__(self, ctx, section, address, placeholder, discovered=False):
+        self.discovered = discovered      # a worker found through Kubernetes, not in the inventory
         self.ctx = ctx
         self.sec = section
         self.comp = COMPONENTS[section["type"]]
@@ -1325,7 +1326,10 @@ class Target:
 
     # ---- connection --------------------------------------------------------
     def _base(self):
-        return ["-S", self.ctl, "-p", str(self.sec["port"]), "-l", self.user] + self.sec["ssh_options"]
+        extra = []
+        if self.discovered and not self.ctx.args.strict_host_keys:
+            extra = ["-o", "UserKnownHostsFile=" + os.path.join(self.ctx.rundir, "known_hosts_workers")]
+        return ["-S", self.ctl, "-p", str(self.sec["port"]), "-l", self.user] + extra + self.sec["ssh_options"]
 
     def connect(self):
         self.errkind, self.errmsg = None, ""
@@ -1381,7 +1385,9 @@ class Target:
         low = err.lower()
         if "host key verification failed" in low or "identification has changed" in low or state.get("hostkey"):
             self.errkind = "hostkey"
-            self.errmsg = "SSH host key not trusted or changed (check ~/.ssh/known_hosts)"
+            self.errmsg = ("the SSH host key of this host changed or is not trusted, on the computer running "
+                           "vcf_diag (not on the target). If the host was rebuilt, remove the old key there "
+                           "with: ssh-keygen -R %s" % self.address)
         elif any(k in " ".join(state["prompts"]).lower() for k in ("new password", "expired", "current")):
             self.errkind = "auth"
             self.errmsg = "the server asked for a password change - the password has probably expired"
@@ -1560,6 +1566,8 @@ class Target:
             pre = "export KUBECONFIG=%s; " % shlex.quote(self.kube["kubeconfig"]) \
                 if self.kube["kubeconfig"] else ""
             rc, out, to = self.sh(pre + command, c["timeout"], sudo=self.kube["sudo"])
+        if c["mode"] == "sh" and c.get("sudo") and self.mode == "sh" and not self.sudo:
+            res["note"] = "sudo not available for this user: ran without it"
         res.update(rc=rc, out=out, dur=time.time() - t0)
         if to:
             res.update(status="timeout", note="timed out after %ds" % c["timeout"])
@@ -1890,7 +1898,7 @@ def mgmt_followup(ctx, item, targets, cluster_groups, cred, scrubber, progress):
             scrubber.m.ipv4(ip) if is_plain_ipv4(ip) else None
             ph = (scrubber.learn_host(cols[0], prefix=sec["prefix"] + "-worker") if scrubber.anonymize
                   else "%s (%s)" % (cols[0], ip)) or ip
-            w = Target(ctx, sec, ip, ph)
+            w = Target(ctx, sec, ip, ph, discovered=True)
             w.user, w.password, w.su_password = cred
             workers.append(w)
     if not workers:
@@ -2071,6 +2079,9 @@ def build_report(ctx, done, scrubber, started, max_lines, kind="health", title="
                     "TIMEOUT" if r["status"] == "timeout" else "exit %s" % r["rc"])
                 w("**%s** (%s, %.1fs)" % (S(r["label"]), status, r["dur"]))
                 w("")
+                if r["note"]:
+                    w("Note: " + S(r["note"]))
+                    w("")
                 w("`$ %s`" % S(r["cmd"]).replace("`", "'"))
                 body = S(clip(r["out"], max(r["spec"]["max_lines"] or max_lines, max_lines))).strip("\n")
                 if not body.strip():
@@ -2381,6 +2392,11 @@ Rules for the block:
 - One command per `run:`; continue a long command on indented lines. On Kubernetes nodes write
   `{K}` for kubectl. On NSX nodes NSX CLI commands (`get ...`) can be given directly.
 - Optional per step: `timeout:` seconds (default 60) and `lines:` output lines to keep (default 400).
+- Commands run on the target as the login user shown in each host's "Connection:" line, through
+  sudo where the tool has it. Do not add sudo yourself. Use `journalctl` and log files freely.
+- Connection problems in a report (host key, authentication, unreachable) happen on the person's
+  own computer, not on the targets. Do not ask to inspect them on a target; propose a [fix] for
+  the person to run locally instead (for a changed host key: `ssh-keygen -R <host>`).
 - Ask only for what you need: every line of output costs the person review time."""
 
 PLAN_FENCE = re.compile(r"`{3,}[ \t]*vcf-plan[^\n]*\n(.*?)`{3,}", re.S)
@@ -2553,8 +2569,10 @@ def prepare_plan(args, text):
         die("no inventory file found - the reply refers to hosts in your inventory")
     settings, sections, _ = load_inventory(inv)
     plain = not anonymize_enabled(args, settings)
-    mapping = Mapping(None if plain else os.path.join(args.private_dir, "mapping.json"))
-    dec = (lambda x: x) if plain else Decoder(mapping)
+    # Even with anonymization off, a mapping from earlier anonymized reports is used when it
+    # exists, so that a reply written against those placeholders still finds its hosts.
+    mapping = Mapping(os.path.join(args.private_dir, "mapping.json"))
+    dec = Decoder(mapping)
     if not plain and not dec.rev:
         die("no mapping found in %s - run a collection first" % args.private_dir)
     known, by_addr = {}, {}
@@ -2562,9 +2580,11 @@ def prepare_plan(args, text):
         for addr in s["hosts"]:
             if plain:
                 by_addr[(s["name"], addr)] = addr
-                known.setdefault(addr.lower(), (s, addr, addr))
-                if not is_ip(addr):
-                    known.setdefault(addr.lower().split(".")[0], (s, addr, addr))
+                keys = [addr.lower()] + ([] if is_ip(addr) else [addr.lower().split(".")[0]])
+                old = mapping.lookup("target", addr) or (None if is_ip(addr) else
+                                                         mapping.lookup("host", addr.split(".")[0]))
+                for k in keys + ([old.lower()] if old else []):
+                    known.setdefault(k, (s, addr, addr))
                 continue
             ph = mapping.lookup("target", addr) or (None if is_ip(addr) else mapping.lookup("host", addr.split(".")[0]))
             by_addr[(s["name"], addr)] = ph or "not in a report yet"
@@ -2618,7 +2638,7 @@ def prepare_plan(args, text):
         for s, a, ph in resolved:
             per_host.setdefault(s["name"], {}).setdefault(a, []).append(
                 cmd(label, entry["command"], timeout=_clamp(st["timeout"], 60, 5, 900), mode=modes[(s["name"], a)],
-                    max_lines=_clamp(st["lines"], 400, 20, 5000)))
+                    max_lines=_clamp(st["lines"], 400, 20, 5000), sudo=s.get("sudo") != "no"))
     for s in sections:
         if s["name"] in per_host:
             out["plan"].append({"sec": s, "hosts": list(per_host[s["name"]]), "groups": [],
