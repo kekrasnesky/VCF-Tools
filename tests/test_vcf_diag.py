@@ -1,0 +1,255 @@
+"""Unit tests for the anonymizer and the non-network parts of vcf_diag.
+
+Run from the repository root:  python3 -m unittest discover -s tests -v
+All names and addresses below are invented.
+"""
+import os
+import re
+import sys
+import tempfile
+import unittest
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import vcf_diag as v  # noqa: E402
+
+
+def make(terms=(), keep=("9.1.1.0",), domains=(), mapping=None):
+    sc = v.Scrubber(mapping or v.Mapping(None), extra_domains=domains, terms=terms, keep_literals=keep)
+    sc.learn_host("esx01.corp.example-widgets.com", prefix="esxi")
+    sc.learn_host("vc01.corp.example-widgets.com", prefix="vcenter")
+    return sc
+
+
+def run(sc, text):
+    sc.prescan(text)
+    sc.compile()
+    return sc.scrub(text)
+
+
+def harvest(sc, spec, text):
+    for cat, rx, split in spec["harvest"]:
+        for m in re.finditer(rx, text):
+            for val in (re.split(split, m.group(1)) if split else [m.group(1)]):
+                sc.learn(cat, val)
+
+
+def find(typ, label):
+    for _, _, cmds in v.COMPONENTS[typ]["groups"]:
+        for c in cmds:
+            if c["label"] == label:
+                return c
+    raise KeyError(label)
+
+
+class HostAndDomain(unittest.TestCase):
+    def test_fqdn_short_and_case(self):
+        out = run(make(), "esx01.corp.example-widgets.com ESX01 esx01 VC01.CORP.EXAMPLE-WIDGETS.COM")
+        self.assertEqual(out, "esxi-01.domain-01 ESXI-01 esxi-01 VCENTER-01.DOMAIN-01")
+
+    def test_unknown_host_in_known_domain(self):
+        out = run(make(), "ntp1.corp.example-widgets.com then ntp1 alone, bare corp.example-widgets.com")
+        self.assertNotIn("example-widgets", out)
+        self.assertIn("host-0001.domain-01", out)
+        self.assertIn("bare domain-01", out)
+
+    def test_short_name_inside_other_names(self):
+        out = run(make(), "esx01-vmk1 esx01_local /vmfs/volumes/esx01-ds notesx01x")
+        self.assertEqual(out, "esxi-01-vmk1 esxi-01_local /vmfs/volumes/esxi-01-ds notesx01x")
+
+    def test_generic_short_names_are_not_replaced_alone(self):
+        sc = make()
+        sc.learn_host("nsx.corp.example-widgets.com", prefix="nsxmgr")
+        out = run(sc, "nsx-proxy is running; nsx.corp.example-widgets.com")
+        self.assertIn("nsx-proxy is running", out)
+        self.assertNotIn("example-widgets", out)
+
+    def test_other_domains_and_safe_names(self):
+        out = run(make(), "mirror.partner-site.net pool.ntp.org kubernetes.default.svc.cluster.local "
+                          "administrator@vsphere.local com.vmware.vsan java.net.ConnectException "
+                          "vmware-vpostgres.service packages.broadcom.com")
+        self.assertNotIn("partner-site", out)
+        for keep in ("pool.ntp.org", "svc.cluster.local", "administrator@vsphere.local", "com.vmware.vsan",
+                     "java.net.ConnectException", "vmware-vpostgres.service", "packages.broadcom.com"):
+            self.assertIn(keep, out)
+
+    def test_email_domain(self):
+        out = run(make(), "alerts@corp.example-widgets.com")
+        self.assertEqual(out, "alerts@domain-01")
+
+
+class Addresses(unittest.TestCase):
+    def test_ipv4_networks_are_grouped(self):
+        out = run(make(), "10.1.1.5 10.1.1.6 10.1.2.5 10.1.1.5/24 10.1.1.5:443")
+        self.assertEqual(out, "ip-n1-h1 ip-n1-h2 ip-n2-h1 ip-n1-h1/24 ip-n1-h1:443")
+
+    def test_special_addresses_kept(self):
+        text = "127.0.0.1 0.0.0.0 255.255.252.0 169.254.1.1 224.1.2.3 ::1"
+        self.assertEqual(run(make(), text), text)
+
+    def test_versions_kept_addresses_hidden(self):
+        out = run(make(), 'Version: 8.0.3.0 "version":"9.0.2.0" VCF 9.1.1.0 build 9.0.0.0.24755229 '
+                          'i40en 2.9.2.0-1OEM.800 nameserver 10.9.8.7 NTP Server 10.9.8.8 Driver: 10.9.8.9')
+        for keep in ("8.0.3.0", "9.0.2.0", "9.1.1.0", "9.0.0.0.24755229", "2.9.2.0-1OEM"):
+            self.assertIn(keep, out)
+        self.assertNotIn("10.9.8.", out)
+
+    def test_version_word_on_previous_line_does_not_protect_an_address(self):
+        out = run(make(), "NAME VERSION\n10.2.2.2 Ready\nrelease\n\n10.3.3.3")
+        self.assertNotIn("10.2.2.2", out)
+        self.assertNotIn("10.3.3.3", out)
+
+    def test_dashed_and_reverse_forms(self):
+        out = run(make(), "10.20.30.41 ip-10-20-30-41.internal-zone 41.30.20.10.in-addr.arpa")
+        self.assertNotIn("10-20-30-41", out)
+        self.assertNotIn("41.30.20.10", out)
+
+    def test_ipv6_and_times(self):
+        out = run(make(), "fe80::250:56ff:feab:cdef 2001:db8:10::15 at 12:34:56 std::string")
+        self.assertIn("ip6-ll-0001", out)
+        self.assertIn("ip6-0001", out)
+        self.assertIn("12:34:56", out)
+        self.assertIn("std::string", out)
+
+    def test_mac_wwn_thumbprint(self):
+        out = run(make(), "00:50:56:ab:cd:ef 00-50-56-AB-CD-EF 20:00:00:25:b5:aa:bb:cc "
+                          "AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01 ff:ff:ff:ff:ff:ff")
+        self.assertEqual(out, "mac-0001 mac-0001 wwn-0001 thumbprint-0001 ff:ff:ff:ff:ff:ff")
+
+
+class Identifiers(unittest.TestCase):
+    def test_uuid_forms(self):
+        out = run(make(), "4c4c4544-0038-4b10-8032-b7c04f503933 5f3c2a1b-8d7e6f5a-4b3c-2a1b0c9d8e7f "
+                          "50 0e 3c 1a 2b 4d 5e 6f-70 81 92 a3 b4 c5 d6 e7")
+        self.assertEqual(out, "uuid-0001 uuid-0002 uuid-0003")
+
+    def test_devices_serials_license(self):
+        out = run(make(), "naa.600508b1001c5e3a9f2d4b7c8e1f0a2b t10.NVMe____Dell_Ent_NVMe_AGN_MU_U.2_1.6TB_____0123456789AB "
+                          "iqn.1998-01.com.vmware:esx01-4f3a2b1c\n   Serial Number: 7XK2P93\n   Asset Tag: unknown\n"
+                          "key AB1CD-EF2GH-IJ3KL-MN4OP-QR5ST")
+        for gone in ("600508b1", "0123456789AB", "4f3a2b1c", "7XK2P93", "AB1CD"):
+            self.assertNotIn(gone, out)
+        self.assertIn("naa.device-0001", out)
+        self.assertIn("Asset Tag: unknown", out)
+
+    def test_certificate_names(self):
+        out = run(make(), "subject=C = US, O = Example Widgets Inc, CN = vc01.corp.example-widgets.com\n"
+                          "issuer=CN = CA, DC = vsphere, DC = local, O = VMware")
+        self.assertNotIn("Example Widgets", out)
+        self.assertIn("CN = vcenter-01.domain-01", out)
+        self.assertIn("O = VMware", out)
+
+    def test_secrets(self):
+        out = run(make(), 'password = "Sup3r S3cret"\napi_token: abc123\nPassword expires : never\n'
+                          "Last password change : Nov 01, 2026\nhttps://svc:hunter2@10.1.1.1/x\n"
+                          "Authorization: Bearer abc.def.ghi\nroot:$6$abcdefgh$" + "x" * 40 + ":19000\n"
+                          "-----BEGIN PRIVATE KEY-----\nMIIabc\n-----END PRIVATE KEY-----\n")
+        for gone in ("Sup3r", "abc123", "hunter2", "abc.def.ghi", "MIIabc", "$6$"):
+            self.assertNotIn(gone, out)
+        self.assertIn("Password expires : never", out)
+        self.assertIn("Last password change : Nov 01, 2026", out)
+        self.assertIn("[REDACTED-PRIVATE-KEY]", out)
+
+
+class Harvest(unittest.TestCase):
+    def test_esxi_datastores_and_switches(self):
+        sc = make()
+        fs = ("Mount Point                                        Volume Name       UUID                                 Mounted  Type            Size          Free\n"
+              "/vmfs/volumes/5f3c2a1b-8d7e6f5a-4b3c-2a1b0c9d8e7f  WIDGETS-PROD-DS1  5f3c2a1b-8d7e6f5a-4b3c-2a1b0c9d8e7f     true  VMFS-6  1099511627776  549755813888\n"
+              "/vmfs/volumes/vsan:52a1b2c3d4e5f607-8899aabbccddeeff  vsanDatastore     vsan:52a1b2c3d4e5f607-8899aabbccddeeff  true  vsan   9999999999999  1111111111111\n")
+        vsw = "vSwitch0\n   Name: vSwitch0\n   Portgroups: Widgets-Backup, VM Network, Management Network\n"
+        vmk = "vmk0\n   Name: vmk0\n   Portgroup: N/A\n   VDS Name: Widgets-DSwitch-01\n   MTU: 9000\n"
+        harvest(sc, find("esxi", "Filesystems"), fs)
+        harvest(sc, find("esxi", "Standard switches"), vsw)
+        harvest(sc, find("esxi", "VMkernel interfaces"), vmk)
+        out = run(sc, fs + vsw + vmk + "df: /vmfs/volumes/WIDGETS-PROD-DS1 50%\n")
+        self.assertNotIn("widgets", out.lower())
+        for keep in ("vsanDatastore", "VM Network", "Management Network", "vSwitch0", "MTU: 9000", "Portgroup: N/A"):
+            self.assertIn(keep, out)
+        self.assertIn("/vmfs/volumes/DATASTORE-0001 50%", out)
+
+    def test_search_domains(self):
+        sc = v.Scrubber(v.Mapping(None))
+        harvest(sc, find("linux", "Resolver configuration"), "nameserver 10.1.1.53\nsearch eng.widgets-internal.io ops.widgets-internal.io\n")
+        out = run(sc, "db01.eng.widgets-internal.io and search eng.widgets-internal.io")
+        self.assertNotIn("widgets", out)
+
+    def test_kubernetes_tables(self):
+        sc = make()
+        nodes = ("NAME        STATUS   ROLES           AGE   VERSION\n"
+                 "vsr-cp-a1   Ready    control-plane   40d   v1.31.4+vmware.1\n"
+                 "vsr-cp-a2   NotReady,SchedulingDisabled control-plane 40d v1.31.4+vmware.1\n")
+        ns = "NAME STATUS AGE\nkube-system Active 40d\nprelude Active 40d\nwidgets-finance Active 3d\n"
+        pods = ("NAMESPACE NAME READY STATUS RESTARTS AGE IP NODE\n"
+                "prelude provisioning-service-app-5d9c7b6f4-x2x9z 0/1 CrashLoopBackOff 37 2d 198.18.3.14 vsr-cp-a2\n"
+                "widgets-finance ledger-api-7f6d5c4b3-abcde 1/1 Running 2 3d 198.18.3.15 vsr-cp-a1\n")
+        sc.learn_k8s("nodes", nodes)
+        sc.learn_k8s("ns", ns)
+        sc.learn_k8s("nsrows", pods)
+        out = run(sc, nodes + ns + pods)
+        for gone in ("vsr-cp-a", "widgets", "ledger-api", "198.18"):
+            self.assertNotIn(gone, out)
+        for keep in ("kube-system", "prelude provisioning-service-app-5d9c7b6f4-x2x9z", "CrashLoopBackOff 37",
+                     "v1.31.4+vmware.1", "NotReady,SchedulingDisabled"):
+            self.assertIn(keep, out)
+
+
+class MappingAndTools(unittest.TestCase):
+    def test_mapping_is_stable_across_runs_and_private(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "private", "mapping.json")
+            first = run(make(mapping=v.Mapping(path)), "esx01 10.1.1.5 corp.example-widgets.com")
+            v.Mapping(path)  # nothing saved yet
+            m = v.Mapping(path)
+            sc = make(mapping=m)
+            run(sc, "10.7.7.7 esx01 10.1.1.5")
+            m.save()
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            again = run(make(mapping=v.Mapping(path)), "10.1.1.5 esx01 10.7.7.7")
+            self.assertEqual(again, "ip-n2-h1 esxi-01 ip-n1-h1")
+            self.assertIn("esxi-01", first)
+
+    def test_leak_check_finds_known_values(self):
+        sc = make()
+        run(sc, "10.1.1.5")
+        self.assertEqual(sc.leak_check("all clean esxi-01 ip-n1-h1"), {})
+        self.assertEqual(sc.leak_check("oops esx01 and 10.1.1.5"), {"esx01": 1, "10.1.1.5": 1})
+
+    def test_selection_parser(self):
+        self.assertEqual(v.parse_selection("", 4), [0, 1, 2, 3])
+        self.assertEqual(v.parse_selection("1,3-4", 4), [0, 2, 3])
+        self.assertEqual(v.parse_selection("none", 4), [])
+        self.assertIsNone(v.parse_selection("5", 4))
+        self.assertIsNone(v.parse_selection("x", 4))
+
+    def test_inventory_and_custom_commands(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "inv.ini")
+            with open(path, "w") as fh:
+                fh.write("[settings]\nscrub_terms = Widgets, Site 7\n[esxi:mgmt]\nhosts =\n  a.example.internal\n"
+                         "  b.example.internal, 10.0.0.9\nuser = root\n[vcenter]\nhosts =\n"
+                         "[commands:esxi]\nAdvanced = esxcli system settings advanced list -d\n")
+            settings, sections, custom = v.load_inventory(path)
+            self.assertEqual(len(sections), 1)
+            self.assertEqual(sections[0]["hosts"], ["a.example.internal", "b.example.internal", "10.0.0.9"])
+            self.assertEqual(sections[0]["prefix"], "esxi-mgmt")
+            self.assertEqual(v.groups_for("esxi", custom)[-1][0], "custom")
+            self.assertIn("scrub_terms", settings)
+
+    def test_template_parses_and_clip(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "inv.ini")
+            with open(path, "w") as fh:
+                fh.write(v.INVENTORY_TEMPLATE)
+            _, sections, _ = v.load_inventory(path)
+            self.assertEqual(sections, [])
+        clipped = v.clip("\n".join(str(i) for i in range(1000)), 100)
+        self.assertEqual(len(clipped.split("\n")), 101)
+        self.assertIn("900 lines omitted", clipped)
+        self.assertEqual(v.fence("a ``` b"), "````")
+
+    def test_self_test(self):
+        self.assertEqual(v.cmd_self_test(), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

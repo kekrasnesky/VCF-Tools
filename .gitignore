@@ -1,0 +1,8 @@
+# Real hostnames, private mapping and reports never belong in git.
+inventory.ini
+*.inventory.ini
+vcf-diag-private/
+vcf-diag-output/
+__pycache__/
+*.pyc
+.DS_Store
