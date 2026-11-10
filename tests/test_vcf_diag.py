@@ -543,6 +543,27 @@ class FollowUps(unittest.TestCase):
             self.assertEqual(step["mode"], "sh")
 
 
+class Supervisor(unittest.TestCase):
+    def test_component_and_vcenter_checks(self):
+        keys = [g[0] for g in v.COMPONENTS["supervisor"]["groups"]]
+        self.assertEqual(keys[0], "k8s-supervisor")
+        self.assertIn("k8s-cluster", keys)
+        vc = [g for g in v.COMPONENTS["vcenter"]["groups"] if g[0] == "vc-supervisor"][0]
+        decrypt = [c for c in vc[2] if "decryptK8Pwd" in c["cmd"]][0]["cmd"]
+        self.assertIn("grep -iE", decrypt)          # only cluster and IP lines are kept
+
+    def test_password_line_is_redacted_even_if_printed(self):
+        out = run(make(), "Cluster: domain-c8:1234\nIP: 10.7.7.2\nPWD: Sup3rSecret!\n")
+        self.assertNotIn("Sup3rSecret", out)
+
+    def test_worker_seen_as_machine_keeps_its_node_placeholder(self):
+        sc = make()
+        sc.learn_k8s("nodes", "NAME STATUS ROLES\nwid-run-md-0-7xk2p-9zq4t Ready <none>\n", prefix="vcfmgmt-mgmt")
+        sc.learn_k8s("nsrows", "NAMESPACE NAME CLUSTER\nsvc-mgmt-ns wid-run-md-0-7xk2p-9zq4t wid-run\n")
+        out = run(sc, "node wid-run-md-0-7xk2p-9zq4t / machine wid-run-md-0-7xk2p-9zq4t")
+        self.assertEqual(out, "node vcfmgmt-mgmt-worker-01 / machine vcfmgmt-mgmt-worker-01")
+
+
 class GuiApi(unittest.TestCase):
     """The browser GUI's local web API, without contacting any host."""
 

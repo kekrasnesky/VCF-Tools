@@ -112,6 +112,7 @@ still asked), `--list` prints every check and the exact command behind it.
 | `[sddc]` | SDDC Manager | `vcf` | add `escalate = su` to also run the checks that need root |
 | `[k8s]` | Kubernetes control-plane nodes: VCF services runtime, Operations, Automation, Supervisor | `vmware-system-user` | finds a working `kubectl` on its own (plain, `KUBECONFIG=/etc/kubernetes/admin.conf`, with `sudo`) |
 | `[vcfmgmt]` | VCF management cluster (VCF services runtime) | `vmware-system-user` | list the control-plane IPs; workers are discovered; service endpoints are checked (see below) |
+| `[supervisor]` | vSphere Supervisor control plane | `root` | VKS / Cluster API clusters and machines, VM Service VMs, Supervisor services, controller errors |
 | `[linux]` | any other Linux appliance | `root` | generic OS health |
 
 A section name may carry a label, for example `[esxi:mgmt]`, `[esxi:wld01]`, `[k8s:runtime]`,
@@ -152,6 +153,20 @@ SDDC lifecycle   = instance.example.internal
   readable (`Endpoint endpoint-04: Fleet lifecycle, Salt RaaS`).
 - If your host names share a site prefix, add it to `scrub_terms` so it is replaced wherever
   it appears, also in names the tool has not seen before.
+
+### vSphere Supervisor
+
+The vCenter checks include a **Supervisor / Workload Management** group: the state of the
+Workload Control Plane (wcp) service, the Supervisor clusters with their control-plane address,
+and recent errors from `wcpsvc.log` and the ESX Agent Manager. No extra login is needed.
+
+To look inside the Supervisor itself, add its control-plane address (from that check) as a
+`[supervisor]` section and log in as `root`. The root password is printed by
+`/usr/lib/vmware-wcp/decryptK8Pwd.py` on vCenter; run that yourself; the tool keeps only the
+cluster and address lines of its output and never shows the password. The Supervisor checks
+list VKS / Cluster API clusters and machines, VM Service virtual machines, Supervisor services
+and errors from the Cluster API and VM operator controllers. A worker that appears both as a
+node and as a Cluster API machine gets the same placeholder in both places.
 
 You can add your own read-only commands per component type:
 

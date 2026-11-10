@@ -54,7 +54,7 @@ import time
 import urllib.parse
 import webbrowser
 
-VERSION = "1.4.1"
+VERSION = "1.5.0"
 
 # ----------------------------------------------------------------------------
 # Diagnostic catalog
@@ -264,6 +264,17 @@ VCENTER_GROUPS = [
             " | grep -E 'Alias|Not Before|Not After|Subject:|Issuer:'; done",
             timeout=120, max_lines=300),
     ]),
+    ("vc-supervisor", "Supervisor / Workload Management (wcp service)", [
+        cmd("Workload Control Plane service", "vmon-cli -s wcp 2>&1 | head -n 12"),
+        # The script also prints the Supervisor root password: only the cluster and IP lines are kept
+        # (and a PWD line would be redacted anyway).
+        cmd("Supervisor clusters and control-plane address",
+            "/usr/lib/vmware-wcp/decryptK8Pwd.py 2>&1 | grep -iE '^ *(cluster|ip)\\b' || echo 'no Supervisor found'"),
+        cmd("wcpsvc errors (last 150)",
+            "grep -iE 'error|fail|x509' /var/log/vmware/wcp/wcpsvc.log 2>&1 | tail -n 150", max_lines=200),
+        cmd("ESX Agent Manager errors (last 60)",
+            "grep -iE ' error |exception' /var/log/vmware/eam/eam.log 2>&1 | tail -n 60", max_lines=80),
+    ]),
     ("vc-storage", "Appliance partitions and core dumps", [
         cmd("Key partitions", "df -hP /storage/log /storage/db /storage/seat /storage/core 2>&1"),
         cmd("Core dumps", "ls -lh /storage/core 2>&1 | tail -n 15"),
@@ -349,6 +360,27 @@ MGMT_CLUSTER_GROUPS = K8S_GROUPS + [
 ]
 
 
+SUPERVISOR_GROUPS = [
+    ("k8s-supervisor", "Supervisor workloads: VKS clusters, Cluster API machines, VM Service", [
+        kctl("VKS / Cluster API clusters",
+             "{K} get clusters.cluster.x-k8s.io,tanzukubernetesclusters -A -o wide 2>&1 | head -n 120",
+             k8s="nsrows", max_lines=150),
+        kctl("Machines not Running",
+             "{K} get machines.cluster.x-k8s.io -A -o wide --no-headers 2>&1 | grep -v ' Running ' | head -n 80",
+             k8s="nsrows"),
+        kctl("All machines", "{K} get machines.cluster.x-k8s.io -A -o wide 2>&1", k8s="nsrows", max_lines=400),
+        kctl("Machine deployments and health checks",
+             "{K} get machinedeployments,machinehealthchecks -A 2>&1 | head -n 80", k8s="nsrows"),
+        kctl("VM Service virtual machines", "{K} get virtualmachines -A -o wide 2>&1", k8s="nsrows", max_lines=400),
+        kctl("Supervisor services", "{K} get supervisorservices,packageinstalls -A 2>&1 | head -n 120", k8s="nsrows"),
+        kctl("Cluster API and VM operator controller errors (best effort)",
+             "for p in $({K} get pods -A --no-headers 2>/dev/null | awk '$2 ~ /(capi|capv|capw|vmop|vm-operator)"
+             ".*controller-manager/ {print $1\"/\"$2}'); do echo \"== ${p#*/}\"; {K} logs -n \"${p%%/*}\" \"${p#*/}\" "
+             "--all-containers --tail=300 2>/dev/null | grep -iE 'error|fail' | tail -n 30; done", timeout=90, max_lines=200),
+    ]),
+]
+
+
 def endpoint_group(endpoints):
     """Checks for the VCF management service endpoints configured for a cluster."""
     if not endpoints:
@@ -396,6 +428,8 @@ COMPONENTS = {
     "vcfmgmt": {"title": "VCF management cluster (services runtime: control planes and workers)",
                 "user": "vmware-system-user", "prefix": "vcfmgmt", "sudo": "auto",
                 "groups": MGMT_CLUSTER_GROUPS + MGMT_NODE_GROUPS, "host_label": "Control planes"},
+    "supervisor": {"title": "vSphere Supervisor control plane", "user": "root", "prefix": "supervisor",
+                   "groups": SUPERVISOR_GROUPS + K8S_GROUPS + linux_groups(), "host_label": "Control-plane address"},
     "linux": {"title": "Generic Linux appliance", "user": "root", "prefix": "linux",
               "groups": linux_groups()},
 }
@@ -420,6 +454,8 @@ INVENTORY_TEMPLATE = """\
 #            Automation, Supervisor          (vmware-system-user, or root)
 #   vcfmgmt  VCF management cluster: control-plane IPs + service endpoints,
 #            workers found automatically     (vmware-system-user)
+#   supervisor  vSphere Supervisor control plane (root; the vCenter check
+#            "Supervisor clusters" shows its address)
 #   linux    Any other Linux appliance, e.g. Operations for logs / networks
 #
 # Per-section options (all optional):
@@ -477,6 +513,12 @@ hosts =
 control_planes =
 #    10.0.0.11, 10.0.0.12, 10.0.0.13
 # ssh_workers = no
+
+# vSphere Supervisor control plane. Its address is shown by the vCenter check
+# "Supervisor clusters and control-plane address". The root password comes from
+# running /usr/lib/vmware-wcp/decryptK8Pwd.py on vCenter yourself; the tool never shows it.
+[supervisor]
+hosts =
 
 # The management services that run on that cluster: service name = endpoint (FQDN,
 # short name or IP). Several services may share one endpoint. The section label must
@@ -760,6 +802,8 @@ class Scrubber:
             return None
         if re.fullmatch(r"(?i)(vSwitch|vmk|vmnic|vusb|eth|ens)\d+", v):
             return None
+        if cat == "k8sobj" and self.m.lookup("host", v):
+            return self.m.lookup("host", v)
         return self.m.get(cat, v, prefix=OBJECT_CATS.get(cat, cat), width=4)
 
     def learn(self, cat, value):
@@ -818,7 +862,7 @@ class Scrubber:
             (strict if len(short) == 3 else loose)[short] = ph
         for cat in OBJECT_CATS:
             for real, ph in self.m.maps.get(cat, {}).items():
-                loose[real] = ph
+                loose.setdefault(real, ph)       # a host placeholder wins over an object one
         for ip, ph in self.m.maps.get("ipv4", {}).items():
             digit[ip.replace(".", "-")] = ph
         self._terms = {}
@@ -1480,7 +1524,7 @@ class Target:
                 self.sudo = self._detect_sudo()
                 if want == "yes" and not self.sudo:
                     self.notes.append("sudo was requested but is not available for this user")
-            if self.sec["type"] in ("k8s", "vcfmgmt"):
+            if self.sec["type"] in ("k8s", "vcfmgmt", "supervisor"):
                 self._detect_kubectl()
         return True
 
