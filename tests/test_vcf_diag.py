@@ -564,6 +564,128 @@ class Supervisor(unittest.TestCase):
         self.assertEqual(out, "node vcfmgmt-mgmt-worker-01 / machine vcfmgmt-mgmt-worker-01")
 
 
+FAKE_VC = {
+    "/api/vcenter/namespace-management/clusters": [
+        {"cluster": "domain-c8", "cluster_name": "WIDGETS-MGMT-CL01", "config_status": "RUNNING",
+         "kubernetes_status": "READY"}],
+    "/api/vcenter/namespace-management/clusters/domain-c8": {
+        "config_status": "RUNNING", "kubernetes_status": "WARNING", "size_hint": "SMALL",
+        "network_provider": "NSXT_CONTAINER_PLUGIN", "api_server_management_endpoint": "10.20.30.41",
+        "messages": [], "kubernetes_status_messages": [
+            {"severity": "WARNING", "details": {"default_message": "Control plane VM 10.20.30.42 is degraded."}}],
+        "stat_summary": {"cpu_used": 9000, "cpu_capacity": 100000, "memory_used": 64000,
+                         "memory_capacity": 512000, "storage_used": 1000, "storage_capacity": 9000}},
+    "/api/vcenter/namespaces/instances": [
+        {"namespace": "widgets-finance", "cluster": "domain-c8", "config_status": "RUNNING",
+         "stats": {"cpu_used": 1200, "memory_used": 4096, "storage_used": 20480}},
+        {"namespace": "svc-velero-domain-c8", "cluster": "domain-c8", "config_status": "ERROR",
+         "stats": {"cpu_used": 0, "memory_used": 0, "storage_used": 0}}],
+    "/api/vcenter/namespaces/instances/widgets-finance": {
+        "config_status": "RUNNING", "messages": [],
+        "access_list": [{"subject_type": "USER", "subject": "devops", "domain": "vsphere.local", "role": "EDIT"}],
+        "storage_specs": [{"policy": "4c4c4544-0038-4b10-8032-b7c04f503933", "limit": 102400}],
+        "vm_service_spec": {"vm_classes": ["best-effort-small"], "content_libraries": ["lib-1"]},
+        "resource_spec": {"cpu_limit": 20000}},
+    "/api/vcenter/namespaces/instances/svc-velero-domain-c8": {
+        "config_status": "ERROR",
+        "messages": [{"severity": "ERROR", "details": {"default_message": "Failed to create network for namespace."}}]},
+    "/api/vcenter/namespace-management/supervisor-services": [
+        {"supervisor_service": "velero.vsphere.vmware.com", "display_name": "Velero", "state": "ACTIVATED"}],
+    "/api/vcenter/namespace-management/clusters/domain-c8/supervisor-services": [
+        {"supervisor_service": "velero.vsphere.vmware.com", "version": "1.5.1", "config_status": "ERROR",
+         "messages": [{"severity": "ERROR", "details": {"default_message": "Reconcile failed."}}]}],
+}
+
+
+def fake_vcenter():
+    """A local stand-in for the vCenter REST API (GET only, plus the session)."""
+    import http.server
+    import json as _json
+    import threading
+    seen = []
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def send(self, code, obj):
+            data = _json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_POST(self):
+            seen.append(("POST", self.path))
+            import base64 as b64
+            auth = self.headers.get("Authorization", "")
+            ok = auth == "Basic " + b64.b64encode(b"administrator@vsphere.local:Secr3t!").decode()
+            self.send(201 if ok else 401, "token-123" if ok else {"error": "unauthorized"})
+
+        def do_DELETE(self):
+            seen.append(("DELETE", self.path))
+            self.send(204, "")
+
+        def do_GET(self):
+            seen.append(("GET", self.path))
+            if self.headers.get("vmware-api-session-id") != "token-123":
+                return self.send(401, {})
+            if self.path in FAKE_VC:
+                return self.send(200, FAKE_VC[self.path])
+            self.send(404, {"error": "not found"})
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, "http://127.0.0.1:%d" % srv.server_address[1], seen
+
+
+class VCenterNamespaces(unittest.TestCase):
+    def setUp(self):
+        self.srv, self.base, self.seen = fake_vcenter()
+
+    def tearDown(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+
+    def test_namespace_report_and_only_reads(self):
+        api = v.VcApi("vc", "administrator@vsphere.local", "Secr3t!", base_url=self.base)
+        api.login()
+        self.assertIsNone(api.password)                      # not kept after login
+        sup, ns, svc = v.api_supervisors(api), v.api_namespaces(api), v.api_services(api)
+        api.logout()
+        self.assertIn("supervisor: WIDGETS-MGMT-CL01 (domain-c8)  config=RUNNING  kubernetes=READY", sup)
+        self.assertIn("WARNING: Control plane VM 10.20.30.42 is degraded.", sup)
+        self.assertTrue(ns.startswith("Namespaces needing attention:\n  svc-velero-domain-c8: status=ERROR - ERROR: "
+                                      "Failed to create network"))
+        self.assertIn("namespace: widgets-finance  supervisor=WIDGETS-MGMT-CL01  status=RUNNING", ns)
+        self.assertIn("access: USER devops@vsphere.local EDIT", ns)
+        self.assertIn("VM classes: best-effort-small   content libraries: 1", ns)
+        self.assertIn("velero.vsphere.vmware.com 1.5.1  config=ERROR", svc)
+        self.assertEqual({m for m, _ in self.seen}, {"POST", "GET", "DELETE"})
+        self.assertEqual([p for m, p in self.seen if m != "GET"], ["/api/session", "/api/session"])
+
+    def test_wrong_password(self):
+        api = v.VcApi("vc", "administrator@vsphere.local", "nope", base_url=self.base)
+        with self.assertRaises(v.VcApiError) as e:
+            api.login()
+        self.assertIn("SSO login failed", str(e.exception))
+
+    def test_names_are_anonymized(self):
+        api = v.VcApi("vc", "administrator@vsphere.local", "Secr3t!", base_url=self.base)
+        api.login()
+        text = v.api_namespaces(api) + "\n" + v.api_supervisors(api)
+        api.logout()
+        sc = make()
+        group = [g for g in v.COMPONENTS["vcenter"]["groups"] if g[0] == "vc-api-namespaces"][0]
+        harvest(sc, group[2][1], text)
+        out = run(sc, text)
+        for gone in ("widgets", "WIDGETS", "10.20.30", "4c4c4544"):
+            self.assertNotIn(gone, out)
+        self.assertIn("svc-velero-domain-c8", out)           # product namespace stays readable
+        self.assertRegex(out, r"namespace: ns-0001  supervisor=VCLUSTER-0001")
+
+
 class GuiApi(unittest.TestCase):
     """The browser GUI's local web API, without contacting any host."""
 

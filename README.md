@@ -168,6 +168,28 @@ list VKS / Cluster API clusters and machines, VM Service virtual machines, Super
 and errors from the Cluster API and VM operator controllers. A worker that appears both as a
 node and as a Cluster API machine gets the same placeholder in both places.
 
+### Supervisor namespaces (from vCenter)
+
+The vCenter check group **Supervisor namespaces** reads the vCenter REST API directly from your
+Mac (HTTPS to the vCenter address in the inventory), using only GET requests. It needs a vCenter
+SSO login, asked for when the group is selected (default user `administrator@vsphere.local`;
+any user that can view Workload Management is enough). No SSH login is needed for this group.
+
+It reports, per Supervisor: configuration and Kubernetes status, status messages, and capacity
+used; per vSphere Namespace: status and messages, permissions, storage policies and limits, VM
+classes and content libraries, resource limits and usage; and the Supervisor services that are
+registered and installed, with their status. Namespaces and Supervisors that are not healthy are
+listed first. With anonymization on, organisation-specific namespace and cluster names become
+`ns-0001` and `vcluster-0001`; product namespaces such as `svc-velero-...` stay readable.
+
+The vCenter certificate is verified. If your Mac does not trust vCenter's CA, download it from
+`https://<vcenter>/certs/download.zip` and set `ca_file = /path/to/ca.pem` in the `[vcenter]`
+section, or set `tls_verify = no` to skip the check.
+
+The `[supervisor]` section adds the same namespaces as seen inside the Supervisor: resource
+quotas, limit ranges, VM class bindings, namespace networks, role bindings and pods that are not
+running.
+
 You can add your own read-only commands per component type:
 
 ```ini

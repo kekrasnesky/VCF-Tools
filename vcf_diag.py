@@ -43,6 +43,7 @@ import shlex
 import shutil
 import signal
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -51,10 +52,12 @@ import termios
 import textwrap
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 import webbrowser
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 # ----------------------------------------------------------------------------
 # Diagnostic catalog
@@ -66,9 +69,22 @@ VERSION = "1.5.0"
 #          values are registered as names to anonymize everywhere in the report.
 
 
-def cmd(label, command, timeout=30, mode="sh", harvest=(), max_lines=None, k8s=None, sudo=False):
+def cmd(label, command, timeout=30, mode="sh", harvest=(), max_lines=None, k8s=None, sudo=False, api=None):
     return {"label": label, "cmd": command, "timeout": timeout, "mode": mode,
-            "harvest": tuple(harvest), "max_lines": max_lines, "k8s": k8s, "sudo": sudo}
+            "harvest": tuple(harvest), "max_lines": max_lines, "k8s": k8s, "sudo": sudo, "api": api}
+
+
+H_NAMESPACE = ("k8sns", r"(?m)^namespace: (\S+)", None)
+H_SUPERVISOR = ("vcluster", r"(?m)^supervisor: (.+?) \(", None)
+
+
+def apicmd(label, fn, shown, harvest=(), max_lines=600):
+    """A check answered by the vCenter REST API from this computer (GET requests only)."""
+    return cmd(label, shown, timeout=120, mode="vcapi", api=fn, harvest=harvest, max_lines=max_lines)
+
+
+def is_api_group(key):
+    return key.startswith("vc-api-")
 
 
 def ncli(label, command, **kw):
@@ -275,6 +291,14 @@ VCENTER_GROUPS = [
         cmd("ESX Agent Manager errors (last 60)",
             "grep -iE ' error |exception' /var/log/vmware/eam/eam.log 2>&1 | tail -n 60", max_lines=80),
     ]),
+    ("vc-api-namespaces", "Supervisor namespaces (vCenter API from this computer; needs a vCenter SSO login)", [
+        apicmd("Supervisors", "supervisors", "GET /api/vcenter/namespace-management/clusters (+ details)",
+               harvest=[H_SUPERVISOR]),
+        apicmd("vSphere Namespaces", "namespaces", "GET /api/vcenter/namespaces/instances (+ details)",
+               harvest=[H_NAMESPACE, H_SUPERVISOR], max_lines=1500),
+        apicmd("Supervisor services", "services", "GET /api/vcenter/namespace-management/supervisor-services",
+               harvest=[H_SUPERVISOR]),
+    ]),
     ("vc-storage", "Appliance partitions and core dumps", [
         cmd("Key partitions", "df -hP /storage/log /storage/db /storage/seat /storage/core 2>&1"),
         cmd("Core dumps", "ls -lh /storage/core 2>&1 | tail -n 15"),
@@ -379,6 +403,26 @@ SUPERVISOR_GROUPS = [
              "--all-containers --tail=300 2>/dev/null | grep -iE 'error|fail' | tail -n 30; done", timeout=90, max_lines=200),
     ]),
 ]
+
+
+SUPERVISOR_GROUPS.append(("k8s-namespaces", "vSphere Namespaces as seen inside the Supervisor", [
+    kctl("vSphere Namespaces", "{K} get ns -l vSphereClusterID -o wide 2>&1 || {K} get ns 2>&1", k8s="ns"),
+    kctl("Resource quotas (CPU, memory, storage per policy)",
+         "{K} describe resourcequota -A 2>&1 | grep -vE '^(Annotations|Labels):' | head -n 400",
+         k8s="nsrows", max_lines=400),
+    kctl("Limit ranges", "{K} get limitrange -A 2>&1", k8s="nsrows"),
+    kctl("VM classes bound to namespaces",
+         "{K} get virtualmachineclassbindings -A 2>/dev/null || {K} get virtualmachineclasses -A 2>&1",
+         k8s="nsrows", max_lines=300),
+    kctl("Namespace networks (best effort)",
+         "{K} get networkinterfaces,virtualnetworks,subnetsets -A 2>&1 | head -n 200", k8s="nsrows"),
+    kctl("Role bindings (namespace permissions)",
+         "{K} get rolebindings -A -o wide 2>&1 | grep -vE ' system:|kube-system|vmware-system' | head -n 200",
+         k8s="nsrows"),
+    kctl("Pods not Running, per namespace",
+         "{K} get pods -A --no-headers 2>&1 | awk '$4!=\"Running\" && $4!=\"Completed\"' | head -n 150",
+         k8s="nsrows"),
+]))
 
 
 def endpoint_group(endpoints):
@@ -487,6 +531,10 @@ hosts =
 
 [vcenter]
 hosts =
+# Supervisor namespace checks use the vCenter API from this computer with an SSO login:
+# sso_user   = administrator@vsphere.local
+# ca_file    = ~/vcenter-ca.pem    trust vCenter's CA (download from https://<vcenter>/certs/download.zip)
+# tls_verify = no                  or skip certificate checks (not recommended)
 
 [nsx]
 hosts =
@@ -745,7 +793,7 @@ RX_FQDN_ANY = re.compile(r"(?i)(?<![A-Za-z0-9_])((?:%s\.)+)(%s)(?![A-Za-z0-9_-])
                          % (LABEL, "|".join(GENERIC_TLDS + CC_TLDS)))
 RX_DOTTED_QUAD = re.compile(r"(?<![\w.])\d{1,3}(?:\.\d{1,3}){3}(?!\.?\d)(?!\w)")
 
-OBJECT_CATS = {"datastore": "datastore", "portgroup": "portgroup", "dvs": "dvs", "vm": "vm",
+OBJECT_CATS = {"vcluster": "vcluster", "datastore": "datastore", "portgroup": "portgroup", "dvs": "dvs", "vm": "vm",
                "namespace": "ns", "k8sobj": "k8sobj", "lrouter": "lrouter", "term": "term"}
 
 
@@ -807,6 +855,9 @@ class Scrubber:
         return self.m.get(cat, v, prefix=OBJECT_CATS.get(cat, cat), width=4)
 
     def learn(self, cat, value):
+        if cat == "k8sns":
+            v = value.strip()
+            return None if self.keep_ns_rx.match(v) else self.learn_term("namespace", v)
         if cat == "host":
             return self.learn_host(value)
         if cat == "domain":
@@ -1344,6 +1395,7 @@ class PtyShell:
 class Target:
     def __init__(self, ctx, section, address, placeholder, discovered=False):
         self.discovered = discovered      # a worker found through Kubernetes, not in the inventory
+        self.sso = None                   # (user, password) for vCenter API checks
         self.ctx = ctx
         self.sec = section
         self.comp = COMPONENTS[section["type"]]
@@ -1620,25 +1672,254 @@ class Target:
         return res
 
 
-def collect_target(t, groups, progress):
-    """Connect (if needed), detect, and run every selected command on one target."""
+class VcApiError(Exception):
+    pass
+
+
+class VcApi:
+    """Minimal vCenter REST client. Only GET requests are made, apart from opening and
+    closing the session. The SSO password is used once, in memory, to open the session."""
+
+    def __init__(self, host, user, password, verify=True, ca_file=None, base_url=None, timeout=30):
+        self.base = base_url or "https://%s" % host
+        self.user, self.password = user, password
+        self.timeout = timeout
+        self.token = None
+        if verify:
+            ctx = ssl.create_default_context(cafile=ca_file) if ca_file else ssl.create_default_context()
+        else:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        # vCenter is reached directly, never through a proxy from the environment.
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                                  urllib.request.HTTPSHandler(context=ctx))
+
+    def _call(self, method, path, headers=None):
+        req = urllib.request.Request(self.base + path, method=method, headers=dict(headers or {}))
+        if self.token:
+            req.add_header("vmware-api-session-id", self.token)
+        try:
+            with self.opener.open(req, timeout=self.timeout) as r:
+                body = r.read().decode("utf-8", "replace")
+                return r.status, body
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode("utf-8", "replace")
+        except urllib.error.URLError as e:
+            reason = e.reason
+            if isinstance(reason, ssl.SSLCertVerificationError):
+                raise VcApiError("the vCenter certificate is not trusted by this computer (%s). Set "
+                                 "ca_file = <vCenter CA file> in the [vcenter] section, or tls_verify = no "
+                                 "to skip the check" % reason.verify_message)
+            raise VcApiError("cannot reach the vCenter API: %s" % reason)
+        except (OSError, ValueError) as e:
+            raise VcApiError("cannot reach the vCenter API: %s" % e)
+
+    def login(self):
+        cred = base64.b64encode(("%s:%s" % (self.user, self.password)).encode("utf-8")).decode()
+        code, body = self._call("POST", "/api/session", {"Authorization": "Basic " + cred})
+        self.password = None
+        if code == 401:
+            raise VcApiError("vCenter SSO login failed for %s (wrong user or password)" % self.user)
+        if code not in (200, 201):
+            raise VcApiError("vCenter refused the session (HTTP %d)" % code)
+        self.token = json.loads(body)
+
+    def logout(self):
+        if self.token:
+            try:
+                self._call("DELETE", "/api/session")
+            except VcApiError:
+                pass
+            self.token = None
+
+    def get(self, path):
+        """Returns parsed JSON, or None when the endpoint does not exist on this version."""
+        code, body = self._call("GET", path)
+        if code == 404:
+            return None
+        if code in (401, 403):
+            raise VcApiError("HTTP %d for %s: the SSO user lacks permission" % (code, path))
+        if code >= 400:
+            raise VcApiError("HTTP %d for %s: %s" % (code, path, body[:300]))
+        return json.loads(body) if body.strip() else None
+
+
+def _messages(msgs, indent="  "):
+    out = []
+    for m in msgs or []:
+        d = m.get("details") or m
+        text = d.get("default_message") or d.get("id") or json.dumps(d)
+        out.append("%s%s: %s" % (indent, m.get("severity", "INFO"), text))
+    return out
+
+
+def _detail_json(obj):
+    return json.dumps(obj, indent=1, sort_keys=True)
+
+
+def api_supervisors(api):
+    out, attention = [], []
+    clusters = api.get("/api/vcenter/namespace-management/clusters") or []
+    summaries = api.get("/api/vcenter/namespace-management/supervisors/summaries")
+    if not clusters and not summaries:
+        return "No Supervisor is enabled on this vCenter."
+    out.append("Supervisors")
+    for c in clusters:
+        out.append("supervisor: %s (%s)  config=%s  kubernetes=%s" % (
+            c.get("cluster_name"), c.get("cluster"), c.get("config_status"), c.get("kubernetes_status")))
+        if c.get("config_status") != "RUNNING" or c.get("kubernetes_status") not in (None, "READY"):
+            attention.append("  %s: config=%s kubernetes=%s" % (
+                c.get("cluster_name"), c.get("config_status"), c.get("kubernetes_status")))
+    for item in (summaries or {}).get("items", []) if isinstance(summaries, dict) else []:
+        info = item.get("info") or {}
+        out.append("supervisor: %s (%s)  config=%s  kubernetes=%s" % (
+            info.get("name"), item.get("supervisor"), info.get("config_status"), info.get("kubernetes_status")))
+    if attention:
+        out[:0] = ["Supervisors needing attention:"] + attention + [""]
+    for c in clusters:
+        d = api.get("/api/vcenter/namespace-management/clusters/" + urllib.parse.quote(c.get("cluster", ""))) or {}
+        out += ["", "== supervisor %s (%s)" % (c.get("cluster_name"), c.get("cluster")),
+                "config_status: %s   kubernetes_status: %s   size: %s   network: %s" % (
+                    d.get("config_status"), d.get("kubernetes_status"), d.get("size_hint"),
+                    d.get("network_provider"))]
+        out += ["messages:"] + (_messages(d.get("messages")) or ["  none"])
+        out += ["kubernetes messages:"] + (_messages(d.get("kubernetes_status_messages")) or ["  none"])
+        stats = d.get("stat_summary") or {}
+        if stats:
+            out.append("capacity: CPU %s/%s MHz, memory %s/%s MiB, storage %s/%s MiB" % (
+                stats.get("cpu_used"), stats.get("cpu_capacity"), stats.get("memory_used"),
+                stats.get("memory_capacity"), stats.get("storage_used"), stats.get("storage_capacity")))
+        out += ["--- full detail", _detail_json(d)]
+    return "\n".join(out)
+
+
+def api_namespaces(api):
+    items = api.get("/api/vcenter/namespaces/instances")
+    if items is None:
+        return "The namespaces API is not available on this vCenter (no Supervisor?)."
+    if not items:
+        return "No vSphere Namespaces exist."
+    names = {c.get("cluster"): c.get("cluster_name")
+             for c in (api.get("/api/vcenter/namespace-management/clusters") or [])}
+    head, attention, details = [], [], []
+    for n in items:
+        st = n.get("stats") or {}
+        sup = n.get("supervisor") or n.get("cluster")
+        head.append("namespace: %s  supervisor=%s  status=%s  CPU=%s MHz  memory=%s MiB  storage=%s MiB" % (
+            n.get("namespace"), names.get(sup, sup), n.get("config_status"), st.get("cpu_used"),
+            st.get("memory_used"), st.get("storage_used")))
+        name = urllib.parse.quote(n.get("namespace", ""))
+        d = api.get("/api/vcenter/namespaces/instances/" + name) or \
+            api.get("/api/vcenter/namespaces/instances/v2/" + name) or {}
+        msgs = _messages(d.get("messages"))
+        if n.get("config_status") != "RUNNING" or any(m.lstrip().startswith(("ERROR", "WARNING")) for m in msgs):
+            attention.append("  %s: status=%s%s" % (n.get("namespace"), n.get("config_status"),
+                                                   (" - " + msgs[0].strip()) if msgs else ""))
+        details += ["", "== namespace %s" % n.get("namespace"), "status: %s" % d.get("config_status"),
+                    "messages:"] + (msgs or ["  none"])
+        acc = d.get("access_list") or []
+        details.append("access: " + (", ".join("%s %s@%s %s" % (a.get("subject_type"), a.get("subject"),
+                                                              a.get("domain"), a.get("role")) for a in acc) or "none"))
+        stor = d.get("storage_specs") or []
+        details.append("storage policies: " + (", ".join("%s (limit %s MiB)" % (x.get("policy"), x.get("limit", "none"))
+                                                         for x in stor) or "none"))
+        vm = d.get("vm_service_spec") or {}
+        details.append("VM classes: %s   content libraries: %d" % (
+            ", ".join(vm.get("vm_classes") or []) or "none", len(vm.get("content_libraries") or [])))
+        if d.get("resource_spec"):
+            details.append("resource limits: %s" % json.dumps(d["resource_spec"], sort_keys=True))
+        details += ["--- full detail", _detail_json(d)]
+    out = (["Namespaces needing attention:"] + attention + [""] if attention else
+           ["All namespaces report RUNNING without errors or warnings.", ""])
+    return "\n".join(out + head + details)
+
+
+def api_services(api):
+    svcs = api.get("/api/vcenter/namespace-management/supervisor-services")
+    if svcs is None:
+        return "The Supervisor services API is not available on this vCenter."
+    out = ["Registered Supervisor services:"]
+    out += ["  %s  (%s)  state=%s" % (x.get("display_name"), x.get("supervisor_service"), x.get("state"))
+            for x in svcs] or ["  none"]
+    for c in api.get("/api/vcenter/namespace-management/clusters") or []:
+        inst = api.get("/api/vcenter/namespace-management/clusters/%s/supervisor-services"
+                       % urllib.parse.quote(c.get("cluster", ""))) or []
+        out += ["", "supervisor: %s (%s) installed services:" % (c.get("cluster_name"), c.get("cluster"))]
+        for x in inst:
+            out.append("  %s %s  config=%s" % (x.get("supervisor_service"), x.get("version"), x.get("config_status")))
+            out += _messages(x.get("messages"), indent="    ")
+        if not inst:
+            out.append("  none")
+    return "\n".join(out)
+
+
+VCAPI_FUNCS = {"supervisors": api_supervisors, "namespaces": api_namespaces, "services": api_services}
+
+
+def collect_api(t, groups):
+    """Run vCenter API checks for one vCenter target, from this computer."""
+    todo = [(g, c) for g in groups for c in g[2]]
+    user, password = t.sso or (None, None)
+    if not password:
+        for g, c in todo:
+            t.results.append({"group": g, "label": c["label"], "cmd": c["cmd"], "rc": None, "out": "", "dur": 0.0,
+                              "status": "skipped", "note": "no vCenter SSO login was entered", "spec": c})
+        return
+    sec = t.sec
+    api = VcApi(t.address, user, password, verify=sec.get("tls_verify", True), ca_file=sec.get("ca_file"),
+                base_url=sec.get("api_base"))
     try:
-        if not t.connected and not t.connect():
-            progress(t, "FAILED: " + t.errmsg)
-            return
-        if not t.detect():
-            t.errkind = t.errkind or "error"
-            progress(t, "FAILED: " + t.errmsg)
-            return
-        t.probe_identity()
-        todo = [(g, c) for g in groups for c in g[2]]
+        api.login()
+    except VcApiError as e:
+        for g, c in todo:
+            t.results.append({"group": g, "label": c["label"], "cmd": c["cmd"], "rc": 1, "out": str(e), "dur": 0.0,
+                              "status": "fail", "note": "", "spec": c})
+        return
+    try:
         for g, c in todo:
             if t.ctx.cancel.is_set():
                 break
-            t.results.append(t.run_catalog(g, c))
-        bad = sum(1 for r in t.results if r["status"] in ("fail", "timeout"))
-        skipped = sum(1 for r in t.results if r["status"] == "skipped")
-        progress(t, "done: %d commands, %d failed, %d skipped (%s)" % (len(t.results), bad, skipped, t.mode))
+            t0 = time.time()
+            res = {"group": g, "label": c["label"], "cmd": c["cmd"], "rc": 0, "out": "", "dur": 0.0,
+                   "status": "ok", "note": "", "spec": c}
+            try:
+                res["out"] = VCAPI_FUNCS[c["api"]](api)
+            except (VcApiError, ValueError, KeyError, TypeError, AttributeError) as e:
+                res.update(rc=1, status="fail", out="%s" % e)
+            res["dur"] = time.time() - t0
+            t.results.append(res)
+    finally:
+        api.logout()
+
+
+def collect_target(t, groups, progress):
+    """Connect (if needed), detect, and run every selected command on one target.
+    vCenter API checks run from this computer, also when SSH to the target fails."""
+    ssh_groups = [g for g in groups if not is_api_group(g[0])]
+    api_groups = [g for g in groups if is_api_group(g[0])]
+    try:
+        if ssh_groups:
+            ok = t.connected or t.connect()
+            if ok and not t.detect():
+                t.errkind = t.errkind or "error"
+                ok = False
+            if not ok:
+                progress(t, "FAILED: " + t.errmsg + (" (vCenter API checks still run)" if api_groups else ""))
+            else:
+                t.probe_identity()
+                for g in ssh_groups:
+                    for c in g[2]:
+                        if t.ctx.cancel.is_set():
+                            break
+                        t.results.append(t.run_catalog(g, c))
+        if api_groups and not t.ctx.cancel.is_set():
+            collect_api(t, api_groups)
+        if t.results or not t.errkind:
+            bad = sum(1 for r in t.results if r["status"] in ("fail", "timeout"))
+            skipped = sum(1 for r in t.results if r["status"] == "skipped")
+            progress(t, "done: %d commands, %d failed, %d skipped (%s)" % (
+                len(t.results), bad, skipped, t.mode or "api"))
     except Exception as e:  # never let one host break the run
         t.errkind, t.errmsg = "error", "collector error: %r" % (e,)
         progress(t, "FAILED: " + t.errmsg)
@@ -1698,6 +1979,10 @@ def load_inventory(path):
             "kubectl": (s.get("kubectl") or "").strip() or None,
             "ssh_options": shlex.split(s.get("ssh_options", "")),
             "ssh_workers": (s.get("ssh_workers") or "no").strip().lower() in ("yes", "true", "1"),
+            "sso_user": (s.get("sso_user") or "administrator@vsphere.local").strip(),
+            "tls_verify": (s.get("tls_verify") or "yes").strip().lower() not in ("no", "false", "0", "off"),
+            "ca_file": os.path.expanduser((s.get("ca_file") or "").strip()) or None,
+            "api_base": (s.get("api_base") or "").strip() or None,
             "endpoints": {},
         })
     mgmt = [x for x in sections if x["type"] == "vcfmgmt"]
@@ -1790,6 +2075,11 @@ class ConsoleUI:
     def initial_credentials(self, sec):
         return prompt_credentials(sec)
 
+    def sso_credentials(self, sec):
+        print("\nvCenter SSO login for the Supervisor namespace checks of [%s] (Return to skip)" % sec["name"])
+        user = input("  SSO username [%s]: " % sec["sso_user"]).strip() or sec["sso_user"]
+        return user, getpass.getpass("  SSO password for %s: " % user)
+
     def retry_credentials(self, sec, what, message, default=True):
         if not ask_yes("  %s Enter different credentials for %s?" % (message, what), default):
             return None
@@ -1825,8 +2115,12 @@ def run_plan(ctx, plan, scrubber, ui=None):
     ui = ui or ConsoleUI()
     done = []
     creds = {}
+    sso = {}
     for item in plan:
-        creds[item["sec"]["name"]] = ui.initial_credentials(item["sec"])
+        needs_ssh = any(not is_api_group(g[0]) for g in item["groups"])
+        creds[item["sec"]["name"]] = ui.initial_credentials(item["sec"]) if needs_ssh else (None, None, None)
+        if any(is_api_group(g[0]) for g in item["groups"]):
+            sso[item["sec"]["name"]] = ui.sso_credentials(item["sec"])
     log()
 
     def progress(t, msg):
@@ -1867,13 +2161,16 @@ def run_plan(ctx, plan, scrubber, ui=None):
             return host_groups.get(t.address, item["groups"])
 
         apply(targets, creds[sec["name"]])
+        for t in targets:
+            t.sso = sso.get(sec["name"])
         log("[%s] %d host(s), %d check(s) in total" % (
             sec["name"], len(targets), sum(len(g[2]) for t in targets for g in groups_of(t))))
         # Canary: try the first host alone, so a mistyped password costs one failed
         # login on one host instead of one on every host (account lockout protection).
         first, rest = targets[0], targets[1:]
         tries = 0
-        while not first.connect() and first.errkind == "auth" and tries < 2:
+        needs_ssh = any(not is_api_group(g[0]) for g in item["groups"])
+        while needs_ssh and not first.connect() and first.errkind == "auth" and tries < 2:
             tries += 1
             log("  [%s] %s: %s" % (sec["name"], first.address, first.errmsg))
             new = ui.retry_credentials(sec, "[%s]" % sec["name"],
@@ -1887,6 +2184,9 @@ def run_plan(ctx, plan, scrubber, ui=None):
                 t.errkind = "skipped"
                 t.errmsg = "not attempted: credentials were rejected by the first host of this group"
             progress(first, "FAILED: " + first.errmsg)
+            api_only = [g for g in item["groups"] if is_api_group(g[0])]
+            for t in targets if api_only else []:
+                collect_api(t, api_only)
             done.append((item, targets))
             continue
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, ctx.args.parallel)) as pool:
@@ -2095,8 +2395,10 @@ def build_report(ctx, done, scrubber, started, max_lines, kind="health", title="
             w("### %s" % t.ph)
             w("")
             if t.errkind:
-                w("Not collected: %s - %s" % (t.errkind, S(t.errmsg)))
-                continue
+                w("Not collected over SSH: %s - %s" % (t.errkind, S(t.errmsg)))
+                if not t.results:
+                    continue
+                w("")
             info = ["user `%s`" % S(t.user), "shell mode `%s`" % t.mode]
             if t.identity:
                 short, _, dom = t.identity[0].lower().partition(".")
@@ -3039,6 +3341,13 @@ function renderGroups() {
     if (s.escalate === "su")
       fields.append(el("label", { className: "f" }, "Root password for su",
         el("input", { type: "password", className: "su", autocomplete: "off" })));
+    if (s.type === "vcenter") {
+      const su = el("input", { type: "text", className: "ssouser", value: s.sso_user, autocomplete: "off", spellcheck: false });
+      su.setAttribute("autocapitalize", "off");
+      fields.append(el("label", { className: "f" }, "vCenter SSO user (namespace checks)", su),
+        el("label", { className: "f" }, "vCenter SSO password",
+          el("input", { type: "password", className: "ssopass", autocomplete: "off" })));
+    }
     const det = el("details", {}, el("summary", { textContent: "Choose hosts and checks" }),
       el("div", { className: "cols" },
         checklist(s.host_label || "Hosts", s.hosts.map(h => ({ value: h, text: h })), "host"),
@@ -3084,16 +3393,21 @@ $("#run").onclick = async () => {
   let bad = null;
   for (const card of $$("#groups .card")) {
     if (!$(".sec", card).checked) continue;
-    const need = [$(".pass", card)].concat($(".su", card) ? [$(".su", card)] : []);
-    for (const i of need) { i.classList.toggle("missing", !i.value); if (!i.value && !bad) bad = i; }
     const hosts = $$(".host:checked", card).map(i => i.value), groups = $$(".grp:checked", card).map(i => i.value);
+    const apiOnly = groups.length > 0 && groups.every(g => g.startsWith("vc-api-"));
+    const need = (apiOnly ? [] : [$(".pass", card)].concat($(".su", card) ? [$(".su", card)] : []))
+      .concat(groups.some(g => g.startsWith("vc-api-")) && $(".ssopass", card) ? [$(".ssopass", card)] : []);
+    $$("input[type=password]", card).forEach(i => i.classList.remove("missing"));
+    for (const i of need) { i.classList.toggle("missing", !i.value); if (!i.value && !bad) bad = i; }
     if (!hosts.length || !groups.length) {
       $("#runHint").textContent = "Group " + card.dataset.name + " has no hosts or no checks selected";
       $("details", card).open = true;
       return;
     }
     req.sections[card.dataset.name] = { hosts, groups, user: $(".user", card).value.trim(),
-      password: $(".pass", card).value, su_password: $(".su", card) ? $(".su", card).value : null };
+      password: $(".pass", card).value, su_password: $(".su", card) ? $(".su", card).value : null,
+      sso_user: $(".ssouser", card) ? $(".ssouser", card).value.trim() : null,
+      sso_password: $(".ssopass", card) ? $(".ssopass", card).value : null };
   }
   if (bad) { bad.focus(); $("#runHint").textContent = "Enter the password for each selected group"; return; }
   try {
@@ -3343,6 +3657,10 @@ class GuiUI:
         c = self.creds.get(sec["name"], {})
         return (c.get("user") or sec["user"], c.get("password") or "", c.get("su_password") or None)
 
+    def sso_credentials(self, sec):
+        c = self.creds.get(sec["name"], {})
+        return (c.get("sso_user") or sec["sso_user"], c.get("sso_password") or "")
+
     def retry_credentials(self, sec, what, message, default=True):
         return self.gui.ask({"section": sec["name"], "what": what, "message": message,
                              "user": sec["user"], "needs_su": sec.get("escalate") == "su"})
@@ -3412,6 +3730,7 @@ class Gui:
         for s in sections:
             out["sections"].append({
                 "name": s["name"], "title": COMPONENTS[s["type"]]["title"], "user": s["user"],
+                "type": s["type"], "sso_user": s["sso_user"],
                 "host_label": COMPONENTS[s["type"]].get("host_label", "Hosts"),
                 "hosts": s["hosts"], "escalate": s["escalate"],
                 "groups": [{"key": k, "title": t, "checks": [c["label"] for c in cs]}
@@ -3459,11 +3778,16 @@ class Gui:
                 groups = [g for g in groups_for(sec, custom) if g[0] in set(sel.get("groups") or [])]
                 if not hosts or not groups:
                     raise Fatal("nothing selected in [%s]" % name)
-                if not sel.get("password"):
+                api = [g for g in groups if is_api_group(g[0])]
+                if len(api) < len(groups) and not sel.get("password"):
                     raise Fatal("no password given for [%s]" % name)
+                if api and not sel.get("sso_password"):
+                    raise Fatal("no vCenter SSO password given for the namespace checks of [%s]" % name)
                 plan.append({"sec": sec, "hosts": hosts, "groups": groups})
-                creds[name] = {"user": str(sel.get("user") or "").strip(), "password": str(sel["password"]),
-                               "su_password": sel.get("su_password")}
+                creds[name] = {"user": str(sel.get("user") or "").strip(), "password": str(sel.get("password") or ""),
+                               "su_password": sel.get("su_password"),
+                               "sso_user": str(sel.get("sso_user") or "").strip(),
+                               "sso_password": str(sel.get("sso_password") or "")}
             if not plan:
                 raise Fatal("nothing selected")
             args = self._run_args(body, settings)
