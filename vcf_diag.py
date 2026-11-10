@@ -57,7 +57,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 
 # ----------------------------------------------------------------------------
 # Diagnostic catalog
@@ -85,6 +85,13 @@ def apicmd(label, fn, shown, harvest=(), max_lines=600):
 
 def is_api_group(key):
     return key.startswith("vc-api-")
+
+
+def plan_needs_ssh(item):
+    """True when any check of a plan item runs over SSH. Follow-up plans keep their
+    checks per host in host_groups, so those count too."""
+    groups = list(item["groups"]) + [g for gs in (item.get("host_groups") or {}).values() for g in gs]
+    return any(not is_api_group(g[0]) for g in groups)
 
 
 def ncli(label, command, **kw):
@@ -2117,7 +2124,7 @@ def run_plan(ctx, plan, scrubber, ui=None):
     creds = {}
     sso = {}
     for item in plan:
-        needs_ssh = any(not is_api_group(g[0]) for g in item["groups"])
+        needs_ssh = plan_needs_ssh(item)
         creds[item["sec"]["name"]] = ui.initial_credentials(item["sec"]) if needs_ssh else (None, None, None)
         if any(is_api_group(g[0]) for g in item["groups"]):
             sso[item["sec"]["name"]] = ui.sso_credentials(item["sec"])
@@ -2169,7 +2176,7 @@ def run_plan(ctx, plan, scrubber, ui=None):
         # login on one host instead of one on every host (account lockout protection).
         first, rest = targets[0], targets[1:]
         tries = 0
-        needs_ssh = any(not is_api_group(g[0]) for g in item["groups"])
+        needs_ssh = plan_needs_ssh(item)
         while needs_ssh and not first.connect() and first.errkind == "auth" and tries < 2:
             tries += 1
             log("  [%s] %s: %s" % (sec["name"], first.address, first.errmsg))
@@ -2969,6 +2976,10 @@ def prepare_plan(args, text):
             continue
         if not resolved:
             continue
+        if re.search(r"(?:^|[|;&(`]\s*|\$\(\s*)kubectl\s", st["run"]) and \
+                any(s["type"] in ("k8s", "vcfmgmt", "supervisor") for s, a, ph in resolved):
+            st["run"] = re.sub(r"(^|[|;&(`]\s*|\$\(\s*)kubectl(?=\s)", r"\1{K}", st["run"])
+            entry["command"] = dec(st["run"])
         modes = {}
         for s, a, ph in resolved:
             mode = st["mode"].lower() if st["mode"].lower() in ("sh", "nsxcli", "kubectl") else (

@@ -686,6 +686,47 @@ class VCenterNamespaces(unittest.TestCase):
         self.assertRegex(out, r"namespace: ns-0001  supervisor=VCLUSTER-0001")
 
 
+class FollowUpRegression(unittest.TestCase):
+    """1.6.0 skipped the SSH login for follow-up plans (their checks live in host_groups)."""
+
+    def prep(self, run_line, typ="supervisor"):
+        import argparse
+        with tempfile.TemporaryDirectory() as d:
+            inv = os.path.join(d, "inventory.ini")
+            with open(inv, "w") as fh:
+                fh.write("[settings]\nanonymize = no\n[%s]\nhosts = 10.9.0.5\n" % typ)
+            args = argparse.Namespace(inventory=inv, private_dir=os.path.join(d, "none"))
+            return v.prepare_plan(args, "```vcf-plan\n[collect] target=10.9.0.5\nrun: %s\n```" % run_line)
+
+    def test_follow_up_plans_ask_for_the_ssh_login(self):
+        prep = self.prep("kubectl get kubeadmcontrolplane -n ns-a cl-b -o yaml")
+        item = prep["plan"][0]
+        self.assertEqual(item["groups"], [])
+        self.assertTrue(v.plan_needs_ssh(item))
+
+        class UI:
+            asked = []
+
+            def initial_credentials(self, sec):
+                UI.asked.append(sec["name"])
+                return ("root", "pw", None)
+
+        import argparse
+        import threading
+        ctx = argparse.Namespace(cancel=threading.Event(), args=argparse.Namespace(parallel=1, strict_host_keys=False))
+        ctx.cancel.set()               # stop right after the credentials are collected
+        v.run_plan(ctx, prep["plan"], v.Scrubber(v.Mapping(None), anonymize=False), UI())
+        self.assertEqual(UI.asked, ["supervisor"])
+
+    def test_plain_kubectl_uses_the_detected_kubectl(self):
+        step = self.prep("kubectl get kubeadmcontrolplane -A")["plan"][0]["host_groups"]["10.9.0.5"][0][2][0]
+        self.assertEqual((step["mode"], step["cmd"]), ("kubectl", "{K} get kubeadmcontrolplane -A"))
+        step = self.prep("journalctl -u kubelet | tail -n 5")["plan"][0]["host_groups"]["10.9.0.5"][0][2][0]
+        self.assertEqual(step["mode"], "sh")
+        step = self.prep("kubectl version", typ="linux")["plan"][0]["host_groups"]["10.9.0.5"][0][2][0]
+        self.assertEqual(step["mode"], "sh")      # not a Kubernetes section: left as written
+
+
 class GuiApi(unittest.TestCase):
     """The browser GUI's local web API, without contacting any host."""
 
