@@ -48,12 +48,13 @@ import subprocess
 import sys
 import tempfile
 import termios
+import textwrap
 import threading
 import time
 import urllib.parse
 import webbrowser
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # ----------------------------------------------------------------------------
 # Diagnostic catalog
@@ -595,6 +596,7 @@ RX_KV_SECRET = re.compile(
     r"private[_-]key|credential)[\w.-]*[\"']?\s*[:=]\s*)(\"[^\"\n]*\"|'[^'\n]*'|[^\s\"',;]+)")
 RX_HASH = re.compile(r"\$(?:1|2[aby]?|5|6|y)\$[./A-Za-z0-9$]{20,}")
 RX_SSHKEY = re.compile(r"AAAA[0-9A-Za-z+/]{60,}={0,2}")
+RX_BLOB = re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{160,}={0,2}")
 RX_SSHFP = re.compile(r"\b(SHA256|MD5):[A-Za-z0-9+/:]{22,}={0,2}")
 
 RX_HEXSEQ = re.compile(r"(?<![\w:])(?:[0-9A-Fa-f]{2}:){5,}[0-9A-Fa-f]{2}(?![\w:])")
@@ -887,6 +889,7 @@ class Scrubber:
         t = RX_KV_SECRET.sub(lambda m: m.group(1) + self._tok("[REDACTED]"), t)
         t = RX_HASH.sub(lambda m: self._tok("[REDACTED-HASH]"), t)
         t = RX_SSHKEY.sub(lambda m: self._tok("[REDACTED-KEY]"), t)
+        t = RX_BLOB.sub(lambda m: self._tok("[REDACTED-ENCODED-DATA]"), t)
         t = self._sub(RX_SSHFP, lambda m: self._tok(self.m.get("thumbprint", m.group(0))), t)
         # 2. identifiers that may contain a host name: replace them as a whole first
         t = self._sub(RX_IQN, lambda m: self._tok(self.m.get("iqn", m.group(0))), t)
@@ -1685,8 +1688,12 @@ def run_plan(ctx, plan, scrubber, ui=None):
             for t in ts:
                 t.user, t.password, t.su_password = c
 
+        def groups_of(t):
+            return item.get("host_groups", {}).get(t.address, item["groups"])
+
         apply(targets, creds[sec["name"]])
-        log("[%s] %d host(s), %d check group(s)" % (sec["name"], len(targets), len(item["groups"])))
+        log("[%s] %d host(s), %d check(s) in total" % (
+            sec["name"], len(targets), sum(len(g[2]) for t in targets for g in groups_of(t))))
         # Canary: try the first host alone, so a mistyped password costs one failed
         # login on one host instead of one on every host (account lockout protection).
         first, rest = targets[0], targets[1:]
@@ -1708,7 +1715,7 @@ def run_plan(ctx, plan, scrubber, ui=None):
             done.append((item, targets))
             continue
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, ctx.args.parallel)) as pool:
-            list(pool.map(lambda t: collect_target(t, item["groups"], progress), targets))
+            list(pool.map(lambda t: collect_target(t, groups_of(t), progress), targets))
         # Offer a retry for individual hosts that rejected the shared credentials.
         for t in targets:
             if t.errkind == "auth" and t is not first and not ctx.cancel.is_set():
@@ -1718,7 +1725,7 @@ def run_plan(ctx, plan, scrubber, ui=None):
                 if new:
                     apply([t], new)
                     t.results = []
-                    collect_target(t, item["groups"], progress)
+                    collect_target(t, groups_of(t), progress)
         done.append((item, targets))
     return done
 
@@ -1790,19 +1797,26 @@ An UPPERCASE placeholder means the original was written in upper case. Loopback,
 multicast addresses and netmasks are left as they are."""
 
 
-def build_report(ctx, done, scrubber, started, max_lines):
+def build_report(ctx, done, scrubber, started, max_lines, kind="health", title=""):
     S = scrubber.scrub
     out = []
     w = out.append
-    w("# VCF anonymized diagnostic report")
+    w("# VCF anonymized %s report" % ("follow-up" if kind == "followup" else "diagnostic"))
     w("")
     w("- Generated: %s UTC" % started.strftime("%Y-%m-%d %H:%M:%S"))
     w("- Tool: vcf_diag %s, Python %s, %s" % (VERSION, sys.version.split()[0], ctx.ssh_banner))
-    w("- Scope: health and status checks only, read-only commands over SSH")
+    if kind == "followup":
+        w("- Scope: read-only diagnostics requested in an analyst plan%s" % (": " + S(title) if title else ""))
+    else:
+        w("- Scope: health and status checks only, read-only commands over SSH")
     w("")
     w("## How to read this report")
     w("")
     w(LEGEND)
+    w("")
+    w("## How to reply (for the analyst)")
+    w("")
+    w(ANALYST_GUIDE)
     w("")
     w("## Summary")
     w("")
@@ -1824,8 +1838,8 @@ def build_report(ctx, done, scrubber, started, max_lines):
                 attention.append("- **%s**: %s - %s" % (t.ph, t.errkind, S(t.errmsg)))
             if t.clock_offset is not None and abs(t.clock_offset) > 5:
                 attention.append("- **%s**: clock differs from the collector by %+.0f s" % (t.ph, t.clock_offset))
-            timed = [r["label"] for r in t.results if r["status"] == "timeout"]
-            failed = [r["label"] for r in t.results if r["status"] == "fail"]
+            timed = [S(r["label"]) for r in t.results if r["status"] == "timeout"]
+            failed = [S(r["label"]) for r in t.results if r["status"] == "fail"]
             if timed:
                 attention.append("- %s: timed out: %s" % (t.ph, "; ".join(timed)))
             if failed:
@@ -1866,11 +1880,11 @@ def build_report(ctx, done, scrubber, started, max_lines):
                     w("#### %s - %s" % (gkey, r["group"][1]))
                 w("")
                 if r["status"] == "skipped":
-                    w("**%s** - skipped: %s" % (r["label"], S(r["note"])))
+                    w("**%s** - skipped: %s" % (S(r["label"]), S(r["note"])))
                     continue
                 status = "ok" if r["status"] == "ok" else (
                     "TIMEOUT" if r["status"] == "timeout" else "exit %s" % r["rc"])
-                w("**%s** (%s, %.1fs)" % (r["label"], status, r["dur"]))
+                w("**%s** (%s, %.1fs)" % (S(r["label"]), status, r["dur"]))
                 w("")
                 w("`$ %s`" % S(r["cmd"]).replace("`", "'"))
                 body = S(clip(r["out"], r["spec"]["max_lines"] or max_lines)).strip("\n")
@@ -1996,18 +2010,10 @@ def scrub_texts(args, texts):
 
 def decode_text(args, text):
     """Translate placeholders back to real names using the private mapping."""
-    mapping = Mapping(os.path.join(args.private_dir, "mapping.json"))
-    rev = {}
-    for cat, vals in mapping.maps.items():
-        if cat in ("ipv4net", "file"):
-            continue
-        for real, ph in vals.items():
-            rev.setdefault(ph.lower(), real)
-    if not rev:
+    dec = Decoder(Mapping(os.path.join(args.private_dir, "mapping.json")))
+    if not dec.rev:
         die("no mapping found in %s - run a collection first" % args.private_dir)
-    rx = re.compile(r"(?i)(?<![\w-])(?:%s)(?![\w-])" % "|".join(
-        re.escape(k) for k in sorted(rev, key=len, reverse=True)))
-    return rx.sub(lambda m: rev[m.group(0).lower()], text)
+    return dec(text)
 
 
 def cmd_scrub_files(args):
@@ -2032,7 +2038,7 @@ def cmd_decode(args):
         sys.stdout.write(decode_text(args, fh.read()))
 
 
-def collect_and_report(args, settings, sections, plan, ui, on_context=None):
+def collect_and_report(args, settings, sections, plan, ui, on_context=None, kind="health", title=""):
     """Run a plan and write the anonymized report. Shared by the terminal and the GUI.
     Returns None when the run was cancelled."""
     ctx = Context(args)
@@ -2046,10 +2052,11 @@ def collect_and_report(args, settings, sections, plan, ui, on_context=None):
         if ctx.cancel.is_set():
             return None
         learn_from_results(done, scrubber)
-        report = build_report(ctx, done, scrubber, started, args.max_lines)
+        report = build_report(ctx, done, scrubber, started, args.max_lines, kind=kind, title=title)
         scrubber.m.save()
         os.makedirs(args.output_dir, exist_ok=True)
-        path = os.path.join(args.output_dir, "vcf-report-%s.md" % started.strftime("%Y%m%d-%H%M%S"))
+        path = os.path.join(args.output_dir, "vcf-%s-%s.md" % (
+            "followup" if kind == "followup" else "report", started.strftime("%Y%m%d-%H%M%S")))
         write_private(path, report)
     finally:
         ctx.cleanup()
@@ -2115,6 +2122,339 @@ def print_result(args, res):
         print("Note:    this is a large report. Consider collecting one component group at a time.")
     print("Mapping: %s  (PRIVATE - never share)" % os.path.join(args.private_dir, "mapping.json"))
     print("\nOpen the report and skim it before sharing. Use --decode to translate an analysis back.")
+
+
+# ----------------------------------------------------------------------------
+# Analyst replies: follow-up diagnostics (run, read-only) and fixes (translated
+# for the person to apply by hand - this tool never runs a fix)
+# ----------------------------------------------------------------------------
+ANALYST_GUIDE = """\
+The person who sent this report works in an isolated environment. Their tool translates your
+reply back to real names, so always refer to hosts, addresses, domains and objects by the
+placeholders exactly as they appear here. Write your analysis as normal prose. When you need
+more data, or want to propose changes, add one fenced block like this to your reply:
+
+````text
+```vcf-plan
+plan: short title of what this plan is for
+
+[collect] target=vcenter-01
+label: vpxd errors, last 200 lines
+run: grep -iE 'error|fail' /var/log/vmware/vpxd/vpxd.log | tail -n 200
+
+[collect] target=@esxi:mgmt
+label: vmkernel warnings
+run: grep -i warn /var/log/vmkernel.log | tail -n 100
+timeout: 60
+
+[fix] target=vcenter-01
+label: Restart the vpxd service
+run: service-control --restart vmware-vpxd
+note: vCenter is unavailable for about two minutes. No rollback needed.
+```
+````
+
+Rules for the block:
+
+- `target=` takes one or more host placeholders from this report, comma separated, or
+  `@group` for every host of a group (the group names are the `[...]` section headings below).
+- `[collect]` steps must only read. The tool shows them to the person, runs them after they
+  confirm, and returns the anonymized output as a follow-up report. A step that looks as if it
+  changes anything is refused, as is one that would print secrets.
+- `[fix]` steps are never run by the tool. The person reads them with real names and applies
+  them by hand. Make each one a complete command, put them in the order they must be applied,
+  and state impact and rollback in `note:`.
+- One command per `run:`; continue a long command on indented lines. On Kubernetes nodes write
+  `{K}` for kubectl. On NSX nodes NSX CLI commands (`get ...`) can be given directly.
+- Optional per step: `timeout:` seconds (default 60) and `lines:` output lines to keep (default 400).
+- Ask only for what you need: every line of output costs the person review time."""
+
+PLAN_FENCE = re.compile(r"`{3,}[ \t]*vcf-plan[^\n]*\n(.*?)`{3,}", re.S)
+PLAN_STEP = re.compile(r"(?i)^\[(collect|fix)\][ \t]*(.*)$")
+PLAN_KEY = re.compile(r"(?i)^(targets?|label|run|note|mode|timeout|lines)[ \t]*[:=][ \t]?(.*)$")
+FOLLOWUP_GROUP = ("followup", "Follow-up diagnostics requested by the analyst")
+
+
+def parse_plan(text):
+    """Extract the steps of a vcf-plan block from an analyst reply."""
+    text = text.replace("\r\n", "\n")
+    blocks = PLAN_FENCE.findall(text)
+    body = "\n".join(textwrap.dedent(b) for b in blocks) if blocks else text
+    title, steps, cur, last = "", [], None, None
+    for raw in body.split("\n"):
+        line = raw.rstrip()
+        indented = raw[:1] in (" ", "\t")
+        m = None if indented else PLAN_STEP.match(line)
+        if m:
+            cur = {"kind": m.group(1).lower(), "targets": [], "label": "", "run": "", "note": "",
+                   "mode": "", "timeout": "", "lines": ""}
+            tm = re.match(r"(?i)targets?[ \t]*[:=][ \t]*(.*)$", m.group(2).strip())
+            if tm:
+                cur["targets"] = split_list(tm.group(1))
+            steps.append(cur)
+            last = None
+            continue
+        if cur is None:
+            tm = re.match(r"(?i)^#*[ \t]*plan[ \t]*:[ \t]*(.+)$", line.strip())
+            if tm and not title:
+                title = tm.group(1).strip()
+            continue
+        if indented and last and line.strip():
+            cur[last] += ("\n" if last == "run" else " ") + line.strip()
+            continue
+        km = None if indented else PLAN_KEY.match(line)
+        if km:
+            key = km.group(1).lower()
+            if key.startswith("target"):
+                cur["targets"] += split_list(km.group(2))
+                last = None
+            else:
+                cur[key] = km.group(2).strip()
+                last = key
+            continue
+        last = None
+    return {"title": title, "steps": steps}
+
+
+# A safety net, not a proof: a [collect] step that matches any of these is not run.
+_CMDPOS = r"(?:^|[|;&(`{\n]|\$\(|\b(?:xargs|exec|then|do|else|time|nohup|watch|env|timeout)\s[^|;&]*?|-exec\s|-ok\s)\s*(?:[\w./-]*/)?"
+_KUBE_READ = set("get describe logs top version api-resources api-versions cluster-info explain events".split())
+_KUBE_WRITE = set("""delete apply create replace patch edit scale drain cordon uncordon taint label annotate exec cp
+run expose set autoscale debug attach port-forward proxy certificate approve deny""".split())
+READONLY_RULES = [(re.compile(rx, re.I), why) for rx, why in [
+    (_CMDPOS + r"(?:rm|rmdir|mv|cp|dd|truncate|shred|chmod|chown|chgrp|chattr|ln|touch|mkdir|mktemp|tee|install|"
+               r"unlink|mkfs\S*|mount|umount|fsck\S*|gunzip|unzip|patch|vi|vim|nano|ed)(?![\w.-])",
+     "it can create, change or delete files"),
+    (r"\bfind\b[^|;&]*\s-(?:delete|fprint\S*|fls)\b", "it can delete or write files"),
+    (r"\bsed\b[^|;&]*\s-[a-z]*i|\bsed\b[^|;&]*--in-place|\bperl\b[^|;&]*\s-[a-z]*i", "it can edit a file in place"),
+    (_CMDPOS + r"(?:reboot|shutdown|halt|poweroff|init|telinit|kill|pkill|killall|kexec)(?![\w.-])",
+     "it can stop processes or the system"),
+    (r"\bsystemctl\b[^|;&]*\b(?:start|stop|restart|try-restart|reload\S*|enable|disable|mask|unmask|"
+     r"daemon-reload|daemon-reexec|kill|reset-failed|isolate|set-property|set-default|edit|revert|preset\S*)\b",
+     "it can change a service"),
+    (r"\bservice-control\b[^|;&]*--(?:start|stop|restart)|\bservice\s+\S+\s+(?:start|stop|restart|reload)\b|"
+     r"/etc/init\.d/\S+\s+(?:start|stop|restart|reload)\b|\bvmon-cli\b[^|;&]*\s(?:-[ikr]\b|--(?:start|stop|restart))",
+     "it can start or stop a service"),
+    (r"\bvim-cmd\b[^|;&]*(?:power\.(?!getstate)|destroy|unregister|reload|maintenance_mode_(?:enter|exit)|"
+     r"snapshot\.(?:create|remove|revert)|/(?:set|add|remove|delete|start|stop|restart|enable|disable)\w*)",
+     "it can change the host or a VM"),
+    (r"\bvsish\b[^|;&]*-e\s+set\b", "it can change a kernel setting"),
+    (r"\bnsxcli\s+-c\s+(?![\"']?\s*get\b)", "only NSX CLI 'get' commands are read-only"),
+    (r"\bcurl\b[^|;&]*(?:-X\s*(?:POST|PUT|PATCH|DELETE)|--request[ =](?:POST|PUT|PATCH|DELETE)|\s-d\b|--data|"
+     r"(?-i:\s-T\b|\s-F\b|\s-O\b)|--upload-file|--form|(?:(?-i:\s-o)|--output)(?![ =]*/dev/null))", "it can send data or write a file"),
+    (_CMDPOS + r"(?:wget|scp|sftp|rsync|ssh|telnet|ftp|tftp|socat)(?![\w.-])", "it can copy data or open a session elsewhere"),
+    (_CMDPOS + r"(?:nc|ncat|netcat)(?![\w.-])(?![^|;&]*\s-[a-z]*z)", "it can send data to another system"),
+    (r"\b(?:psql|mysql|sqlite3)\b[^|]*\b(?:update|delete|insert|drop|alter|truncate|create|vacuum|reindex|grant|revoke)\b",
+     "it can change a database"),
+    (_CMDPOS + r"(?:tdnf|yum|dnf|apt|apt-get|dpkg|pip[0-9.]*|esxupdate)(?![\w.-])|\brpm\s+-(?![a-z]*q)[a-z]*[ieUF]",
+     "it can install or remove software"),
+    (_CMDPOS + r"(?:passwd|chpasswd|useradd|userdel|usermod|groupadd|groupdel|visudo)(?![\w.-])|\bchage\s+(?!-l\b)|"
+     r"\b(?:pam_tally2|faillock)\b[^|;&]*(?:--reset|-r\b)", "it can change accounts"),
+    (_CMDPOS + r"(?:sudo|su|doas)(?![\w.-])", "privilege is handled by the tool (sudo / escalate in the inventory)"),
+    (_CMDPOS + r"(?:eval|source|\.)\s|\b(?:bash|sh|zsh|ash|python[0-9.]*|perl|ruby|node)\s+-[ce]\b|"
+     r"\bbase64\s+(?:-d|--decode)\b|\|\s*(?:bash|sh|zsh|ash|python[0-9.]*)\b", "it runs code that cannot be checked"),
+    (r"\b(?:crictl|docker|ctr|nerdctl)\b[^|;&]*\s(?:rm|rmi|stop|kill|exec|pull|push|run|runp|create|start|restart|prune)\b",
+     "it can change containers"),
+    (r"\betcdctl\b[^|;&]*\s(?:put|del|defrag|compact|move-leader|snapshot\s+(?:save|restore)|member\s+(?:add|remove|update))\b",
+     "it can change etcd"),
+    (r"\bkubeadm\b[^|;&]*\s(?:reset|init|join|upgrade\s+apply|certs\s+renew|token\s+(?:create|delete))\b|"
+     r"\bhelm\b[^|;&]*\s(?:install|upgrade|uninstall|rollback|delete)\b", "it can change the cluster"),
+    (r"(?:/etc/shadow|/etc/gshadow|id_rsa|id_ed25519|id_ecdsa|\.pgpass|\.kube/config|/etc/kubernetes/\S*\.conf|"
+     r"/etc/kubernetes/pki/\S*\.key|\S+\.key\b|\S+\.pfx\b|\S+\.p12\b|\S+\.jks\b)", "it would read secrets or private keys"),
+    (r"(?:kubectl|\{K\})[^|;&]*\bget\b[^|;&]*\bsecrets?\b[^|;&]*(?:-o|--output)", "it would print secret values"),
+]]
+_QUOTED = re.compile(r"'[^']*'|\"[^\"]*\"")
+_REDIRECT = re.compile(r"(?<![0-9&<>])[0-9]?>{1,2}(?!\s*(?:&[0-9]|/dev/null))")
+_SEGMENT = re.compile(r"[^|;&\n]+")
+
+
+def readonly_problem(command, mode):
+    """Return why a command may not be read-only, or None when nothing suspicious was found."""
+    if mode == "nsxcli":
+        if not re.match(r"\s*(?:get|ping|traceroute|nslookup|help)\b", command) or re.search(r"[|;&`\n]|\$\(", command):
+            return "only single NSX CLI 'get' commands are read-only"
+        return None
+    for rx, why in READONLY_RULES:
+        if rx.search(command):
+            return why
+    if _REDIRECT.search(_QUOTED.sub("''", command)):
+        return "it writes its output to a file"
+    for seg in _SEGMENT.findall(_QUOTED.sub("''", command)):
+        words = seg.split()
+        for i, word in enumerate(words):
+            base = word.rsplit("/", 1)[-1]
+            if base in ("esxcli", "localcli"):
+                named = []
+                for x in words[i + 1:]:
+                    if x.startswith("-"):
+                        break
+                    named.append(x)
+                if not named or named[-1] not in ("get", "list", "ping"):
+                    return "only esxcli 'get' and 'list' commands are read-only"
+            if base == "kubectl" or word == "{K}":
+                verbs = [x for x in words[i + 1:] if x in _KUBE_READ or x in _KUBE_WRITE or
+                         x in ("rollout", "config", "auth")]
+                if not verbs:
+                    return "the kubectl action could not be recognised"
+                verb, rest = verbs[0], words[words.index(verbs[0]) + 1:]
+                if verb in _KUBE_WRITE:
+                    return "kubectl %s changes the cluster or opens a session" % verb
+                sub = next((x for x in rest if not x.startswith("-")), "")
+                if (verb == "rollout" and sub not in ("status", "history")) or \
+                        (verb == "config" and sub not in ("view", "current-context", "get-contexts")) or \
+                        (verb == "auth" and sub not in ("can-i", "whoami")):
+                    return "kubectl %s %s is not read-only" % (verb, sub)
+    return None
+
+
+class Decoder:
+    """Translates placeholders back to real names with the private mapping."""
+
+    def __init__(self, mapping):
+        self.rev = {}
+        for cat, vals in mapping.maps.items():
+            if cat in ("ipv4net", "file"):
+                continue
+            for real, ph in vals.items():
+                self.rev.setdefault(ph.lower(), real)
+        self.rx = re.compile(r"(?i)(?<![\w-])(?:%s)(?![\w-])" % "|".join(
+            re.escape(k) for k in sorted(self.rev, key=len, reverse=True))) if self.rev else None
+
+    def __call__(self, text):
+        return self.rx.sub(lambda m: self.rev[m.group(0).lower()], text) if self.rx else text
+
+
+def _clamp(value, default, lo, hi):
+    try:
+        return min(hi, max(lo, int(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def prepare_plan(args, text):
+    """Translate an analyst reply and sort its steps into: read-only diagnostics the tool
+    may run, and everything else, which is only shown for the person to apply by hand."""
+    inv = find_inventory(args)
+    if not inv:
+        die("no inventory file found - the reply refers to hosts in your inventory")
+    settings, sections, _ = load_inventory(inv)
+    mapping = Mapping(os.path.join(args.private_dir, "mapping.json"))
+    dec = Decoder(mapping)
+    if not dec.rev:
+        die("no mapping found in %s - run a collection first" % args.private_dir)
+    known, by_addr = {}, {}
+    for s in sections:
+        for addr in s["hosts"]:
+            ph = mapping.lookup("target", addr) or (None if is_ip(addr) else mapping.lookup("host", addr.split(".")[0]))
+            by_addr[(s["name"], addr)] = ph or "not in a report yet"
+            if ph:
+                known.setdefault(ph.lower(), (s, addr, ph))
+    parsed = parse_plan(text)
+    out = {"title": parsed["title"], "translated": dec(text), "collect": [], "manual": [], "problems": [],
+           "settings": settings, "sections": sections, "plan": []}
+    per_host = {}
+    for n, st in enumerate(parsed["steps"], 1):
+        label = st["label"] or "Step %d" % n
+        if not st["run"].strip():
+            out["problems"].append("Step %d (%s) has no run: line and was ignored." % (n, label))
+            continue
+        resolved, unknown = [], []
+        for tok in st["targets"]:
+            if tok.startswith("@"):
+                sec = next((s for s in sections if s["name"].lower() == tok[1:].lower()), None)
+                if sec:
+                    resolved += [(sec, a, by_addr[(sec["name"], a)]) for a in sec["hosts"]]
+                else:
+                    unknown.append(tok)
+            elif tok.lower().split(".")[0] in known:
+                resolved.append(known[tok.lower().split(".")[0]])
+            else:
+                unknown.append(tok)
+        resolved = list({(s["name"], a): (s, a, ph) for s, a, ph in resolved}.values())
+        if unknown:
+            out["problems"].append("Step %d (%s): %s is not a host or group in your inventory."
+                                   % (n, label, ", ".join(unknown)))
+        entry = {"kind": st["kind"], "label": dec(label), "note": dec(st["note"]), "command": dec(st["run"]),
+                 "reason": "", "targets": [{"section": s["name"], "address": a, "placeholder": ph}
+                                           for s, a, ph in resolved]}
+        if st["kind"] == "fix":
+            out["manual"].append(entry)
+            continue
+        if not resolved:
+            continue
+        modes = {}
+        for s, a, ph in resolved:
+            mode = st["mode"].lower() if st["mode"].lower() in ("sh", "nsxcli", "kubectl") else (
+                "kubectl" if "{K}" in st["run"] else
+                "nsxcli" if COMPONENTS[s["type"]].get("nsxcli") and re.match(r"\s*get\s", st["run"]) else "sh")
+            modes[(s["name"], a)] = mode
+        reason = next((r for r in (readonly_problem(st["run"], m) for m in set(modes.values())) if r), None)
+        if reason:
+            entry.update(kind="blocked", reason=reason)
+            out["manual"].append(entry)
+            continue
+        out["collect"].append(entry)
+        for s, a, ph in resolved:
+            per_host.setdefault(s["name"], {}).setdefault(a, []).append(
+                cmd(label, entry["command"], timeout=_clamp(st["timeout"], 60, 5, 900), mode=modes[(s["name"], a)],
+                    max_lines=_clamp(st["lines"], 400, 20, 5000)))
+    for s in sections:
+        if s["name"] in per_host:
+            out["plan"].append({"sec": s, "hosts": list(per_host[s["name"]]), "groups": [],
+                                "host_groups": {a: [FOLLOWUP_GROUP + (cs,)] for a, cs in per_host[s["name"]].items()}})
+    return out
+
+
+def plan_public(prep):
+    """The part of a prepared plan that is shown to the person (contains real names)."""
+    logins = [{"name": i["sec"]["name"], "title": COMPONENTS[i["sec"]["type"]]["title"], "user": i["sec"]["user"],
+               "escalate": i["sec"]["escalate"]} for i in prep["plan"]]
+    return {"title": prep["title"], "translated": prep["translated"], "collect": prep["collect"],
+            "manual": prep["manual"], "problems": prep["problems"], "logins": logins}
+
+
+def cmd_plan(args):
+    with open(args.plan, encoding="utf-8", errors="replace") as fh:
+        prep = prepare_plan(args, fh.read())
+
+    def show(e):
+        print("  - %s" % e["label"])
+        print("      on:  %s" % (", ".join("%s (%s)" % (t["address"], t["placeholder"]) for t in e["targets"]) or "?"))
+        for i, ln in enumerate(e["command"].split("\n")):
+            print("      %s %s" % ("run:" if i == 0 else "    ", ln))
+        if e["note"]:
+            print("      note: %s" % e["note"])
+        if e["reason"]:
+            print("      NOT RUN by this tool: %s" % e["reason"])
+
+    if prep["title"]:
+        print("Plan: %s" % prep["title"])
+    for p in prep["problems"]:
+        print("warning: %s" % p)
+    if prep["manual"]:
+        print("\nTo apply by hand (this tool never runs these):")
+        for e in prep["manual"]:
+            show(e)
+    if not prep["collect"]:
+        print("\nNo read-only diagnostics to run." if prep["manual"] else "\nNo plan steps were found in that file.")
+        return 0
+    print("\nRead-only diagnostics requested:")
+    for e in prep["collect"]:
+        show(e)
+    if not ask_yes("\nRun these %d read-only diagnostic(s) now?" % len(prep["collect"]), default=False):
+        return 0
+    if args.parallel is None:
+        args.parallel = int(prep["settings"].get("parallel", 4))
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda *_: sys.exit(143))
+    try:
+        res = collect_and_report(args, prep["settings"], prep["sections"], prep["plan"], ConsoleUI(),
+                                 kind="followup", title=prep["title"])
+    except KeyboardInterrupt:
+        print("\nInterrupted - connections closed. No report written.")
+        return 130
+    print_result(args, res)
+    return 0
 
 
 # ----------------------------------------------------------------------------
@@ -2222,8 +2562,8 @@ td.mono { font-family: ui-monospace, Menlo, monospace; font-size: 13px; overflow
   </div>
   <nav role="tablist">
     <button role="tab" data-tab="collect" aria-selected="true">Collect</button>
+    <button role="tab" data-tab="reply" aria-selected="false">Analyst reply</button>
     <button role="tab" data-tab="scrub" aria-selected="false">Anonymize text</button>
-    <button role="tab" data-tab="decode" aria-selected="false">Translate back</button>
   </nav>
 </div></header>
 
@@ -2268,6 +2608,7 @@ td.mono { font-family: ui-monospace, Menlo, monospace; font-size: 13px; overflow
   <div id="result" hidden>
     <h2>Report ready</h2>
     <p id="resSummary"></p>
+    <p class="muted">Send the saved file for analysis, then paste the answer into the <b>Analyst reply</b> tab.</p>
     <div id="resPrivacy"></div>
     <div id="resQuads" class="note warn" hidden></div>
     <div class="actions">
@@ -2298,13 +2639,35 @@ td.mono { font-family: ui-monospace, Menlo, monospace; font-size: 13px; overflow
   <pre id="scrubOut" hidden></pre>
 </section>
 
-<section id="tab-decode" hidden>
-  <p class="muted">Paste an analysis that uses placeholders. It is translated back to your real names.
-    The result is shown here only.</p>
-  <textarea id="decodeIn" placeholder="Paste text with placeholders here" aria-label="Text to translate back"></textarea>
-  <div class="actions"><button class="btn primary" id="decodeGo">Translate back</button>
-    <span class="muted" id="decodeMsg"></span></div>
-  <pre id="decodeOut" hidden></pre>
+<section id="tab-reply" hidden>
+  <p class="muted">Paste the analyst's whole reply. Placeholders are translated back to your real names.
+    Fixes are only shown, for you to apply by hand: this tool never runs them. Read-only follow-up
+    diagnostics can be run from here.</p>
+  <textarea id="replyIn" placeholder="Paste the reply here" aria-label="Analyst reply"></textarea>
+  <div class="actions"><button class="btn primary" id="replyGo">Translate and read plan</button>
+    <span class="muted" id="replyMsg"></span></div>
+  <div id="replyOut" hidden>
+    <div id="planProblems" class="note warn" hidden></div>
+    <div id="planManualWrap" hidden>
+      <h2>To apply by hand</h2>
+      <p class="muted">The tool does not run these. Read each one, make sure you agree, then run it yourself
+        on the host shown, in this order.</p>
+      <div id="planManual"></div>
+    </div>
+    <div id="planCollectWrap" hidden>
+      <h2>Read-only diagnostics requested</h2>
+      <p class="muted">These only read information. Check the commands, enter the logins and run them. The
+        output is anonymized into a follow-up report to send back.</p>
+      <div class="tablewrap"><table><thead><tr><th>Host</th><th>What</th><th>Command</th></tr></thead>
+        <tbody id="planCollect"></tbody></table></div>
+      <div id="planCreds"></div>
+      <div class="actions"><button class="btn primary" id="planRun">Run these diagnostics</button>
+        <span class="muted" id="planRunMsg"></span></div>
+    </div>
+    <h2>Translated reply</h2>
+    <p class="muted">Shown here only. It contains your real names, so do not send this version anywhere.</p>
+    <pre id="replyText"></pre>
+  </div>
 </section>
 </main>
 
@@ -2353,7 +2716,7 @@ let sections = [], lastReport = "", logNext = 0, timer = null;
 // ---- tabs ----
 $$("nav button").forEach(b => b.onclick = () => {
   $$("nav button").forEach(x => x.setAttribute("aria-selected", x === b));
-  ["collect", "scrub", "decode"].forEach(t => $("#tab-" + t).hidden = t !== b.dataset.tab);
+  ["collect", "reply", "scrub"].forEach(t => $("#tab-" + t).hidden = t !== b.dataset.tab);
 });
 
 // ---- selection ----
@@ -2582,12 +2945,82 @@ $("#scrubGo").onclick = async () => {
   } catch (e) { $("#scrubMsg").textContent = e.message; }
 };
 $("#scrubCopy").onclick = () => copyText($("#scrubOut").textContent, $("#scrubMsg"));
-$("#decodeGo").onclick = async () => {
-  $("#decodeMsg").textContent = "";
+
+// ---- analyst reply: translate, show fixes, run read-only follow-ups ----
+let planText = "";
+const hostNames = ts => ts.length ? ts.map(t => t.address + " (" + t.placeholder + ")").join(", ") : "no known host";
+function credFields(l) {
+  const user = el("input", { type: "text", className: "user", value: l.user, autocomplete: "off", spellcheck: false });
+  user.setAttribute("autocapitalize", "off");
+  const f = el("div", { className: "fields" },
+    el("label", { className: "f" }, "SSH username", user),
+    el("label", { className: "f" }, "SSH password", el("input", { type: "password", className: "pass", autocomplete: "off" })));
+  if (l.escalate === "su")
+    f.append(el("label", { className: "f" }, "Root password for su",
+      el("input", { type: "password", className: "su", autocomplete: "off" })));
+  const card = el("div", { className: "card on" },
+    el("div", { className: "row" }, el("b", { textContent: l.name }), el("span", { textContent: l.title })), f);
+  card.dataset.name = l.name;
+  return card;
+}
+function renderPlan(r) {
+  $("#replyOut").hidden = false;
+  $("#replyText").textContent = r.translated;
+  const pr = $("#planProblems");
+  pr.hidden = !r.problems.length;
+  pr.textContent = r.problems.join(" ");
+  const man = $("#planManual");
+  man.textContent = "";
+  $("#planManualWrap").hidden = !r.manual.length;
+  r.manual.forEach((e, i) => {
+    const msg = el("span", { className: "muted" });
+    const card = el("div", { className: "card" },
+      el("div", { className: "row" }, el("b", { textContent: (i + 1) + ". " + e.label }),
+        el("span", { className: "pill " + (e.kind === "fix" ? "warn" : "bad"),
+          textContent: e.kind === "fix" ? "changes the system" : "not run by the tool" })),
+      el("p", { textContent: "On: " + hostNames(e.targets) }));
+    if (e.reason) card.append(el("p", { className: "muted", textContent:
+      "It was requested as a read-only check, but " + e.reason + ". Run it yourself only if you agree with it." }));
+    if (e.note) card.append(el("p", { textContent: e.note }));
+    card.append(el("pre", { textContent: e.command }),
+      el("div", { className: "actions" }, el("button", { className: "btn", textContent: "Copy command",
+        onclick: () => copyText(e.command, msg) }), msg));
+    man.append(card);
+  });
+  const tb = $("#planCollect");
+  tb.textContent = "";
+  $("#planCollectWrap").hidden = !r.collect.length;
+  for (const e of r.collect)
+    tb.append(el("tr", {}, el("td", { className: "mono", textContent: e.targets.map(t => t.address).join("\n") }),
+      el("td", { textContent: e.label }), el("td", { className: "mono", textContent: e.command })));
+  const creds = $("#planCreds");
+  creds.textContent = "";
+  r.logins.forEach(l => creds.append(credFields(l)));
+  if (!r.manual.length && !r.collect.length && !r.problems.length)
+    $("#replyMsg").textContent = "No plan block was found in this reply. The translation is below.";
+}
+$("#replyGo").onclick = async () => {
+  $("#replyMsg").textContent = ""; $("#planRunMsg").textContent = "";
   try {
-    const r = await api("decode", { text: $("#decodeIn").value });
-    $("#decodeOut").textContent = r.text; $("#decodeOut").hidden = false;
-  } catch (e) { $("#decodeMsg").textContent = e.message; }
+    const r = await api("plan", { text: $("#replyIn").value });
+    planText = $("#replyIn").value;
+    renderPlan(r);
+  } catch (e) { $("#replyOut").hidden = true; $("#replyMsg").textContent = e.message; }
+};
+$("#planRun").onclick = async () => {
+  const req = { text: planText, sections: {}, options: { parallel: +$("#optParallel").value, strict: $("#optStrict").checked } };
+  let bad = null;
+  for (const card of $$("#planCreds .card")) {
+    const need = [$(".pass", card)].concat($(".su", card) ? [$(".su", card)] : []);
+    for (const i of need) { i.classList.toggle("missing", !i.value); if (!i.value && !bad) bad = i; }
+    req.sections[card.dataset.name] = { user: $(".user", card).value.trim(), password: $(".pass", card).value,
+      su_password: $(".su", card) ? $(".su", card).value : null };
+  }
+  if (bad) { bad.focus(); $("#planRunMsg").textContent = "Enter the password for each group"; return; }
+  try { await api("plan_run", req); } catch (e) { $("#planRunMsg").textContent = e.message; return; }
+  $$("#planCreds input[type=password]").forEach(i => i.value = "");
+  $('nav button[data-tab="collect"]').click();
+  startPolling();
 };
 
 $("#quit").onclick = async () => {
@@ -2738,28 +3171,68 @@ class Gui:
                                "su_password": sel.get("su_password")}
             if not plan:
                 raise Fatal("nothing selected")
-            opt = body.get("options") or {}
-            args = argparse.Namespace(**vars(self.args))
-            args.parallel = min(16, max(1, int(opt.get("parallel") or settings.get("parallel", 4))))
-            args.max_lines = min(5000, max(20, int(opt.get("max_lines") or self.args.max_lines)))
-            args.strict_host_keys = bool(opt.get("strict")) or self.args.strict_host_keys
+            args = self._run_args(body, settings)
             scale = self.args.timeout_scale
             scale_timeouts(plan, scale if scale is not None else float(settings.get("timeout", 30)) / 30.0)
         except Exception:
             with self.lock:
                 self.state = "idle"
             raise
+        return self._start(args, settings, sections, plan, creds, "health", "")
+
+    def _run_args(self, body, settings):
+        opt = body.get("options") or {}
+        args = argparse.Namespace(**vars(self.args))
+        args.parallel = _clamp(opt.get("parallel") or settings.get("parallel", 4), 4, 1, 16)
+        args.max_lines = _clamp(opt.get("max_lines") or self.args.max_lines, 200, 20, 5000)
+        args.strict_host_keys = bool(opt.get("strict")) or self.args.strict_host_keys
+        return args
+
+    def _start(self, args, settings, sections, plan, creds, kind, title):
         with self.lock:
             del self.lines[:]
             self.result, self.error, self.prompt = None, "", None
-        threading.Thread(target=self._run, args=(args, settings, sections, plan, creds), daemon=True).start()
+        threading.Thread(target=self._run, args=(args, settings, sections, plan, creds, kind, title),
+                         daemon=True).start()
         return {"ok": True}
 
-    def _run(self, args, settings, sections, plan, creds):
+    def api_plan(self, body):
+        text = str(body.get("text", ""))
+        if not text.strip():
+            raise Fatal("paste the reply first")
+        return plan_public(prepare_plan(self.args, text))
+
+    def api_plan_run(self, body):
+        """Run the read-only diagnostics of a pasted reply. Fix steps are never run."""
+        with self.lock:
+            if self.state == "running":
+                raise Fatal("a collection is already running")
+            self.state = "running"
+        try:
+            prep = prepare_plan(self.args, str(body.get("text", "")))
+            if not prep["plan"]:
+                raise Fatal("this reply contains no read-only diagnostics to run")
+            creds = {}
+            for item in prep["plan"]:
+                name = item["sec"]["name"]
+                sel = (body.get("sections") or {}).get(name) or {}
+                if not sel.get("password"):
+                    raise Fatal("no password given for [%s]" % name)
+                creds[name] = {"user": str(sel.get("user") or "").strip(), "password": str(sel["password"]),
+                               "su_password": sel.get("su_password")}
+            args = self._run_args(body, prep["settings"])
+        except Exception:
+            with self.lock:
+                self.state = "idle"
+            raise
+        return self._start(args, prep["settings"], prep["sections"], prep["plan"], creds, "followup", prep["title"])
+
+    def _run(self, args, settings, sections, plan, creds, kind="health", title=""):
         state, result, error = "error", None, ""
         try:
             result = collect_and_report(args, settings, sections, plan, GuiUI(self, creds),
-                                        on_context=lambda ctx: setattr(self, "ctx", ctx))
+                                        on_context=lambda ctx: setattr(self, "ctx", ctx),
+                                        kind=kind, title=title)
             state = "done" if result else "cancelled"
         except Fatal as e:
             error = str(e)
@@ -2831,6 +3304,10 @@ class Gui:
                 return self.api_inventory_set(body)
             if route == "run":
                 return self.api_run(body)
+            if route == "plan":
+                return self.api_plan(body)
+            if route == "plan_run":
+                return self.api_plan_run(body)
             if route == "answer":
                 return self.api_answer(body)
             if route == "cancel":
@@ -3021,6 +3498,9 @@ def main(argv=None):
                     help="only connect to hosts already in known_hosts (default: trust on first use)")
     ap.add_argument("--scrub-file", nargs="+", metavar="FILE",
                     help="anonymize existing text files with the same mapping, then exit")
+    ap.add_argument("--plan", metavar="FILE",
+                    help="read an analyst reply: show its fixes translated to real names (never run) and "
+                         "offer to run the read-only diagnostics it asks for")
     ap.add_argument("--decode", metavar="FILE",
                     help="print FILE with placeholders translated back to real names (local use only)")
     ap.add_argument("--self-test", action="store_true", help="test the anonymizer and exit")
@@ -3044,6 +3524,8 @@ def dispatch(args):
         return cmd_decode(args)
     if args.scrub_file:
         return cmd_scrub_files(args)
+    if args.plan:
+        return cmd_plan(args)
     if args.gui:
         return cmd_gui(args)
     try:

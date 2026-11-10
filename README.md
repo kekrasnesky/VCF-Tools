@@ -1,15 +1,32 @@
 # VCF-Tools
 
-## vcf_diag — anonymized health collector for VCF 9.x
+## vcf_diag — anonymized diagnostics for VCF 9.x
 
-`vcf_diag.py` logs in to the parts of a VMware Cloud Foundation environment over SSH, runs
-read-only health and status checks, and writes one Markdown report in which hostnames, domains,
-IP addresses and other identifiers are replaced by consistent placeholders. The report is meant
-to be shared for analysis; the table that maps placeholders back to real names never leaves
-your machine.
+`vcf_diag.py` lets you get outside help with a VMware Cloud Foundation environment without
+revealing what the environment is. It runs where your environment is (it needs no internet),
+and everything it writes for sharing uses placeholders instead of hostnames, domains, IP
+addresses and other identifiers. The table that maps placeholders back to real names never
+leaves your machine.
 
 It is one script with no dependencies beyond what macOS already has. Use it from a simple
 window in your browser, or from the terminal.
+
+### How the loop works
+
+1. **Collect.** The tool logs in over SSH, runs read-only health and status checks and writes an
+   anonymized Markdown report.
+2. **Send.** You carry that file out and share it with the analyst (for example Claude). The
+   report itself explains to the analyst how to answer.
+3. **Reply.** The analyst answers using the placeholders. The answer can contain a plan with two
+   kinds of steps: read-only diagnostics it would like to see next, and fixes it proposes.
+4. **Translate.** You paste the answer into the tool. It shows the whole answer with your real
+   names, and sorts the plan:
+   - **Read-only diagnostics** are listed with the exact commands. If you agree, the tool runs
+     them and writes an anonymized follow-up report. Back to step 2.
+   - **Fixes are never run by the tool.** They are shown with real names, impact notes and a
+     copy button, for you to review and apply by hand.
+
+The tool only ever reads from your systems. Anything that changes them is done by you.
 
 ### Requirements
 
@@ -36,8 +53,10 @@ A page opens in your browser:
 4. When it finishes you see the privacy check, which real host became which placeholder, and a
    preview of the report, with **Copy report**, **Save a copy…** and **Show file**.
 
-The **Anonymize text** tab scrubs anything you paste (a log excerpt, an error message) with the
-same placeholders. **Translate back** turns placeholders in an analysis into your real names.
+The **Analyst reply** tab is where the answer comes back in: paste it, click **Translate and
+read plan**, apply the fixes by hand and, if you want, run the requested read-only diagnostics.
+The **Anonymize text** tab scrubs anything else you paste (a log excerpt, an error message) with
+the same placeholders.
 
 The page is served by the script to your own Mac only (`127.0.0.1`, behind a random one-time
 address). Nothing is uploaded anywhere. Leave the Terminal window that started it open; **Quit**
@@ -157,14 +176,37 @@ identifying word the tool has never seen. **Read the report before you send it.*
 - `vcf-diag-private/mapping.json` maps placeholders to real names. It is created with owner-only
   permissions. **Never share that directory.** `inventory.ini`, the private directory and the
   output directory are in `.gitignore`.
-- Every check is read-only. Nothing is restarted or changed on the targets. Checks have a time
+- Every built-in check is read-only, and so is everything the tool runs from an analyst reply.
+  Nothing is restarted or changed on the targets by the tool. Proposed fixes are only displayed. Checks have a time
   limit, enforced on the remote side as well where the appliance supports it.
 - Host keys are trusted on first use and written to your normal `~/.ssh/known_hosts`. Use
   `--strict-host-keys` to connect only to hosts you have already accepted.
 
-### Working with the analysis
+### Working with the reply
 
-Translate placeholders in a reply back to real names, locally:
+In the window, use the **Analyst reply** tab. In the terminal, save the reply to a file and run:
+
+```bash
+python3 vcf_diag.py --plan reply.txt
+```
+
+It prints the fixes with your real names (they are not run), lists the read-only diagnostics
+that were requested, and asks whether to run those. The result is a
+`vcf-diag-output/vcf-followup-<timestamp>.md` to send back.
+
+How requested diagnostics are kept read-only:
+
+- You see every command, with the real host, before anything runs.
+- Each command is checked first. One that looks as if it changes something (deleting or writing
+  files, restarting services, `esxcli ... set`, `kubectl delete`, and so on) or that would print
+  secrets is refused and moved to the by-hand list with the reason.
+- That check is a safety net based on patterns, not a guarantee. Your reading of the list is
+  the real control.
+
+Follow-up output is usually log text, which is less predictable than status output. Skim a
+follow-up report more carefully than a health report before sending it.
+
+To only translate a text, without reading it as a plan:
 
 ```bash
 python3 vcf_diag.py --decode analysis.txt
@@ -193,6 +235,7 @@ python3 vcf_diag.py --scrub-file vpxd-excerpt.log
     --timeout-scale X    multiply all command time limits
     --max-lines N        output lines kept per check (default 200)
     --strict-host-keys   refuse hosts not already in known_hosts
+    --plan FILE          read an analyst reply: show fixes (never run), offer read-only follow-ups
     --scrub-file FILE..  anonymize existing text files
     --decode FILE        translate placeholders back (local only)
     --self-test          test the anonymizer
@@ -219,7 +262,10 @@ python3 vcf_diag.py --scrub-file vpxd-excerpt.log
   on a Mac yet. The check commands themselves have not yet been run against a live VCF 9.1.1
   system. Expect a few checks to need adjusting on the first real run; a failing check is
   recorded in the report and never stops the collection.
-- Scope is health and status. No log collection, no support bundles.
+- The first report covers health and status only. Logs are fetched on request, through the
+  read-only diagnostics in an analyst reply. No support bundles.
+- A proposed fix is based on anonymized data and can be wrong. Review it like any change to a
+  production system before you apply it.
 
 ### Tests
 

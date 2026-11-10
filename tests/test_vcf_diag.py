@@ -251,6 +251,164 @@ class MappingAndTools(unittest.TestCase):
         self.assertEqual(v.cmd_self_test(), 0)
 
 
+READ_ONLY_OK = r"""
+grep -iE 'error|fail' /var/log/vmware/vpxd/vpxd.log | tail -n 200
+tail -n 100 /var/log/vmkernel.log
+esxcli network nic stats get -n vmnic0
+esxcli vsan debug object health summary get
+esxcli software vib list | grep -i nsx
+esxcli network diag ping -H ip-n1-h2 -I vmk1 -s 8972 -d
+vmkping -I vmk1 -s 8972 -d ip-n1-h2
+{K} logs -n prelude provisioning-service-app-5d9c7b6f4-x2x9z --tail=200 --previous 2>&1
+{K} get pods -n prelude -o wide | awk '$4!="Running" && $5>3'
+{K} describe pod -n prelude identity-service-app-0 | tail -n 40
+{K} rollout status deploy/foo -n prelude
+{K} get secret -n prelude
+journalctl -u vmware-vpxd --since '2 hours ago' --no-pager | grep -i error | tail -n 100
+systemctl status vmware-vpxd --no-pager 2>&1 | head -n 20
+service-control --status vmware-vpxd
+df -h; free -m; uptime
+openssl x509 -in /etc/vmware-vpx/ssl/rui.crt -noout -dates
+curl -sk https://localhost/lcm/about
+curl -s -m 5 -o /dev/null -w '%{http_code}' https://vcenter-01.domain-01/ 2>/dev/null
+nc -vz ip-n1-h5 443 2>&1
+rpm -qa | grep -i vmware | head
+vim-cmd hostsvc/hostsummary | grep -i maintenance
+vim-cmd vmsvc/getallvms | wc -l
+zcat /var/log/vmware/vpxd/vpxd-1.log.gz | grep -c ERROR
+find /var/log -name '*.log' -mmin -60 -size +100M
+chage -l root
+nsxcli -c 'get managers'
+for f in /var/log/vmware/*/*.log; do echo "$f $(grep -c ERROR "$f")"; done | sort -k2 -n | tail
+"""
+
+NOT_READ_ONLY = r"""
+rm -f /var/log/x.log
+service-control --restart vmware-vpxd
+systemctl restart vmware-vpxd
+echo 1 > /proc/sys/vm/drop_caches
+grep x /var/log/a | tee /tmp/out
+esxcli system maintenanceMode set -e true
+esxcli storage core adapter rescan --all
+{K} delete pod -n prelude foo
+{K} -n prelude delete pod foo
+{K} exec -n prelude foo -- cat /etc/passwd
+{K} rollout restart deploy/foo -n prelude
+{K} get secret -n prelude db-creds -o yaml
+sed -i 's/a/b/' /etc/hosts
+cat /etc/shadow
+cat /root/.ssh/id_rsa
+cat /etc/kubernetes/admin.conf
+curl -X POST https://localhost/api/restart
+curl -sk https://localhost/x -d '{"a":1}'
+find /tmp -name '*.core' -delete
+find /var/core -type f -exec rm {} \;
+kill -9 1234
+sudo cat /var/log/messages
+bash -c 'echo hi'
+echo cm0gLXJmIC8K | base64 -d | sh
+python3 -c 'import os; os.remove("/x")'
+vim-cmd vmsvc/power.off 12
+vim-cmd hostsvc/maintenance_mode_enter
+nsxcli -c 'set service ntp restart'
+psql -U postgres -d VCDB -c 'delete from vpx_event'
+tdnf install -y foo
+chage -M 90 root
+ls /tmp && rm -rf /tmp/x
+uptime; shutdown -r now
+scp /etc/hosts other:/tmp
+date >> /var/log/custom.log
+/usr/bin/rm /tmp/x
+timeout 5 rm /tmp/x
+nc ip-n1-h5 443 < /etc/passwd
+"""
+
+REPLY = """The vpxd service on vcenter-01.domain-01 cannot reach esxi-01 (ip-n1-h1).
+
+```vcf-plan
+plan: look at vpxd and restart it
+
+[collect] target=vcenter-01
+label: vpxd errors
+run: grep -i error /var/log/vmware/vpxd/vpxd.log |
+  grep esxi-01.domain-01 | tail -n 50
+timeout: 90
+lines: 80
+
+[collect] target=@esxi
+label: clean up
+run: rm -rf /var/core/*
+
+[collect] target=nosuchhost-09
+label: unknown host
+run: uptime
+
+[fix] target=vcenter-01
+label: Restart vpxd
+run: service-control --restart vmware-vpxd
+note: vCenter API is down for two minutes; esxi-01 reconnects by itself.
+```
+"""
+
+
+class Plans(unittest.TestCase):
+    def test_read_only_check(self):
+        mode = lambda c: "kubectl" if "{K}" in c else "sh"   # noqa: E731
+        refused = [c for c in READ_ONLY_OK.strip().split("\n") if v.readonly_problem(c, mode(c))]
+        allowed = [c for c in NOT_READ_ONLY.strip().split("\n") if not v.readonly_problem(c, mode(c))]
+        self.assertEqual(refused, [], "read-only commands wrongly refused")
+        self.assertEqual(allowed, [], "changing commands wrongly allowed")
+        self.assertIsNone(v.readonly_problem("get cluster status", "nsxcli"))
+        self.assertIsNotNone(v.readonly_problem("set service ntp", "nsxcli"))
+        self.assertIsNotNone(v.readonly_problem("get managers | tee x", "nsxcli"))
+
+    def test_parse_plan(self):
+        p = v.parse_plan(REPLY)
+        self.assertEqual(p["title"], "look at vpxd and restart it")
+        self.assertEqual([s["kind"] for s in p["steps"]], ["collect", "collect", "collect", "fix"])
+        self.assertEqual(p["steps"][0]["targets"], ["vcenter-01"])
+        self.assertIn("\ngrep esxi-01.domain-01 | tail -n 50", p["steps"][0]["run"])
+        self.assertEqual((p["steps"][0]["timeout"], p["steps"][0]["lines"]), ("90", "80"))
+        self.assertTrue(p["steps"][3]["note"].startswith("vCenter API is down"))
+        self.assertEqual(v.parse_plan("just prose, no plan")["steps"], [])
+
+    def test_prepare_plan_sorts_steps_and_translates(self):
+        import argparse
+        with tempfile.TemporaryDirectory() as d:
+            inv = os.path.join(d, "inventory.ini")
+            with open(inv, "w") as fh:
+                fh.write("[esxi]\nhosts = esx01.corp.example-widgets.com\n"
+                         "[vcenter]\nhosts = vc01.corp.example-widgets.com\n")
+            args = argparse.Namespace(inventory=inv, private_dir=os.path.join(d, "private"))
+            with self.assertRaises(v.Fatal):
+                v.prepare_plan(args, REPLY)                 # no mapping yet
+            m = v.Mapping(os.path.join(d, "private", "mapping.json"))
+            sc = make(mapping=m)
+            run(sc, "10.1.1.5")
+            m.save()
+            prep = v.prepare_plan(args, REPLY)
+            self.assertIn("vc01.corp.example-widgets.com cannot reach esx01 (10.1.1.5)", prep["translated"])
+            self.assertEqual([e["label"] for e in prep["collect"]], ["vpxd errors"])
+            self.assertIn("grep esx01.corp.example-widgets.com", prep["collect"][0]["command"])
+            self.assertEqual(prep["collect"][0]["targets"][0]["address"], "vc01.corp.example-widgets.com")
+            kinds = {e["label"]: e["kind"] for e in prep["manual"]}
+            self.assertEqual(kinds, {"clean up": "blocked", "Restart vpxd": "fix"})
+            self.assertTrue(any("nosuchhost-09" in p for p in prep["problems"]))
+            # only the read-only step is in the plan the tool would run
+            self.assertEqual(len(prep["plan"]), 1)
+            item = prep["plan"][0]
+            self.assertEqual(item["sec"]["name"], "vcenter")
+            cmds = item["host_groups"]["vc01.corp.example-widgets.com"][0][2]
+            self.assertEqual([(c["label"], c["timeout"], c["max_lines"]) for c in cmds], [("vpxd errors", 90, 80)])
+            self.assertNotIn("service-control", str(prep["plan"]))
+            self.assertNotIn("rm -rf", str(prep["plan"]))
+
+    def test_encoded_blobs_are_redacted(self):
+        out = run(make(), "client-key-data: " + "QUJD" * 60 + "\nok: short QUJDQUJD")
+        self.assertIn("[REDACTED-ENCODED-DATA]", out)
+        self.assertIn("short QUJDQUJD", out)
+
+
 class GuiApi(unittest.TestCase):
     """The browser GUI's local web API, without contacting any host."""
 
@@ -324,6 +482,23 @@ class GuiApi(unittest.TestCase):
                                                                "groups": ["system"], "password": ""}}})
         self.assertEqual(code, 400)
         self.assertIn("no password", out["error"])
+        self.assertEqual(self.call("api/status?since=0")[1]["state"], "idle")
+
+    def test_reply_is_translated_and_fixes_are_never_runnable(self):
+        self.call("api/inventory", {"text": "[esxi]\nhosts = esx01.corp.example-widgets.com\n"
+                                            "[vcenter]\nhosts = vc01.corp.example-widgets.com\n"})
+        self.call("api/scrub", {"text": "seed the mapping 10.1.1.5"})
+        code, plan = self.call("api/plan", {"text": REPLY})
+        self.assertEqual(code, 200)
+        self.assertEqual([e["label"] for e in plan["collect"]], ["vpxd errors"])
+        self.assertEqual({e["kind"] for e in plan["manual"]}, {"fix", "blocked"})
+        self.assertEqual([lg["name"] for lg in plan["logins"]], ["vcenter"])
+        self.assertIn("vc01.corp.example-widgets.com", plan["translated"])
+        # a reply that only contains fixes offers nothing to run
+        only_fix = "```vcf-plan\n[fix] target=vcenter-01\nrun: service-control --restart vmware-vpxd\n```"
+        code, out = self.call("api/plan_run", {"text": only_fix, "sections": {"vcenter": {"password": "x"}}})
+        self.assertEqual(code, 400)
+        self.assertIn("no read-only diagnostics", out["error"])
         self.assertEqual(self.call("api/status?since=0")[1]["state"], "idle")
 
     def test_anonymize_and_translate_back(self):
