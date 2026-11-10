@@ -8,7 +8,8 @@ IP addresses and other identifiers are replaced by consistent placeholders. The 
 to be shared for analysis; the table that maps placeholders back to real names never leaves
 your machine.
 
-It is one script with no dependencies beyond what macOS already has.
+It is one script with no dependencies beyond what macOS already has. Use it from a simple
+window in your browser, or from the terminal.
 
 ### Requirements
 
@@ -17,7 +18,32 @@ It is one script with no dependencies beyond what macOS already has.
 - The built-in OpenSSH client (`ssh`).
 - SSH reachability from your Mac to the systems you want to check, and SSH enabled on them.
 
-### Quick start
+### Quick start (window)
+
+Double-click `start-gui.command` in Finder, or run:
+
+```bash
+python3 vcf_diag.py --gui
+```
+
+A page opens in your browser:
+
+1. Click **Edit inventory** and list your hosts under the matching sections (first time only).
+2. Tick the groups to check and type the SSH username and password for each. Open
+   **Choose hosts and checks** to narrow a group down.
+3. Click **Run diagnostics** and watch the progress. If a login is rejected you are asked again
+   before any other host is contacted.
+4. When it finishes you see the privacy check, which real host became which placeholder, and a
+   preview of the report, with **Copy report**, **Save a copy…** and **Show file**.
+
+The **Anonymize text** tab scrubs anything you paste (a log excerpt, an error message) with the
+same placeholders. **Translate back** turns placeholders in an analysis into your real names.
+
+The page is served by the script to your own Mac only (`127.0.0.1`, behind a random one-time
+address). Nothing is uploaded anywhere. Leave the Terminal window that started it open; **Quit**
+or Ctrl-C stops it.
+
+### Quick start (terminal)
 
 ```bash
 python3 vcf_diag.py --init
@@ -119,9 +145,11 @@ identifying word the tool has never seen. **Read the report before you send it.*
 
 ### Privacy and credentials
 
-- Passwords are typed at a hidden prompt and held in memory only. They are passed to `ssh`
-  through a private socket; they are not written to disk, to the command line or to environment
-  variables.
+- Passwords are typed at a hidden prompt (or a password field in the window) and held in
+  memory only. They are passed to `ssh` through a private socket; they are not written to disk,
+  to the command line or to environment variables. In the window they travel only between your
+  browser and the script on the same Mac, and the fields are cleared when the run starts. If
+  your browser offers to save them, decline.
 - Each host gets one login attempt. The first host of a group is tried alone, so a mistyped
   password costs one failed login on one host rather than one on every host. If it is rejected
   you are asked again before anything else is contacted.
@@ -151,6 +179,8 @@ python3 vcf_diag.py --scrub-file vpxd-excerpt.log
 ### Options
 
 ```text
+    --gui                open the window in your browser
+    --no-browser         with --gui: print the address instead of opening it
 -i, --inventory FILE     inventory file (default ./inventory.ini)
 -o, --output-dir DIR     where reports go (default ./vcf-diag-output)
     --private-dir DIR    where the private mapping lives (default ./vcf-diag-private)
@@ -184,8 +214,9 @@ python3 vcf_diag.py --scrub-file vpxd-excerpt.log
 ### Status and limits
 
 - The collection engine, all login paths (plain shell, vCenter appliance shell, NSX CLI, `sudo`,
-  `su`) and the anonymizer are tested against a local SSH test rig and by the unit tests in
-  `tests/`. The check commands themselves have not yet been run against a live VCF 9.1.1
+  `su`), the window and the anonymizer are tested against a local SSH test rig, in a headless
+  Chromium browser and by the unit tests in `tests/`. The window has not been tried in Safari
+  on a Mac yet. The check commands themselves have not yet been run against a live VCF 9.1.1
   system. Expect a few checks to need adjusting on the first real run; a failing check is
   recorded in the report and never stops the collection.
 - Scope is health and status. No log collection, no support bundles.

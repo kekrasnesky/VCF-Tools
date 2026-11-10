@@ -251,5 +251,90 @@ class MappingAndTools(unittest.TestCase):
         self.assertEqual(v.cmd_self_test(), 0)
 
 
+class GuiApi(unittest.TestCase):
+    """The browser GUI's local web API, without contacting any host."""
+
+    def setUp(self):
+        import argparse
+        import http.client
+        import http.server
+        import threading
+        self.dir = tempfile.TemporaryDirectory()
+        d = self.dir.name
+        self.inv = os.path.join(d, "inventory.ini")
+        args = argparse.Namespace(inventory=self.inv, private_dir=os.path.join(d, "private"),
+                                  output_dir=os.path.join(d, "out"), parallel=None, max_lines=200,
+                                  strict_host_keys=False, timeout_scale=None, connect_timeout=5,
+                                  no_browser=True)
+        self.gui = v.Gui(args)
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), v.GuiHandler)
+        self.httpd.gui = self.gui
+        self.gui.httpd = self.httpd
+        self.port = self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.http = http.client
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.dir.cleanup()
+
+    def call(self, route, body=None, token=None, headers=None):
+        import json
+        c = self.http.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        h = {"Content-Type": "application/json"}
+        h.update(headers or {})
+        c.request("POST" if body is not None else "GET", "/%s/%s" % (token or self.gui.token, route),
+                  body=json.dumps(body) if body is not None else None, headers=h)
+        r = c.getresponse()
+        data = r.read().decode()
+        c.close()
+        return r.status, (json.loads(data) if route.startswith("api/") else data)
+
+    def test_access_is_limited_to_the_secret_local_url(self):
+        self.assertEqual(self.call("api/state", token="wrong")[0], 403)
+        self.assertEqual(self.call("api/state", headers={"Host": "evil.example"})[0], 403)
+        self.assertEqual(self.call("api/state", headers={"Origin": "http://evil.example"})[0], 403)
+        code, page = self.call("")
+        self.assertEqual(code, 200)
+        self.assertIn("VCF Diagnostics", page)
+        self.assertNotIn("http://", page.replace("http://www.w3.org", ""))   # no outside resources
+
+    def test_inventory_round_trip_and_validation(self):
+        code, inv = self.call("api/inventory")
+        self.assertFalse(inv["exists"])
+        self.assertEqual(inv["text"], v.INVENTORY_TEMPLATE)
+        code, out = self.call("api/inventory", {"text": "[bogus]\nhosts = a\n"})
+        self.assertEqual(code, 400)
+        self.assertIn("unknown component type", out["error"])
+        self.assertFalse(os.path.exists(self.inv))
+        good = "[esxi:mgmt]\nhosts = esx01.corp.example-widgets.com\n[sddc]\nhosts = 10.1.1.9\nescalate = su\n"
+        self.assertEqual(self.call("api/inventory", {"text": good})[0], 200)
+        self.assertEqual(os.stat(self.inv).st_mode & 0o777, 0o600)
+        code, st = self.call("api/state")
+        self.assertEqual([s["name"] for s in st["sections"]], ["esxi:mgmt", "sddc"])
+        self.assertEqual(st["sections"][1]["escalate"], "su")
+        self.assertTrue(st["sections"][0]["groups"][0]["checks"])
+
+    def test_run_requires_a_valid_selection(self):
+        self.call("api/inventory", {"text": "[esxi]\nhosts = esx01.corp.example-widgets.com\n"})
+        code, out = self.call("api/run", {"sections": {}})
+        self.assertEqual((code, out["error"]), (400, "nothing selected"))
+        code, out = self.call("api/run", {"sections": {"esxi": {"hosts": ["esx01.corp.example-widgets.com"],
+                                                               "groups": ["system"], "password": ""}}})
+        self.assertEqual(code, 400)
+        self.assertIn("no password", out["error"])
+        self.assertEqual(self.call("api/status?since=0")[1]["state"], "idle")
+
+    def test_anonymize_and_translate_back(self):
+        self.call("api/inventory", {"text": "[esxi]\nhosts = esx01.corp.example-widgets.com\n"})
+        code, out = self.call("api/scrub", {"text": "esx01.corp.example-widgets.com at 10.4.4.4 password=hunter2"})
+        self.assertEqual(code, 200)
+        self.assertEqual(out["text"], "esxi-01.domain-01 at ip-n1-h1 password=[REDACTED]")
+        self.assertEqual(out["review"]["hits"], [])
+        code, back = self.call("api/decode", {"text": "check esxi-01.domain-01 and ip-n1-h1"})
+        self.assertEqual(back["text"], "check esx01.corp.example-widgets.com and 10.4.4.4")
+
+
 if __name__ == "__main__":
     unittest.main()

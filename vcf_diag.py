@@ -10,6 +10,8 @@ IP addresses, MACs, UUIDs, serials, object names and secrets are replaced by
 consistent placeholders.
 
   * Python 3.9+ standard library only. Runs on macOS and Linux.
+  * Terminal menus by default; "--gui" opens the same tool as a page in your
+    browser, served only to this computer.
   * Uses the system OpenSSH client (ssh). Passwords are typed at a hidden
     prompt, kept in memory only and handed to ssh through a private askpass
     socket. They are never written to disk, argv or the environment.
@@ -29,6 +31,7 @@ import configparser
 import datetime
 import fcntl
 import getpass
+import http.server
 import ipaddress
 import json
 import os
@@ -47,8 +50,10 @@ import tempfile
 import termios
 import threading
 import time
+import urllib.parse
+import webbrowser
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 # ----------------------------------------------------------------------------
 # Diagnostic catalog
@@ -409,16 +414,26 @@ hosts =
 # Small helpers
 # ----------------------------------------------------------------------------
 _print_lock = threading.Lock()
+_log_sinks = []          # the GUI adds a function here to mirror progress lines
+
+
+class Fatal(Exception):
+    """An error the user has to fix; shown as a plain message, not a traceback."""
+
+    def __init__(self, msg, code=2):
+        Exception.__init__(self, msg)
+        self.code = code
 
 
 def log(msg=""):
     with _print_lock:
         print(msg, flush=True)
+        for sink in _log_sinks:
+            sink(msg)
 
 
 def die(msg, code=2):
-    print("error: " + msg, file=sys.stderr)
-    sys.exit(code)
+    raise Fatal(msg, code)
 
 
 def split_list(value):
@@ -1038,6 +1053,7 @@ class Context:
         os.chmod(self.rundir, 0o700)
         self.askpass = AskpassServer(self.rundir)
         self.targets = []
+        self.cancel = threading.Event()
         self._n = 0
         self._lock = threading.Lock()
         atexit.register(self.cleanup)
@@ -1473,7 +1489,9 @@ def collect_target(t, groups, progress):
             return
         t.probe_identity()
         todo = [(g, c) for g in groups for c in g[2]]
-        for i, (g, c) in enumerate(todo, 1):
+        for g, c in todo:
+            if t.ctx.cancel.is_set():
+                break
             t.results.append(t.run_catalog(g, c))
         bad = sum(1 for r in t.results if r["status"] in ("fail", "timeout"))
         skipped = sum(1 for r in t.results if r["status"] == "skipped")
@@ -1599,6 +1617,18 @@ def prompt_credentials(sec, what=None):
     return user, password, su_password
 
 
+class ConsoleUI:
+    """How the collector asks the person at the terminal for credentials."""
+
+    def initial_credentials(self, sec):
+        return prompt_credentials(sec)
+
+    def retry_credentials(self, sec, what, message, default=True):
+        if not ask_yes("  %s Enter different credentials for %s?" % (message, what), default):
+            return None
+        return prompt_credentials(sec, what=what)
+
+
 def build_plan(sections, custom, auto_all):
     usable = [s for s in sections if s["hosts"]]
     if not usable:
@@ -1623,18 +1653,21 @@ def build_plan(sections, custom, auto_all):
 # ----------------------------------------------------------------------------
 # Collection driver
 # ----------------------------------------------------------------------------
-def run_plan(ctx, plan, scrubber, creds_fn=prompt_credentials, interactive=True):
+def run_plan(ctx, plan, scrubber, ui=None):
     """Run the plan. Returns a list of (section, [Target])."""
+    ui = ui or ConsoleUI()
     done = []
     creds = {}
     for item in plan:
-        creds[item["sec"]["name"]] = creds_fn(item["sec"])
-    print()
+        creds[item["sec"]["name"]] = ui.initial_credentials(item["sec"])
+    log()
 
     def progress(t, msg):
         log("  [%s] %-40s %s" % (t.sec["name"], t.address, msg))
 
     for item in plan:
+        if ctx.cancel.is_set():
+            break
         sec = item["sec"]
         targets = []
         for addr in item["hosts"]:
@@ -1658,13 +1691,15 @@ def run_plan(ctx, plan, scrubber, creds_fn=prompt_credentials, interactive=True)
         # login on one host instead of one on every host (account lockout protection).
         first, rest = targets[0], targets[1:]
         tries = 0
-        while not first.connect() and first.errkind == "auth" and interactive and tries < 2:
+        while not first.connect() and first.errkind == "auth" and tries < 2:
             tries += 1
             log("  [%s] %s: %s" % (sec["name"], first.address, first.errmsg))
-            if not ask_yes("  Re-enter credentials for [%s]?" % sec["name"]):
+            new = ui.retry_credentials(sec, "[%s]" % sec["name"],
+                                       "%s rejected the credentials (%s)." % (first.address, first.errmsg))
+            if not new:
                 break
-            creds[sec["name"]] = creds_fn(sec)
-            apply(targets, creds[sec["name"]])
+            creds[sec["name"]] = new
+            apply(targets, new)
         if first.errkind == "auth":
             for t in rest:
                 t.errkind = "skipped"
@@ -1676,10 +1711,12 @@ def run_plan(ctx, plan, scrubber, creds_fn=prompt_credentials, interactive=True)
             list(pool.map(lambda t: collect_target(t, item["groups"], progress), targets))
         # Offer a retry for individual hosts that rejected the shared credentials.
         for t in targets:
-            if t.errkind == "auth" and interactive and t is not first:
-                if ask_yes("  %s rejected the credentials. Enter different ones for this host?"
-                           % t.address, default=False):
-                    apply([t], creds_fn(sec, what="host %s" % t.address))
+            if t.errkind == "auth" and t is not first and not ctx.cancel.is_set():
+                new = ui.retry_credentials(sec, "host %s" % t.address,
+                                           "%s rejected the credentials used for its group." % t.address,
+                                           default=False)
+                if new:
+                    apply([t], new)
                     t.results = []
                     collect_target(t, item["groups"], progress)
         done.append((item, targets))
@@ -1853,28 +1890,38 @@ def build_report(ctx, done, scrubber, started, max_lines):
     return "\n".join(out)
 
 
-def review(scrubber, text):
-    """Print the local, human review hints. Shows real values - console only."""
-    hits = scrubber.leak_check(text)
+def review_data(scrubber, text):
+    """Local privacy check of finished text. The result contains real values:
+    show it to the person running the tool, never put it in a report."""
+    quads = {}
+    for m in RX_DOTTED_QUAD.finditer(text):
+        if is_plain_ipv4(m.group(0)):
+            quads[m.group(0)] = quads.get(m.group(0), 0) + 1
+    return {"hits": sorted(scrubber.leak_check(text).items(), key=lambda kv: -kv[1]),
+            "quads": sorted(quads.items()),
+            "known": sum(len(v) for c, v in scrubber.m.maps.items() if c != "ipv4net")}
+
+
+def print_review(data):
     print("\nPrivacy check of the written report")
-    if hits:
-        print("  WARNING: %d known real value(s) are still present. Review before sharing:" % len(hits))
-        for real, n in sorted(hits.items(), key=lambda kv: -kv[1])[:40]:
+    if data["hits"]:
+        print("  WARNING: %d known real value(s) are still present. Review before sharing:" % len(data["hits"]))
+        for real, n in data["hits"][:40]:
             print("    %-40s %d occurrence(s)" % (real, n))
         print("  Add them to scrub_terms / extra_domains in the inventory and run again.")
     else:
-        print("  OK - none of the %d known real names or addresses appear in the report."
-              % sum(len(v) for v in scrubber.m.maps.values()))
-    quads = {}
-    for m in RX_DOTTED_QUAD.finditer(text):
-        if not is_plain_ipv4(m.group(0)):
-            continue
-        quads[m.group(0)] = quads.get(m.group(0), 0) + 1
-    if quads:
+        print("  OK - none of the %d known real names or addresses appear in the report." % data["known"])
+    if data["quads"]:
         print("  Dotted values left readable because they look like version numbers:")
-        print("    " + ", ".join("%s (x%d)" % kv for kv in sorted(quads.items())))
+        print("    " + ", ".join("%s (x%d)" % tuple(kv) for kv in data["quads"]))
         print("  If any of these is really an IP address, remove it from keep_literals and tell me.")
-    return hits
+
+
+def review(scrubber, text):
+    """Run the privacy check and print it on the console."""
+    data = review_data(scrubber, text)
+    print_review(data)
+    return data
 
 
 # ----------------------------------------------------------------------------
@@ -1931,33 +1978,24 @@ def learn_inventory(scrubber, sections):
                 scrubber.learn_host(addr, prefix=s["prefix"])
 
 
-def cmd_scrub_files(args):
+def scrub_texts(args, texts):
+    """Anonymize arbitrary texts with the inventory settings and the saved mapping."""
     settings, sections = {}, []
     inv = find_inventory(args)
     if inv:
         settings, sections, _ = load_inventory(inv)
     scrubber = make_scrubber(args, settings)
     learn_inventory(scrubber, sections)
-    texts = []
-    for path in args.scrub_file:
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            texts.append(fh.read())
     for tx in texts:
         scrubber.prescan(tx)
     scrubber.compile()
-    os.makedirs(args.output_dir, exist_ok=True)
-    for path, tx in zip(args.scrub_file, texts):
-        dest = os.path.join(args.output_dir, "anon-%s-%s.txt" % (
-            datetime.datetime.now().strftime("%Y%m%d-%H%M%S"),
-            scrubber.m.get("file", os.path.abspath(path), width=3)))
-        result = scrubber.scrub(tx)
-        write_private(dest, result)
-        print("Anonymized %s -> %s" % (path, dest))
-        review(scrubber, result)
+    results = [scrubber.scrub(tx) for tx in texts]
     scrubber.m.save()
+    return scrubber, results
 
 
-def cmd_decode(args):
+def decode_text(args, text):
+    """Translate placeholders back to real names using the private mapping."""
     mapping = Mapping(os.path.join(args.private_dir, "mapping.json"))
     rev = {}
     for cat, vals in mapping.maps.items():
@@ -1966,12 +2004,70 @@ def cmd_decode(args):
         for real, ph in vals.items():
             rev.setdefault(ph.lower(), real)
     if not rev:
-        die("no mapping found in %s" % args.private_dir)
-    with open(args.decode, encoding="utf-8", errors="replace") as fh:
-        text = fh.read()
+        die("no mapping found in %s - run a collection first" % args.private_dir)
     rx = re.compile(r"(?i)(?<![\w-])(?:%s)(?![\w-])" % "|".join(
         re.escape(k) for k in sorted(rev, key=len, reverse=True)))
-    sys.stdout.write(rx.sub(lambda m: rev[m.group(0).lower()], text))
+    return rx.sub(lambda m: rev[m.group(0).lower()], text)
+
+
+def cmd_scrub_files(args):
+    texts = []
+    for path in args.scrub_file:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            texts.append(fh.read())
+    scrubber, results = scrub_texts(args, texts)
+    os.makedirs(args.output_dir, exist_ok=True)
+    for path, result in zip(args.scrub_file, results):
+        dest = os.path.join(args.output_dir, "anon-%s-%s.txt" % (
+            datetime.datetime.now().strftime("%Y%m%d-%H%M%S"),
+            scrubber.m.get("file", os.path.abspath(path), width=3)))
+        write_private(dest, result)
+        print("Anonymized %s -> %s" % (path, dest))
+        review(scrubber, result)
+    scrubber.m.save()
+
+
+def cmd_decode(args):
+    with open(args.decode, encoding="utf-8", errors="replace") as fh:
+        sys.stdout.write(decode_text(args, fh.read()))
+
+
+def collect_and_report(args, settings, sections, plan, ui, on_context=None):
+    """Run a plan and write the anonymized report. Shared by the terminal and the GUI.
+    Returns None when the run was cancelled."""
+    ctx = Context(args)
+    if on_context:
+        on_context(ctx)
+    try:
+        scrubber = make_scrubber(args, settings)
+        learn_inventory(scrubber, sections)
+        started = datetime.datetime.now(datetime.timezone.utc)
+        done = run_plan(ctx, plan, scrubber, ui)
+        if ctx.cancel.is_set():
+            return None
+        learn_from_results(done, scrubber)
+        report = build_report(ctx, done, scrubber, started, args.max_lines)
+        scrubber.m.save()
+        os.makedirs(args.output_dir, exist_ok=True)
+        path = os.path.join(args.output_dir, "vcf-report-%s.md" % started.strftime("%Y%m%d-%H%M%S"))
+        write_private(path, report)
+    finally:
+        ctx.cleanup()
+    targets = [t for _, ts in done for t in ts]
+    return {"path": os.path.abspath(path), "report": report, "review": review_data(scrubber, report),
+            "total": len(targets), "failed": sum(1 for t in targets if t.errkind),
+            "targets": [{"section": t.sec["name"], "address": t.address, "placeholder": t.ph,
+                         "result": t.errkind or "collected", "detail": t.errmsg,
+                         "checks": len(t.results),
+                         "problems": sum(1 for r in t.results if r["status"] in ("fail", "timeout"))}
+                        for t in targets]}
+
+
+def scale_timeouts(plan, factor):
+    if factor != 1.0:
+        for item in plan:
+            item["groups"] = [(k, t, [dict(c, timeout=max(5, int(c["timeout"] * factor))) for c in cs])
+                              for k, t, cs in item["groups"]]
 
 
 def cmd_collect(args):
@@ -1988,10 +2084,7 @@ def cmd_collect(args):
     plan = build_plan(sections, custom, args.all)
     if not plan:
         die("nothing selected", 0)
-    if args.timeout_scale != 1.0:
-        for item in plan:
-            item["groups"] = [(k, t, [dict(c, timeout=int(c["timeout"] * args.timeout_scale)) for c in cs])
-                              for k, t, cs in item["groups"]]
+    scale_timeouts(plan, args.timeout_scale)
     print("\nPlan")
     for item in plan:
         n = sum(len(g[2]) for g in item["groups"])
@@ -2002,35 +2095,858 @@ def cmd_collect(args):
         return
     if not args.all and not ask_yes("\nProceed? Only read-only commands are run."):
         return
-    ctx = Context(args)
     for sig in (signal.SIGTERM, signal.SIGHUP):      # close connections if we are killed
         signal.signal(sig, lambda *_: sys.exit(143))
-    scrubber = make_scrubber(args, settings)
-    learn_inventory(scrubber, sections)
-    started = datetime.datetime.now(datetime.timezone.utc)
     try:
-        done = run_plan(ctx, plan, scrubber)
+        res = collect_and_report(args, settings, sections, plan, ConsoleUI())
     except KeyboardInterrupt:
-        print("\nInterrupted - closing connections. No report written.")
-        ctx.cleanup()
+        print("\nInterrupted - connections closed. No report written.")
         sys.exit(130)
-    learn_from_results(done, scrubber)
-    report = build_report(ctx, done, scrubber, started, args.max_lines)
-    scrubber.m.save()
-    os.makedirs(args.output_dir, exist_ok=True)
-    path = os.path.join(args.output_dir, "vcf-report-%s.md" % started.strftime("%Y%m%d-%H%M%S"))
-    write_private(path, report)
-    ctx.cleanup()
-    review(scrubber, report)
-    total = sum(len(ts) for _, ts in done)
-    failed = sum(1 for _, ts in done for t in ts if t.errkind)
-    print("\nReport:  %s" % path)
+    print_result(args, res)
+
+
+def print_result(args, res):
+    print_review(res["review"])
+    report = res["report"]
+    print("\nReport:  %s" % res["path"])
     print("Size:    %.0f KB, roughly %d thousand tokens" % (len(report) / 1024.0, len(report) // 3500))
-    print("Hosts:   %d collected, %d not collected" % (total - failed, failed))
+    print("Hosts:   %d collected, %d not collected" % (res["total"] - res["failed"], res["failed"]))
     if len(report) > 1500000:
         print("Note:    this is a large report. Consider collecting one component group at a time.")
     print("Mapping: %s  (PRIVATE - never share)" % os.path.join(args.private_dir, "mapping.json"))
     print("\nOpen the report and skim it before sharing. Use --decode to translate an analysis back.")
+
+
+# ----------------------------------------------------------------------------
+# Browser GUI (python3 vcf_diag.py --gui). Served to this machine only.
+# ----------------------------------------------------------------------------
+GUI_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VCF Diagnostics</title>
+<style>
+:root {
+  --bg: #f4f5f7; --panel: #ffffff; --ink: #1c2330; --muted: #5d6778; --line: #d9dee6;
+  --accent: #1f6feb; --accent-ink: #ffffff; --good: #1a7f4b; --warn: #9a5b00; --bad: #b3261e;
+  --good-bg: #e6f4ec; --warn-bg: #fff4e0; --bad-bg: #fdecea; --code: #f0f2f5;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14181f; --panel: #1c222c; --ink: #e6e9ef; --muted: #9aa5b5; --line: #323b49;
+    --accent: #5b9bff; --accent-ink: #0b1220; --good: #5fd08f; --warn: #f0b955; --bad: #ff8a80;
+    --good-bg: #173426; --warn-bg: #3a2c10; --bad-bg: #40201d; --code: #232b37;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+header { background: var(--panel); border-bottom: 1px solid var(--line); }
+.bar { max-width: 980px; margin: 0 auto; padding: 14px 20px 0; }
+.title { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+h1 { font-size: 20px; margin: 0; }
+.ver { color: var(--muted); font-size: 13px; }
+.spacer { flex: 1; }
+nav { display: flex; gap: 4px; margin-top: 12px; }
+nav button { border: 0; background: none; color: var(--muted); font: inherit; padding: 8px 14px;
+  border-bottom: 3px solid transparent; cursor: pointer; }
+nav button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--accent); font-weight: 600; }
+main { max-width: 980px; margin: 0 auto; padding: 20px; }
+h2 { font-size: 16px; margin: 22px 0 8px; }
+p { margin: 6px 0; }
+.muted { color: var(--muted); }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  padding: 14px 16px; margin: 10px 0; }
+.card.on { border-color: var(--accent); }
+.row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.pick { display: flex; align-items: center; gap: 10px; cursor: pointer; flex: 1; min-width: 240px; }
+.pick b { font-family: ui-monospace, Menlo, monospace; font-size: 14px; }
+input[type=checkbox] { width: 17px; height: 17px; flex: none; accent-color: var(--accent); }
+.fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin-top: 12px; }
+label.f { display: block; font-size: 13px; color: var(--muted); }
+input[type=text], input[type=password], input[type=number], textarea {
+  width: 100%; margin-top: 4px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px;
+  background: var(--bg); color: var(--ink); font: inherit; }
+input:focus, textarea:focus, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+input.missing { border-color: var(--bad); }
+textarea { font: 13px/1.45 ui-monospace, Menlo, Consolas, monospace; min-height: 220px; resize: vertical; }
+details { margin-top: 12px; }
+summary { cursor: pointer; color: var(--accent); font-size: 14px; }
+.cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-top: 10px; }
+.list { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; max-height: 240px; overflow: auto; }
+.list label { display: flex; gap: 8px; align-items: flex-start; padding: 3px 0; font-size: 14px; }
+.list label span { overflow-wrap: anywhere; }
+.listhead { display: flex; justify-content: space-between; font-size: 13px; color: var(--muted); margin-bottom: 4px; }
+.link { background: none; border: 0; color: var(--accent); cursor: pointer; font: inherit; padding: 0 2px; }
+button.btn { border: 1px solid var(--line); background: var(--panel); color: var(--ink); font: inherit;
+  padding: 8px 14px; border-radius: 8px; cursor: pointer; }
+button.btn:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
+button:disabled { opacity: .5; cursor: default; }
+.actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 16px; }
+.note { border-radius: 8px; padding: 10px 14px; margin: 10px 0; border: 1px solid var(--line); }
+.note.good { background: var(--good-bg); border-color: var(--good); }
+.note.warn { background: var(--warn-bg); border-color: var(--warn); }
+.note.bad { background: var(--bad-bg); border-color: var(--bad); }
+pre { background: var(--code); border: 1px solid var(--line); border-radius: 8px; padding: 12px;
+  font: 12.5px/1.5 ui-monospace, Menlo, Consolas, monospace; overflow: auto; max-height: 340px;
+  white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0; }
+#report { max-height: 520px; }
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; font-size: 13px; }
+td.mono { font-family: ui-monospace, Menlo, monospace; font-size: 13px; overflow-wrap: anywhere; }
+.tablewrap { overflow-x: auto; }
+.pill { display: inline-block; padding: 1px 9px; border-radius: 999px; font-size: 12.5px; border: 1px solid; }
+.pill.good { color: var(--good); } .pill.bad { color: var(--bad); } .pill.warn { color: var(--warn); }
+.overlay { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: flex; align-items: center;
+  justify-content: center; padding: 20px; z-index: 10; }
+.modal { background: var(--panel); border-radius: 12px; padding: 20px; width: 100%; max-width: 760px;
+  max-height: 92vh; overflow: auto; border: 1px solid var(--line); }
+.modal.small { max-width: 460px; }
+.modal h2 { margin-top: 0; }
+[hidden] { display: none !important; }
+.spin { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--line);
+  border-top-color: var(--accent); border-radius: 50%; animation: sp 0.9s linear infinite; vertical-align: -2px; }
+@keyframes sp { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
+</style>
+</head>
+<body>
+<header><div class="bar">
+  <div class="title">
+    <h1>VCF Diagnostics</h1><span class="ver" id="ver"></span><span class="spacer"></span>
+    <button class="btn" id="editInv">Edit inventory</button>
+    <button class="btn" id="quit">Quit</button>
+  </div>
+  <nav role="tablist">
+    <button role="tab" data-tab="collect" aria-selected="true">Collect</button>
+    <button role="tab" data-tab="scrub" aria-selected="false">Anonymize text</button>
+    <button role="tab" data-tab="decode" aria-selected="false">Translate back</button>
+  </nav>
+</div></header>
+
+<main>
+<div id="stopped" class="note" hidden>The tool has stopped. You can close this tab.</div>
+
+<section id="tab-collect">
+  <div id="problem" class="note bad" hidden></div>
+  <div id="empty" class="note warn" hidden>
+    The inventory has no hosts yet. Click <b>Edit inventory</b> and list your hosts under the matching sections.
+  </div>
+  <div id="setup">
+    <p class="muted">Tick the groups to check, enter the SSH login for each, then run. Only read-only
+      health checks are executed. Passwords stay in memory on this Mac and are never saved.</p>
+    <div id="groups"></div>
+    <details id="opts">
+      <summary>Options</summary>
+      <div class="fields">
+        <label class="f">Hosts contacted at the same time
+          <input type="number" id="optParallel" min="1" max="16" value="4"></label>
+        <label class="f">Output lines kept per check
+          <input type="number" id="optLines" min="20" max="5000" value="200"></label>
+        <label class="f" style="display:flex;gap:8px;align-items:center;margin-top:22px;color:var(--ink)">
+          <input type="checkbox" id="optStrict"> Only connect to hosts already in known_hosts</label>
+      </div>
+    </details>
+    <div class="actions">
+      <button class="btn primary" id="run">Run diagnostics</button>
+      <span class="muted" id="runHint"></span>
+    </div>
+  </div>
+
+  <div id="progress" hidden>
+    <h2><span class="spin" id="spin"></span> <span id="progTitle">Collecting…</span></h2>
+    <pre id="log" aria-live="polite"></pre>
+    <div class="actions">
+      <button class="btn" id="cancel">Cancel</button>
+      <button class="btn" id="again" hidden>Back to selection</button>
+    </div>
+  </div>
+
+  <div id="result" hidden>
+    <h2>Report ready</h2>
+    <p id="resSummary"></p>
+    <div id="resPrivacy"></div>
+    <div id="resQuads" class="note warn" hidden></div>
+    <div class="actions">
+      <button class="btn primary" id="copy">Copy report</button>
+      <button class="btn" id="save">Save a copy…</button>
+      <button class="btn" id="reveal">Show file</button>
+      <span class="muted" id="copied"></span>
+    </div>
+    <p class="muted" id="resPath"></p>
+    <h2>Hosts in this run</h2>
+    <p class="muted">This table shows real names and is only displayed here. It is not part of the report.</p>
+    <div class="tablewrap"><table><thead><tr><th>Real name</th><th>Shown in report as</th><th>Group</th>
+      <th>Result</th><th>Checks</th></tr></thead><tbody id="resHosts"></tbody></table></div>
+    <h2>Report preview</h2>
+    <p class="muted">Skim this before you share it. Add anything identifying that is still readable to
+      <code>scrub_terms</code> in the inventory.</p>
+    <pre id="report"></pre>
+  </div>
+</section>
+
+<section id="tab-scrub" hidden>
+  <p class="muted">Paste any text (a log excerpt, an error message). It is anonymized with the same
+    placeholders as your reports.</p>
+  <textarea id="scrubIn" placeholder="Paste text here" aria-label="Text to anonymize"></textarea>
+  <div class="actions"><button class="btn primary" id="scrubGo">Anonymize</button>
+    <button class="btn" id="scrubCopy" hidden>Copy result</button><span class="muted" id="scrubMsg"></span></div>
+  <div id="scrubPrivacy"></div>
+  <pre id="scrubOut" hidden></pre>
+</section>
+
+<section id="tab-decode" hidden>
+  <p class="muted">Paste an analysis that uses placeholders. It is translated back to your real names.
+    The result is shown here only.</p>
+  <textarea id="decodeIn" placeholder="Paste text with placeholders here" aria-label="Text to translate back"></textarea>
+  <div class="actions"><button class="btn primary" id="decodeGo">Translate back</button>
+    <span class="muted" id="decodeMsg"></span></div>
+  <pre id="decodeOut" hidden></pre>
+</section>
+</main>
+
+<div class="overlay" id="invModal" hidden><div class="modal" role="dialog" aria-modal="true" aria-labelledby="invTitle">
+  <h2 id="invTitle">Inventory</h2>
+  <p class="muted" id="invPath"></p>
+  <textarea id="invText" style="min-height:420px" spellcheck="false" aria-label="Inventory file"></textarea>
+  <div id="invErr" class="note bad" hidden></div>
+  <div class="actions"><button class="btn primary" id="invSave">Save</button>
+    <button class="btn" id="invCancel">Cancel</button></div>
+</div></div>
+
+<div class="overlay" id="credModal" hidden><div class="modal small" role="dialog" aria-modal="true" aria-labelledby="credTitle">
+  <h2 id="credTitle">Login was rejected</h2>
+  <p id="credMsg"></p>
+  <p class="muted">Only one login is tried per host, so nothing else has been contacted with these credentials.</p>
+  <div class="fields" style="grid-template-columns:1fr">
+    <label class="f">Username<input type="text" id="credUser" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+    <label class="f">Password<input type="password" id="credPass" autocomplete="off"></label>
+    <label class="f" id="credSuWrap">Root password for su<input type="password" id="credSu" autocomplete="off"></label>
+  </div>
+  <div class="actions"><button class="btn primary" id="credOk">Try again</button>
+    <button class="btn" id="credSkip">Skip</button></div>
+</div></div>
+
+<script>
+"use strict";
+const $ = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
+function el(tag, props, ...kids) {
+  const e = document.createElement(tag);
+  Object.assign(e, props || {});
+  for (const k of kids) e.append(k);
+  return e;
+}
+async function api(path, body) {
+  const opt = body === undefined ? {} :
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
+  const r = await fetch("api/" + path, opt);
+  const j = await r.json();
+  if (!r.ok || j.error) throw new Error(j.error || r.statusText);
+  return j;
+}
+let sections = [], lastReport = "", logNext = 0, timer = null;
+
+// ---- tabs ----
+$$("nav button").forEach(b => b.onclick = () => {
+  $$("nav button").forEach(x => x.setAttribute("aria-selected", x === b));
+  ["collect", "scrub", "decode"].forEach(t => $("#tab-" + t).hidden = t !== b.dataset.tab);
+});
+
+// ---- selection ----
+function checklist(title, items, cls) {
+  const box = el("div", { className: "list" });
+  for (const it of items) {
+    box.append(el("label", {}, el("input", { type: "checkbox", checked: true, className: cls, value: it.value }),
+      el("span", { textContent: it.text })));
+  }
+  const set = v => $$("input", box).forEach(i => { i.checked = v; i.dispatchEvent(new Event("change", { bubbles: true })); });
+  const head = el("div", { className: "listhead" }, el("span", { textContent: title }),
+    el("span", {}, el("button", { className: "link", type: "button", textContent: "all", onclick: () => set(true) }), " / ",
+      el("button", { className: "link", type: "button", textContent: "none", onclick: () => set(false) })));
+  return el("div", {}, head, box);
+}
+function renderGroups() {
+  const root = $("#groups");
+  root.textContent = "";
+  for (const s of sections) {
+    const pick = el("input", { type: "checkbox", className: "sec" });
+    const count = el("span", { className: "muted" });
+    const body = el("div", { hidden: true });
+    const card = el("div", { className: "card" },
+      el("div", { className: "row" },
+        el("label", { className: "pick" }, pick, el("b", { textContent: s.name }), el("span", { textContent: s.title })),
+        count), body);
+    card.dataset.name = s.name;
+    const user = el("input", { type: "text", className: "user", value: s.user, autocomplete: "off", spellcheck: false });
+    user.setAttribute("autocapitalize", "off");
+    const fields = el("div", { className: "fields" },
+      el("label", { className: "f" }, "SSH username", user),
+      el("label", { className: "f" }, "SSH password", el("input", { type: "password", className: "pass", autocomplete: "off" })));
+    if (s.escalate === "su")
+      fields.append(el("label", { className: "f" }, "Root password for su",
+        el("input", { type: "password", className: "su", autocomplete: "off" })));
+    const det = el("details", {}, el("summary", { textContent: "Choose hosts and checks" }),
+      el("div", { className: "cols" },
+        checklist("Hosts", s.hosts.map(h => ({ value: h, text: h })), "host"),
+        checklist("Checks", s.groups.map(g => ({ value: g.key, text: g.title + " (" + g.checks.length + ")" })), "grp")));
+    body.append(fields, det);
+    const update = () => {
+      const h = $$(".host:checked", card).length, g = $$(".grp:checked", card).length;
+      count.textContent = h + " of " + s.hosts.length + " host" + (s.hosts.length === 1 ? "" : "s") +
+        " · " + g + " of " + s.groups.length + " check groups";
+      body.hidden = !pick.checked;
+      card.classList.toggle("on", pick.checked);
+      updateHint();
+    };
+    card.addEventListener("change", update);
+    root.append(card);
+    update();
+  }
+}
+function updateHint() {
+  const n = $$(".sec:checked").length;
+  $("#runHint").textContent = n ? n + " group" + (n === 1 ? "" : "s") + " selected" : "Select at least one group";
+  $("#run").disabled = !n;
+}
+async function loadState() {
+  const st = await api("state");
+  $("#ver").textContent = "v" + st.version;
+  sections = st.sections;
+  $("#problem").hidden = !st.error;
+  $("#problem").textContent = st.error;
+  $("#empty").hidden = !!st.error || sections.length > 0;
+  $("#optParallel").value = st.parallel;
+  $("#optLines").value = st.max_lines;
+  renderGroups();
+  updateHint();
+  if (st.busy) startPolling();
+}
+
+// ---- run ----
+$("#run").onclick = async () => {
+  const req = { sections: {}, options: { parallel: +$("#optParallel").value, max_lines: +$("#optLines").value,
+    strict: $("#optStrict").checked } };
+  let bad = null;
+  for (const card of $$("#groups .card")) {
+    if (!$(".sec", card).checked) continue;
+    const need = [$(".pass", card)].concat($(".su", card) ? [$(".su", card)] : []);
+    for (const i of need) { i.classList.toggle("missing", !i.value); if (!i.value && !bad) bad = i; }
+    const hosts = $$(".host:checked", card).map(i => i.value), groups = $$(".grp:checked", card).map(i => i.value);
+    if (!hosts.length || !groups.length) {
+      $("#runHint").textContent = "Group " + card.dataset.name + " has no hosts or no checks selected";
+      $("details", card).open = true;
+      return;
+    }
+    req.sections[card.dataset.name] = { hosts, groups, user: $(".user", card).value.trim(),
+      password: $(".pass", card).value, su_password: $(".su", card) ? $(".su", card).value : null };
+  }
+  if (bad) { bad.focus(); $("#runHint").textContent = "Enter the password for each selected group"; return; }
+  try {
+    await api("run", req);
+  } catch (e) { $("#runHint").textContent = e.message; return; }
+  $$("#groups input[type=password]").forEach(i => i.value = "");
+  startPolling();
+};
+function startPolling() {
+  logNext = 0;
+  $("#log").textContent = "";
+  $("#setup").hidden = true; $("#result").hidden = true; $("#progress").hidden = false;
+  $("#spin").hidden = false; $("#cancel").hidden = false; $("#again").hidden = true;
+  $("#progTitle").textContent = "Collecting…";
+  clearInterval(timer);
+  timer = setInterval(poll, 700);
+  poll();
+}
+async function poll() {
+  let st;
+  try { st = await api("status?since=" + logNext); } catch (e) { return; }
+  if (st.lines.length) {
+    const log = $("#log");
+    log.append(st.lines.join("\n") + "\n");
+    log.scrollTop = log.scrollHeight;
+    logNext = st.next;
+  }
+  if (st.prompt && $("#credModal").hidden) showCred(st.prompt);
+  if (!st.prompt) $("#credModal").hidden = true;
+  if (st.state === "running") return;
+  clearInterval(timer);
+  $("#spin").hidden = true; $("#cancel").hidden = true; $("#again").hidden = false;
+  if (st.state === "done") { $("#progTitle").textContent = "Finished"; showResult(st.result); }
+  else if (st.state === "cancelled") $("#progTitle").textContent = "Cancelled. No report was written.";
+  else if (st.state === "error") $("#progTitle").textContent = "Stopped: " + st.error;
+}
+$("#cancel").onclick = () => { $("#progTitle").textContent = "Cancelling…"; api("cancel", {}).catch(() => {}); };
+$("#again").onclick = () => { $("#progress").hidden = true; $("#result").hidden = true; $("#setup").hidden = false; };
+
+function showCred(p) {
+  $("#credMsg").textContent = p.message + " Enter different credentials for " + p.what + ", or skip.";
+  $("#credUser").value = p.user; $("#credPass").value = ""; $("#credSu").value = "";
+  $("#credSuWrap").hidden = !p.needs_su;
+  $("#credModal").hidden = false;
+  $("#credPass").focus();
+}
+$("#credOk").onclick = () => {
+  if (!$("#credPass").value) { $("#credPass").focus(); return; }
+  api("answer", { user: $("#credUser").value.trim(), password: $("#credPass").value,
+    su_password: $("#credSu").value || null }).catch(() => {});
+  $("#credPass").value = ""; $("#credSu").value = ""; $("#credModal").hidden = true;
+};
+$("#credSkip").onclick = () => { api("answer", { skip: true }).catch(() => {}); $("#credModal").hidden = true; };
+
+function privacyNote(box, rv) {
+  box.textContent = "";
+  if (rv.hits.length) {
+    const n = el("div", { className: "note bad" },
+      el("b", { textContent: rv.hits.length + " known real value" + (rv.hits.length === 1 ? " is" : "s are") +
+        " still readable. Do not share yet." }),
+      el("p", { textContent: "Add them to scrub_terms or extra_domains in the inventory and run again:" }));
+    n.append(el("p", { className: "mono", textContent: rv.hits.slice(0, 40).map(h => h[0] + " (×" + h[1] + ")").join(", ") }));
+    box.append(n);
+  } else {
+    box.append(el("div", { className: "note good", textContent:
+      "Privacy check passed: none of the " + rv.known + " known real names or addresses appear in the text." }));
+  }
+}
+async function showResult(res) {
+  $("#result").hidden = false;
+  $("#resSummary").textContent = (res.total - res.failed) + " host" + (res.total - res.failed === 1 ? "" : "s") +
+    " collected, " + res.failed + " not collected. Report size " + res.size_kb + " KB (about " + res.tokens_k +
+    " thousand tokens).";
+  privacyNote($("#resPrivacy"), res.review);
+  const q = $("#resQuads");
+  q.hidden = !res.review.quads.length;
+  q.textContent = "Left readable because they look like version numbers: " +
+    res.review.quads.map(x => x[0] + " (×" + x[1] + ")").join(", ") +
+    ". If one of these is really an IP address, remove it from keep_literals in the inventory.";
+  $("#resPath").textContent = "Saved as " + res.path;
+  const tb = $("#resHosts");
+  tb.textContent = "";
+  for (const t of res.targets) {
+    const ok = t.result === "collected";
+    const pill = el("span", { className: "pill " + (ok ? "good" : t.result === "skipped" ? "warn" : "bad"),
+      textContent: ok ? "collected" : t.result });
+    const cell = el("td", {}, pill);
+    if (t.detail) cell.append(el("div", { className: "muted", textContent: t.detail }));
+    tb.append(el("tr", {}, el("td", { className: "mono", textContent: t.address }),
+      el("td", { className: "mono", textContent: t.placeholder }), el("td", { className: "mono", textContent: t.section }),
+      cell, el("td", { textContent: ok ? t.checks + (t.problems ? " (" + t.problems + " non-zero)" : "") : "–" })));
+  }
+  lastReport = (await api("report")).text;
+  $("#report").textContent = lastReport;
+  $("#result").scrollIntoView({ behavior: "smooth" });
+}
+async function copyText(text, msg) {
+  try { await navigator.clipboard.writeText(text); msg.textContent = "Copied"; }
+  catch (e) { msg.textContent = "Copy failed. Select the text in the preview instead."; }
+  setTimeout(() => msg.textContent = "", 2500);
+}
+$("#copy").onclick = () => copyText(lastReport, $("#copied"));
+$("#save").onclick = () => {
+  const a = el("a", { href: URL.createObjectURL(new Blob([lastReport], { type: "text/markdown" })),
+    download: ($("#resPath").textContent.split("/").pop() || "vcf-report.md") });
+  a.click();
+  URL.revokeObjectURL(a.href);
+};
+$("#reveal").onclick = () => api("reveal", {}).catch(e => $("#copied").textContent = e.message);
+
+// ---- inventory editor ----
+$("#editInv").onclick = async () => {
+  const inv = await api("inventory");
+  $("#invText").value = inv.text;
+  $("#invPath").textContent = inv.path + (inv.exists ? "" : " (not created yet — this is the template)") +
+    ". Contains real hostnames; it stays on this Mac.";
+  $("#invErr").hidden = true;
+  $("#invModal").hidden = false;
+  $("#invText").focus();
+};
+$("#invCancel").onclick = () => $("#invModal").hidden = true;
+$("#invSave").onclick = async () => {
+  try {
+    await api("inventory", { text: $("#invText").value });
+    $("#invModal").hidden = true;
+    await loadState();
+  } catch (e) { $("#invErr").textContent = e.message; $("#invErr").hidden = false; }
+};
+
+// ---- anonymize / translate back ----
+$("#scrubGo").onclick = async () => {
+  $("#scrubMsg").textContent = "";
+  try {
+    const r = await api("scrub", { text: $("#scrubIn").value });
+    $("#scrubOut").textContent = r.text; $("#scrubOut").hidden = false; $("#scrubCopy").hidden = false;
+    privacyNote($("#scrubPrivacy"), r.review);
+  } catch (e) { $("#scrubMsg").textContent = e.message; }
+};
+$("#scrubCopy").onclick = () => copyText($("#scrubOut").textContent, $("#scrubMsg"));
+$("#decodeGo").onclick = async () => {
+  $("#decodeMsg").textContent = "";
+  try {
+    const r = await api("decode", { text: $("#decodeIn").value });
+    $("#decodeOut").textContent = r.text; $("#decodeOut").hidden = false;
+  } catch (e) { $("#decodeMsg").textContent = e.message; }
+};
+
+$("#quit").onclick = async () => {
+  if (!confirm("Stop the tool? A collection that is still running will be cancelled.")) return;
+  await api("quit", {}).catch(() => {});
+  clearInterval(timer);
+  $$("section").forEach(s => s.hidden = true);
+  $("#stopped").hidden = false;
+};
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && !$("#invModal").hidden) $("#invModal").hidden = true;
+  if (e.key === "Enter" && !$("#credModal").hidden) $("#credOk").click();
+});
+loadState().catch(e => { $("#problem").hidden = false; $("#problem").textContent = e.message; });
+</script>
+</body>
+</html>
+"""
+
+
+class GuiUI:
+    """Credential source for a run started from the browser."""
+
+    def __init__(self, gui, creds):
+        self.gui = gui
+        self.creds = creds
+
+    def initial_credentials(self, sec):
+        c = self.creds.get(sec["name"], {})
+        return (c.get("user") or sec["user"], c.get("password") or "", c.get("su_password") or None)
+
+    def retry_credentials(self, sec, what, message, default=True):
+        return self.gui.ask({"section": sec["name"], "what": what, "message": message,
+                             "user": sec["user"], "needs_su": sec.get("escalate") == "su"})
+
+
+class Gui:
+    """State behind the browser page. One collection can run at a time."""
+
+    def __init__(self, args):
+        self.args = args
+        self.token = pysecrets.token_urlsafe(18)
+        self.lock = threading.Lock()
+        self.state = "idle"            # idle | running | done | cancelled | error
+        self.lines = []
+        self.prompt = None
+        self.answer = None
+        self.answered = threading.Event()
+        self.result = None
+        self.error = ""
+        self.ctx = None
+        self.httpd = None
+        _log_sinks.append(lambda msg: self.lines.append(msg) if msg.strip() else None)
+
+    # ---- helpers -----------------------------------------------------------
+    def inventory_path(self):
+        return find_inventory(self.args) or "inventory.ini"
+
+    def ask(self, prompt):
+        with self.lock:
+            self.prompt, self.answer = prompt, None
+            self.answered.clear()
+        while not self.answered.wait(0.5):
+            if self.ctx is not None and self.ctx.cancel.is_set():
+                break
+        with self.lock:
+            self.prompt = None
+            return self.answer
+
+    def cancel(self):
+        ctx = self.ctx
+        if ctx is not None:
+            ctx.cancel.set()
+            self.answered.set()
+            for t in list(ctx.targets):      # drop the connections so running checks stop now
+                t.close()
+
+    # ---- API ---------------------------------------------------------------
+    def api_state(self):
+        out = {"version": VERSION, "sections": [], "error": "", "busy": self.state == "running",
+               "parallel": self.args.parallel or 4, "max_lines": self.args.max_lines}
+        if ssh_version()[0] is None:
+            out["error"] = "The OpenSSH client 'ssh' was not found on this machine."
+            return out
+        inv = find_inventory(self.args)
+        if not inv:
+            return out
+        try:
+            settings, sections, custom = load_inventory(inv)
+        except Fatal as e:
+            out["error"] = "%s (click Edit inventory to fix it)" % e
+            return out
+        if not self.args.parallel:
+            out["parallel"] = int(settings.get("parallel", 4))
+        for s in sections:
+            out["sections"].append({
+                "name": s["name"], "title": COMPONENTS[s["type"]]["title"], "user": s["user"],
+                "hosts": s["hosts"], "escalate": s["escalate"],
+                "groups": [{"key": k, "title": t, "checks": [c["label"] for c in cs]}
+                           for k, t, cs in groups_for(s["type"], custom)]})
+        return out
+
+    def api_inventory_get(self):
+        path = self.inventory_path()
+        exists = os.path.exists(path)
+        text = INVENTORY_TEMPLATE
+        if exists:
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+        return {"path": os.path.abspath(path), "exists": exists, "text": text}
+
+    def api_inventory_set(self, body):
+        text = str(body.get("text", "")).replace("\r\n", "\n")
+        fd, tmp = tempfile.mkstemp(prefix="vdinv")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            try:
+                load_inventory(tmp)              # validate before replacing the real file
+            except Fatal as e:
+                raise Fatal(str(e).replace(tmp, "the inventory"))
+        finally:
+            os.unlink(tmp)
+        write_private(self.inventory_path(), text)
+        return {"ok": True}
+
+    def api_run(self, body):
+        with self.lock:
+            if self.state == "running":
+                raise Fatal("a collection is already running")
+            self.state = "running"
+        try:
+            settings, sections, custom = load_inventory(self.inventory_path())
+            byname = {s["name"]: s for s in sections}
+            plan, creds = [], {}
+            for name, sel in (body.get("sections") or {}).items():
+                sec = byname.get(name)
+                if not sec:
+                    raise Fatal("unknown inventory section [%s]" % name)
+                hosts = [h for h in sec["hosts"] if h in set(sel.get("hosts") or [])]
+                groups = [g for g in groups_for(sec["type"], custom) if g[0] in set(sel.get("groups") or [])]
+                if not hosts or not groups:
+                    raise Fatal("nothing selected in [%s]" % name)
+                if not sel.get("password"):
+                    raise Fatal("no password given for [%s]" % name)
+                plan.append({"sec": sec, "hosts": hosts, "groups": groups})
+                creds[name] = {"user": str(sel.get("user") or "").strip(), "password": str(sel["password"]),
+                               "su_password": sel.get("su_password")}
+            if not plan:
+                raise Fatal("nothing selected")
+            opt = body.get("options") or {}
+            args = argparse.Namespace(**vars(self.args))
+            args.parallel = min(16, max(1, int(opt.get("parallel") or settings.get("parallel", 4))))
+            args.max_lines = min(5000, max(20, int(opt.get("max_lines") or self.args.max_lines)))
+            args.strict_host_keys = bool(opt.get("strict")) or self.args.strict_host_keys
+            scale = self.args.timeout_scale
+            scale_timeouts(plan, scale if scale is not None else float(settings.get("timeout", 30)) / 30.0)
+        except Exception:
+            with self.lock:
+                self.state = "idle"
+            raise
+        with self.lock:
+            del self.lines[:]
+            self.result, self.error, self.prompt = None, "", None
+        threading.Thread(target=self._run, args=(args, settings, sections, plan, creds), daemon=True).start()
+        return {"ok": True}
+
+    def _run(self, args, settings, sections, plan, creds):
+        state, result, error = "error", None, ""
+        try:
+            result = collect_and_report(args, settings, sections, plan, GuiUI(self, creds),
+                                        on_context=lambda ctx: setattr(self, "ctx", ctx))
+            state = "done" if result else "cancelled"
+        except Fatal as e:
+            error = str(e)
+        except Exception as e:
+            error = "unexpected error: %r" % (e,)
+        finally:
+            creds.clear()
+            with self.lock:
+                self.ctx, self.prompt = None, None
+                self.result, self.error, self.state = result, error, state
+
+    def api_status(self, since):
+        with self.lock:
+            out = {"state": self.state, "lines": self.lines[since:], "next": len(self.lines),
+                   "prompt": self.prompt, "error": self.error, "result": None}
+            r = self.result
+            if self.state == "done" and r:
+                out["result"] = {k: r[k] for k in ("path", "total", "failed", "review", "targets")}
+                out["result"]["size_kb"] = int(round(len(r["report"]) / 1024.0))
+                out["result"]["tokens_k"] = max(1, len(r["report"]) // 3500)
+        return out
+
+    def api_answer(self, body):
+        with self.lock:
+            if not self.prompt:
+                return {"ok": False}
+            self.answer = None if body.get("skip") or not body.get("password") else (
+                str(body.get("user") or self.prompt["user"]).strip(), str(body["password"]),
+                body.get("su_password") or None)
+        self.answered.set()
+        return {"ok": True}
+
+    def api_reveal(self):
+        if not self.result:
+            raise Fatal("there is no report yet")
+        path = self.result["path"]
+        argv = ["open", "-R", path] if sys.platform == "darwin" else ["xdg-open", os.path.dirname(path)]
+        try:
+            subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            raise Fatal("could not open the file manager; the report is at %s" % path)
+        return {"ok": True}
+
+    def api_scrub(self, body):
+        text = str(body.get("text", ""))
+        if not text.strip():
+            raise Fatal("paste some text first")
+        scrubber, results = scrub_texts(self.args, [text])
+        return {"text": results[0], "review": review_data(scrubber, results[0])}
+
+    def api_decode(self, body):
+        text = str(body.get("text", ""))
+        if not text.strip():
+            raise Fatal("paste some text first")
+        return {"text": decode_text(self.args, text)}
+
+    def handle(self, method, route, query, body):
+        if method == "GET":
+            if route == "state":
+                return self.api_state()
+            if route == "status":
+                return self.api_status(max(0, int((query.get("since") or ["0"])[0])))
+            if route == "inventory":
+                return self.api_inventory_get()
+            if route == "report":
+                return {"text": self.result["report"] if self.result else ""}
+        elif method == "POST":
+            if route == "inventory":
+                return self.api_inventory_set(body)
+            if route == "run":
+                return self.api_run(body)
+            if route == "answer":
+                return self.api_answer(body)
+            if route == "cancel":
+                self.cancel()
+                return {"ok": True}
+            if route == "reveal":
+                return self.api_reveal()
+            if route == "scrub":
+                return self.api_scrub(body)
+            if route == "decode":
+                return self.api_decode(body)
+            if route == "quit":
+                self.cancel()
+                threading.Thread(target=self.httpd.shutdown, daemon=True).start()
+                return {"ok": True}
+        return None
+
+
+class GuiHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "vcf_diag"
+    sys_version = ""
+
+    def log_message(self, *a):          # keep the terminal for progress lines only
+        pass
+
+    def _reply(self, code, payload, ctype="application/json"):
+        data = payload if isinstance(payload, bytes) else json.dumps(payload).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype + "; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy",
+                         "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+                         "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _route(self):
+        """Return (route, query) for an authorised request, else None.
+        The page is only for the browser on this machine that was given the secret URL."""
+        gui = self.server.gui
+        port = self.server.server_address[1]
+        if self.headers.get("Host", "") not in ("127.0.0.1:%d" % port, "localhost:%d" % port):
+            return None
+        origin = self.headers.get("Origin")
+        if origin and origin not in ("http://127.0.0.1:%d" % port, "http://localhost:%d" % port):
+            return None
+        parsed = urllib.parse.urlsplit(self.path)
+        parts = parsed.path.split("/", 2)
+        if len(parts) < 3 or not pysecrets.compare_digest(parts[1], gui.token):
+            return None
+        return parts[2], urllib.parse.parse_qs(parsed.query)
+
+    def _serve(self, method):
+        r = self._route()
+        if r is None:
+            return self._reply(403, {"error": "forbidden"})
+        route, query = r
+        if method == "GET" and route == "":
+            return self._reply(200, GUI_HTML.encode("utf-8"), "text/html")
+        if not route.startswith("api/"):
+            return self._reply(404, {"error": "not found"})
+        body = {}
+        if method == "POST":
+            try:
+                n = int(self.headers.get("Content-Length", "0"))
+                if n > 16 * 1024 * 1024:
+                    return self._reply(413, {"error": "that text is too large (16 MB limit)"})
+                body = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+                if not isinstance(body, dict):
+                    raise ValueError
+            except ValueError:
+                return self._reply(400, {"error": "bad request"})
+        try:
+            out = self.server.gui.handle(method, route[4:], query, body)
+        except Fatal as e:
+            return self._reply(400, {"error": str(e)})
+        except Exception as e:
+            return self._reply(500, {"error": "unexpected error: %r" % (e,)})
+        if out is None:
+            return self._reply(404, {"error": "not found"})
+        return self._reply(200, out)
+
+    def do_GET(self):
+        self._serve("GET")
+
+    def do_POST(self):
+        self._serve("POST")
+
+
+def cmd_gui(args):
+    gui = Gui(args)
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), GuiHandler)
+    httpd.daemon_threads = True
+    httpd.gui = gui
+    gui.httpd = httpd
+    url = "http://127.0.0.1:%d/%s/" % (httpd.server_address[1], gui.token)
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda *_: sys.exit(143))
+    print("vcf_diag %s - the window opens in your browser. If it does not, open this address:" % VERSION)
+    print("  " + url)
+    print("Only this computer can reach it. Leave this terminal open; press Ctrl-C here to stop.\n")
+    if not args.no_browser:
+        threading.Timer(0.4, lambda: webbrowser.open(url)).start()
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        gui.cancel()
+        httpd.server_close()
+    print("\nStopped.")
+    return 0
 
 
 SELF_TEST = """\
@@ -2089,6 +3005,9 @@ def main(argv=None):
     ap.add_argument("-o", "--output-dir", default="vcf-diag-output", help="where reports are written")
     ap.add_argument("--private-dir", default="vcf-diag-private",
                     help="where the private placeholder mapping is kept (never share)")
+    ap.add_argument("--gui", action="store_true",
+                    help="open the graphical interface in your browser (served to this computer only)")
+    ap.add_argument("--no-browser", action="store_true", help="with --gui: print the address, do not open it")
     ap.add_argument("--init", action="store_true", help="write a template inventory file and exit")
     ap.add_argument("--list", action="store_true", help="list every check the tool can run and exit")
     ap.add_argument("--all", action="store_true",
@@ -2107,6 +3026,14 @@ def main(argv=None):
     ap.add_argument("--self-test", action="store_true", help="test the anonymizer and exit")
     ap.add_argument("--version", action="version", version="vcf_diag " + VERSION)
     args = ap.parse_args(argv)
+    try:
+        return dispatch(args)
+    except Fatal as e:
+        print("error: %s" % e, file=sys.stderr)
+        return e.code
+
+
+def dispatch(args):
     if args.self_test:
         return cmd_self_test()
     if args.init:
@@ -2117,6 +3044,8 @@ def main(argv=None):
         return cmd_decode(args)
     if args.scrub_file:
         return cmd_scrub_files(args)
+    if args.gui:
+        return cmd_gui(args)
     try:
         return cmd_collect(args)
     except (KeyboardInterrupt, EOFError):
