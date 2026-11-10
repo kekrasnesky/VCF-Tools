@@ -514,7 +514,7 @@ class FollowUps(unittest.TestCase):
     def test_workers_get_a_per_run_known_hosts_file(self):
         import argparse
         import types
-        ctx = types.SimpleNamespace(rundir="/run/x", args=argparse.Namespace(strict_host_keys=False))
+        ctx = types.SimpleNamespace(rundir="/run/x", targets=[], args=argparse.Namespace(strict_host_keys=False))
         sec = {"type": "vcfmgmt", "port": 22, "ssh_options": []}
         worker = v.Target(ctx, sec, "10.9.0.21", "w", discovered=True)
         cp = v.Target(ctx, sec, "10.9.0.11", "c")
