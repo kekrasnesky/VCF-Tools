@@ -54,7 +54,7 @@ import time
 import urllib.parse
 import webbrowser
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 # ----------------------------------------------------------------------------
 # Diagnostic catalog
@@ -66,9 +66,9 @@ VERSION = "1.2.0"
 #          values are registered as names to anonymize everywhere in the report.
 
 
-def cmd(label, command, timeout=30, mode="sh", harvest=(), max_lines=None, k8s=None):
+def cmd(label, command, timeout=30, mode="sh", harvest=(), max_lines=None, k8s=None, sudo=False):
     return {"label": label, "cmd": command, "timeout": timeout, "mode": mode,
-            "harvest": tuple(harvest), "max_lines": max_lines, "k8s": k8s}
+            "harvest": tuple(harvest), "max_lines": max_lines, "k8s": k8s, "sudo": sudo}
 
 
 def ncli(label, command, **kw):
@@ -324,6 +324,63 @@ SDDC_GROUPS = [
     ]),
 ] + linux_groups()
 
+MGMT_NODE_GROUPS = [
+    ("node-runtime", "Kubernetes node agents (kubelet, containerd)", [
+        cmd("kubelet and containerd", "systemctl status kubelet containerd --no-pager 2>&1 | head -n 40", sudo=True),
+        cmd("Containers not running",
+            "crictl ps -a 2>/dev/null | awk 'NR==1 || $0 !~ /Running/' | head -n 60", sudo=True),
+        cmd("Recent kubelet errors",
+            "journalctl -u kubelet --since '-2h' --no-pager 2>/dev/null | grep -iE 'error|fail' | tail -n 40",
+            sudo=True),
+    ]),
+] + linux_groups()
+
+MGMT_CLUSTER_GROUPS = K8S_GROUPS + [
+    ("k8s-nodes", "Control planes and workers (worker VMs are discovered, not listed)", [
+        kctl("Nodes with roles", "{K} get nodes -o wide --show-labels=false 2>&1", k8s="nodes"),
+        kctl("Pods per node",
+             "{K} get pods -A -o wide --no-headers 2>&1 | awk '{n[$8]++; if ($4!=\"Running\" && $4!=\"Completed\")"
+             " b[$8]++} END{for(k in n) printf \"%-50s pods %4d  not running %d\\n\", k, n[k], b[k]+0}' | sort"),
+        kctl("Cluster API machines (worker VM lifecycle)",
+             "{K} get clusters,machinedeployments,machinesets,machines -A -o wide 2>&1 | head -n 120",
+             k8s="nsrows", max_lines=150),
+        kctl("Machine health checks", "{K} get machinehealthchecks -A 2>&1 | head -n 40", k8s="nsrows"),
+    ]),
+]
+
+
+def endpoint_group(endpoints):
+    """Checks for the VCF management service endpoints configured for a cluster."""
+    if not endpoints:
+        return []
+    cmds = []
+    for name, services in endpoints.items():
+        q = shlex.quote(name)
+        cmds.append(cmd(
+            "Endpoint %s: %s" % (name, ", ".join(services)),
+            "n=%s; echo '== DNS'; getent hosts \"$n\" || echo 'does not resolve'; "
+            "echo '== HTTPS'; curl -sk -m 10 -o /dev/null -w 'HTTP %%{http_code} in %%{time_total}s\\n' "
+            "\"https://$n/\" 2>&1 || echo 'no HTTPS response'; "
+            "echo '== Certificate'; echo | timeout 10 openssl s_client -connect \"$n:443\" -servername \"$n\" "
+            "2>/dev/null | openssl x509 -noout -subject -issuer -dates 2>&1" % q,
+            timeout=45, harvest=[("host", r"(?m)^(?:\d{1,3}(?:\.\d{1,3}){3}|[0-9A-Fa-f]*:[0-9A-Fa-f:]+)[ \t]+(\S.*)$",
+                                 r"\s+")]))
+    # Names are left unescaped (a dot matching any character is harmless here) so that the
+    # anonymizer recognises them in the command line shown in the report.
+    pattern = "|".join(n if re.fullmatch(r"[A-Za-z0-9.-]+", n) else re.escape(n) for n in endpoints)
+    cmds.append(kctl(
+        "Kubernetes objects that serve these endpoints",
+        "{K} get ingress,httproutes.gateway.networking.k8s.io,gateways.gateway.networking.k8s.io,svc -A -o wide "
+        "2>/dev/null | grep -iE -- %s || echo 'no ingress, route or service names these endpoints'"
+        % shlex.quote("^NAMESPACE|" + pattern), k8s="nsrows", max_lines=150))
+    return [("endpoints", "VCF management service endpoints", cmds)]
+
+
+def is_cluster_group(key):
+    """Groups of a VCF management cluster that describe the whole cluster: collected once."""
+    return key.startswith("k8s-") or key == "endpoints"
+
+
 COMPONENTS = {
     "esxi": {"title": "ESXi hosts", "user": "root", "prefix": "esxi", "groups": ESXI_GROUPS},
     "vcenter": {"title": "vCenter Server", "user": "root", "prefix": "vcenter",
@@ -336,6 +393,9 @@ COMPONENTS = {
     "k8s": {"title": "Kubernetes control plane (VCF services runtime, Operations, Automation)",
             "user": "vmware-system-user", "prefix": "k8snode",
             "groups": K8S_GROUPS + linux_groups(), "sudo": "auto"},
+    "vcfmgmt": {"title": "VCF management cluster (services runtime: control planes and workers)",
+                "user": "vmware-system-user", "prefix": "vcfmgmt", "sudo": "auto",
+                "groups": MGMT_CLUSTER_GROUPS + MGMT_NODE_GROUPS, "host_label": "Control planes"},
     "linux": {"title": "Generic Linux appliance", "user": "root", "prefix": "linux",
               "groups": linux_groups()},
 }
@@ -358,6 +418,8 @@ INVENTORY_TEMPLATE = """\
 #   sddc     SDDC Manager                    (vcf)
 #   k8s      Kubernetes control-plane nodes: VCF services runtime, Operations,
 #            Automation, Supervisor          (vmware-system-user, or root)
+#   vcfmgmt  VCF management cluster: control-plane IPs + service endpoints,
+#            workers found automatically     (vmware-system-user)
 #   linux    Any other Linux appliance, e.g. Operations for logs / networks
 #
 # Per-section options (all optional):
@@ -405,6 +467,23 @@ hosts =
 
 [linux:opslogs]
 hosts =
+
+# VCF management cluster (VCF services runtime). List only the control-plane IPs:
+# worker nodes have generated VM names and are found through Kubernetes.
+#   ssh_workers = yes   also log in to each discovered worker (same credentials)
+[vcfmgmt:mgmt]
+control_planes =
+#    10.0.0.11, 10.0.0.12, 10.0.0.13
+# ssh_workers = no
+
+# The management services that run on that cluster: service name = endpoint (FQDN,
+# short name or IP). Several services may share one endpoint. The section label must
+# match the [vcfmgmt:...] label above.
+[endpoints:mgmt]
+# VCF Operations          = ops.example.internal
+# VCF Automation          = auto.example.internal
+# Fleet lifecycle         = fleet.example.internal
+# Salt RaaS               = fleet.example.internal
 
 # Add your own read-only commands to a component type:
 # [commands:esxi]
@@ -686,7 +765,7 @@ class Scrubber:
             return self.learn_domain(value)
         return self.learn_term(cat, value)
 
-    def learn_k8s(self, kind, text):
+    def learn_k8s(self, kind, text, prefix="k8snode"):
         """Learn node names and organisation-specific namespaces from kubectl tables."""
         for line in text.splitlines():
             cols = line.split()
@@ -695,7 +774,9 @@ class Scrubber:
             if kind == "nodes":
                 if len(cols) >= 3 and cols[1] in ("Ready", "NotReady") or (
                         len(cols) >= 3 and cols[1].startswith(("Ready,", "NotReady,"))):
-                    self.learn_host(cols[0], prefix="k8snode")
+                    role = ("-cp" if re.search(r"control-plane|master", cols[2]) else "-worker") \
+                        if prefix != "k8snode" else ""
+                    self.learn_host(cols[0], prefix=prefix + role)
             elif kind in ("ns", "nsrows"):
                 ns = cols[0]
                 if not re.fullmatch(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?", ns) or self.keep_ns_rx.match(ns):
@@ -1386,7 +1467,7 @@ class Target:
                 self.sudo = self._detect_sudo()
                 if want == "yes" and not self.sudo:
                     self.notes.append("sudo was requested but is not available for this user")
-            if self.sec["type"] == "k8s":
+            if self.sec["type"] in ("k8s", "vcfmgmt"):
                 self._detect_kubectl()
         return True
 
@@ -1455,7 +1536,7 @@ class Target:
             if self.mode == "nsxcli":
                 res.update(status="skipped", note="needs a root shell (logged in to the NSX CLI)")
                 return res
-            sudo = self.sudo if (self.sec.get("sudo") == "yes") else None
+            sudo = self.sudo if (self.sec.get("sudo") == "yes" or c.get("sudo")) else None
             rc, out, to = self.sh(command, c["timeout"], sudo=sudo)
         elif c["mode"] == "nsxcli":
             if self.mode == "nsxcli":
@@ -1518,12 +1599,18 @@ def load_inventory(path):
     except (OSError, configparser.Error) as e:
         die("cannot read inventory %s: %s" % (path, e))
     settings = dict(cp["settings"]) if cp.has_section("settings") else {}
-    sections, custom = [], {}
+    sections, custom, endpoints = [], {}, {}
     for name in cp.sections():
         if name == "settings":
             continue
         typ, _, label = name.partition(":")
         typ, label = typ.strip().lower(), label.strip()
+        if typ == "endpoints":
+            eps = endpoints.setdefault(label, {})
+            for service, names in cp[name].items():
+                for host in split_list(names):
+                    eps.setdefault(host, []).append(service.strip())
+            continue
         if typ == "commands":
             if label not in COMPONENTS:
                 die("inventory: [%s] refers to unknown component type '%s'" % (name, label))
@@ -1533,7 +1620,7 @@ def load_inventory(path):
             die("inventory: unknown component type in section [%s]. Valid types: %s"
                 % (name, ", ".join(COMPONENTS)))
         s = cp[name]
-        hosts = list(dict.fromkeys(split_list(s.get("hosts", ""))))
+        hosts = list(dict.fromkeys(split_list(s.get("hosts", "") + " " + s.get("control_planes", ""))))
         if not hosts:
             continue
         slug = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")
@@ -1551,12 +1638,30 @@ def load_inventory(path):
             "kubeconfig": (s.get("kubeconfig") or "").strip() or None,
             "kubectl": (s.get("kubectl") or "").strip() or None,
             "ssh_options": shlex.split(s.get("ssh_options", "")),
+            "ssh_workers": (s.get("ssh_workers") or "no").strip().lower() in ("yes", "true", "1"),
+            "endpoints": {},
         })
+    mgmt = [x for x in sections if x["type"] == "vcfmgmt"]
+    for label, eps in endpoints.items():
+        if not eps:
+            continue
+        owners = [x for x in mgmt if x["label"] == label] or ([x for x in mgmt if not x["endpoints"]]
+                                                              if label == "" else [])
+        if not owners:
+            die("inventory: [endpoints%s] has no matching [vcfmgmt%s] section with control planes"
+                % ((":" + label) if label else "", (":" + label) if label else ""))
+        for x in owners:
+            x["endpoints"] = eps
     return settings, sections, custom
 
 
-def groups_for(typ, custom):
+def groups_for(sec, custom):
+    """Check groups for a component type, or for an inventory section (which may add endpoints)."""
+    typ = sec["type"] if isinstance(sec, dict) else sec
     groups = list(COMPONENTS[typ]["groups"])
+    if isinstance(sec, dict) and sec.get("endpoints"):
+        groups = groups[:len(MGMT_CLUSTER_GROUPS)] + endpoint_group(sec["endpoints"]) + \
+            groups[len(MGMT_CLUSTER_GROUPS):]
     extra = custom.get(typ)
     if extra:
         cmds = []
@@ -1644,7 +1749,7 @@ def build_plan(sections, custom, auto_all):
     for i in idx:
         s = usable[i]
         hsel = choose("Hosts in [%s]:" % s["name"], s["hosts"], auto_all)
-        groups = groups_for(s["type"], custom)
+        groups = groups_for(s, custom)
         gsel = choose("Diagnostics for [%s]:" % s["name"],
                       ["%-14s %s (%d checks)" % (g[0], g[1], len(g[2])) for g in groups], auto_all)
         if hsel and gsel:
@@ -1688,8 +1793,17 @@ def run_plan(ctx, plan, scrubber, ui=None):
             for t in ts:
                 t.user, t.password, t.su_password = c
 
+        host_groups = item.setdefault("host_groups", {})
+        cluster_groups = []
+        if sec["type"] == "vcfmgmt" and not host_groups:
+            # Whole-cluster checks run on one control plane only; node checks on every node.
+            cluster_groups = [g for g in item["groups"] if is_cluster_group(g[0])]
+            node_groups = [g for g in item["groups"] if not is_cluster_group(g[0])]
+            for i, t in enumerate(targets):
+                host_groups[t.address] = (cluster_groups if i == 0 else []) + node_groups
+
         def groups_of(t):
-            return item.get("host_groups", {}).get(t.address, item["groups"])
+            return host_groups.get(t.address, item["groups"])
 
         apply(targets, creds[sec["name"]])
         log("[%s] %d host(s), %d check(s) in total" % (
@@ -1726,13 +1840,62 @@ def run_plan(ctx, plan, scrubber, ui=None):
                     apply([t], new)
                     t.results = []
                     collect_target(t, groups_of(t), progress)
+        if cluster_groups and not ctx.cancel.is_set():
+            mgmt_followup(ctx, item, targets, cluster_groups, creds[sec["name"]], scrubber, progress)
         done.append((item, targets))
     return done
+
+
+def mgmt_followup(ctx, item, targets, cluster_groups, cred, scrubber, progress):
+    """VCF management cluster: make sure the cluster checks ran somewhere, then reach
+    the worker nodes, whose VM names are generated and therefore not in the inventory."""
+    sec = item["sec"]
+    keys = set(g[0] for g in cluster_groups)
+    have = [t for t in targets if any(r["group"][0] in keys and r["status"] != "skipped" for r in t.results)]
+    if not have:
+        for t in targets[1:]:
+            if t.errkind:
+                continue
+            log("  [%s] %s: collecting the cluster-wide checks here instead" % (sec["name"], t.address))
+            collect_target(t, cluster_groups, progress)
+            if any(r["group"][0] in keys and r["status"] != "skipped" for r in t.results):
+                have = [t]
+                break
+    if not have:
+        log("  [%s] cluster-wide checks could not be collected from any control plane" % sec["name"])
+        return
+    node_groups = [g for g in item["groups"] if not is_cluster_group(g[0])]
+    if not sec.get("ssh_workers") or not node_groups:
+        return
+    table = next((r["out"] for r in have[0].results if r["label"] == "Nodes with roles"), "") or \
+        next((r["out"] for r in have[0].results if r["label"] == "Nodes"), "")
+    known = set(t.address for t in targets)
+    workers = []
+    for line in table.splitlines():
+        cols = line.split()
+        if len(cols) < 6 or cols[0] == "NAME" or re.search(r"control-plane|master", cols[2]):
+            continue
+        ip = next((c for c in cols[5:7] if is_ipv4(c)), None)
+        if ip and ip not in known:
+            known.add(ip)
+            scrubber.m.ipv4(ip) if is_plain_ipv4(ip) else None
+            ph = scrubber.learn_host(cols[0], prefix=sec["prefix"] + "-worker") or ip
+            w = Target(ctx, sec, ip, ph)
+            w.user, w.password, w.su_password = cred
+            workers.append(w)
+    if not workers:
+        return
+    log("[%s] %d worker node(s) found through Kubernetes" % (sec["name"], len(workers)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, ctx.args.parallel)) as pool:
+        list(pool.map(lambda w: collect_target(w, node_groups, progress), workers))
+    targets.extend(workers)
 
 
 def learn_from_results(done, scrubber):
     """Feed everything we collected into the scrubber before any text is written."""
     texts = []
+    # Every host's own name first, so that a node seen in another host's output
+    # gets the same placeholder as the host itself.
     for item, targets in done:
         for t in targets:
             for name in t.identity:
@@ -1741,6 +1904,9 @@ def learn_from_results(done, scrubber):
                     scrubber.learn_domain(name.split(".", 1)[1])
                 if short not in GENERIC_NAMES and not short.isdigit():
                     scrubber.m.alias("host", short, t.ph)
+    for item, targets in done:
+        nodeprefix = item["sec"]["prefix"] if item["sec"]["type"] == "vcfmgmt" else "k8snode"
+        for t in targets:
             if t.errmsg:
                 texts.append(t.errmsg)
             for r in t.results:
@@ -1750,7 +1916,7 @@ def learn_from_results(done, scrubber):
                         for v in (re.split(split, m.group(1)) if split else [m.group(1)]):
                             scrubber.learn(cat, v)
                 if spec["k8s"]:
-                    scrubber.learn_k8s(spec["k8s"], r["out"])
+                    scrubber.learn_k8s(spec["k8s"], r["out"], prefix=nodeprefix)
                 texts.append(r["out"])
     for tx in texts:
         scrubber.prescan(tx)
@@ -1983,6 +2149,12 @@ def cmd_list(args):
 
 def learn_inventory(scrubber, sections):
     for s in sections:
+        for name in s.get("endpoints") or {}:
+            if is_ip(name):
+                if is_plain_ipv4(name):
+                    scrubber.m.ipv4(name)
+            else:
+                scrubber.learn_host(name, prefix="endpoint")
         for addr in s["hosts"]:
             if is_ip(addr):
                 scrubber.m.get("target", addr, prefix=s["prefix"], width=2)
@@ -2754,7 +2926,7 @@ function renderGroups() {
         el("input", { type: "password", className: "su", autocomplete: "off" })));
     const det = el("details", {}, el("summary", { textContent: "Choose hosts and checks" }),
       el("div", { className: "cols" },
-        checklist("Hosts", s.hosts.map(h => ({ value: h, text: h })), "host"),
+        checklist(s.host_label || "Hosts", s.hosts.map(h => ({ value: h, text: h })), "host"),
         checklist("Checks", s.groups.map(g => ({ value: g.key, text: g.title + " (" + g.checks.length + ")" })), "grp")));
     body.append(fields, det);
     const update = () => {
@@ -3118,9 +3290,10 @@ class Gui:
         for s in sections:
             out["sections"].append({
                 "name": s["name"], "title": COMPONENTS[s["type"]]["title"], "user": s["user"],
+                "host_label": COMPONENTS[s["type"]].get("host_label", "Hosts"),
                 "hosts": s["hosts"], "escalate": s["escalate"],
                 "groups": [{"key": k, "title": t, "checks": [c["label"] for c in cs]}
-                           for k, t, cs in groups_for(s["type"], custom)]})
+                           for k, t, cs in groups_for(s, custom)]})
         return out
 
     def api_inventory_get(self):
@@ -3161,7 +3334,7 @@ class Gui:
                 if not sec:
                     raise Fatal("unknown inventory section [%s]" % name)
                 hosts = [h for h in sec["hosts"] if h in set(sel.get("hosts") or [])]
-                groups = [g for g in groups_for(sec["type"], custom) if g[0] in set(sel.get("groups") or [])]
+                groups = [g for g in groups_for(sec, custom) if g[0] in set(sel.get("groups") or [])]
                 if not hosts or not groups:
                     raise Fatal("nothing selected in [%s]" % name)
                 if not sel.get("password"):

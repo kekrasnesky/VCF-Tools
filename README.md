@@ -111,12 +111,47 @@ still asked), `--list` prints every check and the exact command behind it.
 | `[nsxedge]` | NSX Edge | `admin` | same model as NSX Manager |
 | `[sddc]` | SDDC Manager | `vcf` | add `escalate = su` to also run the checks that need root |
 | `[k8s]` | Kubernetes control-plane nodes: VCF services runtime, Operations, Automation, Supervisor | `vmware-system-user` | finds a working `kubectl` on its own (plain, `KUBECONFIG=/etc/kubernetes/admin.conf`, with `sudo`) |
+| `[vcfmgmt]` | VCF management cluster (VCF services runtime) | `vmware-system-user` | list the control-plane IPs; workers are discovered; service endpoints are checked (see below) |
 | `[linux]` | any other Linux appliance | `root` | generic OS health |
 
 A section name may carry a label, for example `[esxi:mgmt]`, `[esxi:wld01]`, `[k8s:runtime]`,
 `[k8s:automation]`. Each labelled section is offered separately in the menu and has its own
 credentials. The label shows up in placeholders (`esxi-mgmt-01`), so pick labels you are happy to
 share.
+
+### VCF management cluster
+
+The VCF management services (Operations, Automation, Fleet lifecycle, Salt, Software depot,
+SDDC lifecycle, Telemetry and so on) run on the nodes of the VCF services runtime cluster:
+a few control planes and worker VMs whose names are generated. You set the control-plane IPs
+and the service endpoints; the workers are found through Kubernetes.
+
+```ini
+[vcfmgmt:mgmt]
+control_planes = 10.0.0.11, 10.0.0.12, 10.0.0.13
+# ssh_workers = yes
+
+[endpoints:mgmt]
+VCF Operations   = ops.example.internal
+Fleet lifecycle  = fleet.example.internal
+Salt RaaS        = fleet.example.internal
+SDDC lifecycle   = instance.example.internal
+```
+
+- **Whole-cluster checks** (Kubernetes API, nodes and roles, pods, events, storage, Cluster API
+  machines, endpoints) run once, on the first control plane that answers.
+- **Node checks** (kubelet, containerd, OS health) run on every control plane. With
+  `ssh_workers = yes` the tool also logs in to each worker it found, with the same
+  credentials, and runs the node checks there.
+- **Each endpoint** is checked from the cluster: does it resolve, does it answer on HTTPS, and
+  what certificate it presents. One more check lists the ingresses, routes and services in
+  Kubernetes that name those endpoints. Several services may share one endpoint; they are
+  checked once and listed together.
+- In the report, control planes appear as `vcfmgmt-mgmt-01` and so on, workers as
+  `vcfmgmt-mgmt-worker-01`, and endpoints as `endpoint-01`, with the service names kept
+  readable (`Endpoint endpoint-04: Fleet lifecycle, Salt RaaS`).
+- If your host names share a site prefix, add it to `scrub_terms` so it is replaced wherever
+  it appears, also in names the tool has not seen before.
 
 You can add your own read-only commands per component type:
 

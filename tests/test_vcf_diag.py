@@ -409,6 +409,66 @@ class Plans(unittest.TestCase):
         self.assertIn("short QUJDQUJD", out)
 
 
+MGMT_INVENTORY = """
+[vcfmgmt:mgmt]
+control_planes = 10.9.0.11, 10.9.0.12, 10.9.0.13
+ssh_workers = yes
+[endpoints:mgmt]
+VCF Operations = ops-x01.corp.example-widgets.com
+Fleet lifecycle = fleet-x01
+Salt RaaS = fleet-x01
+VCF Operations for networks = 10.9.5.50
+"""
+
+
+class ManagementCluster(unittest.TestCase):
+    def load(self, text):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "inv.ini")
+            with open(path, "w") as fh:
+                fh.write(text)
+            return v.load_inventory(path)
+
+    def test_inventory_control_planes_and_endpoints(self):
+        _, sections, custom = self.load(MGMT_INVENTORY)
+        sec = sections[0]
+        self.assertEqual((sec["type"], sec["prefix"], sec["user"]), ("vcfmgmt", "vcfmgmt-mgmt", "vmware-system-user"))
+        self.assertEqual(sec["hosts"], ["10.9.0.11", "10.9.0.12", "10.9.0.13"])
+        self.assertTrue(sec["ssh_workers"])
+        self.assertEqual(sec["endpoints"]["fleet-x01"], ["Fleet lifecycle", "Salt RaaS"])
+        groups = v.groups_for(sec, custom)
+        keys = [g[0] for g in groups]
+        self.assertIn("endpoints", keys)
+        self.assertLess(keys.index("endpoints"), keys.index("node-runtime"))
+        labels = [c["label"] for c in groups[keys.index("endpoints")][2]]
+        self.assertIn("Endpoint fleet-x01: Fleet lifecycle, Salt RaaS", labels)
+        self.assertEqual(len(labels), 4)     # three endpoints + the Kubernetes lookup
+        self.assertNotIn("endpoints", [g[0] for g in v.groups_for("vcfmgmt", custom)])
+        self.assertEqual({k for k in keys if v.is_cluster_group(k)},
+                         {"k8s-cluster", "k8s-workloads", "k8s-storage", "k8s-events", "k8s-vcf", "k8s-nodes", "endpoints"})
+
+    def test_endpoints_need_a_cluster(self):
+        with self.assertRaises(v.Fatal):
+            self.load("[endpoints:other]\nVCF Operations = ops\n")
+        self.assertEqual(self.load("[endpoints:other]\n")[1], [])
+
+    def test_endpoint_and_node_names_are_anonymized(self):
+        _, sections, custom = self.load(MGMT_INVENTORY)
+        sc = v.Scrubber(v.Mapping(None))
+        v.learn_inventory(sc, sections)
+        nodes = ("NAME STATUS ROLES AGE VERSION INTERNAL-IP\n"
+                 "wid-run-cp-8f2kq Ready control-plane 40d v1.31.4 10.9.0.11\n"
+                 "wid-run-md-0-7xk2p-9zq4t NotReady <none> 40d v1.31.4 10.9.0.21\n")
+        sc.learn_k8s("nodes", nodes, prefix="vcfmgmt-mgmt")
+        endpoint_cmds = [g for g in v.groups_for(sections[0], custom) if g[0] == "endpoints"][0][2]
+        text = nodes + "\n".join(c["cmd"] for c in endpoint_cmds) + "\n10.9.6.1 fleet-x01.corp.example-widgets.com fleet-x01"
+        out = run(sc, text)
+        for gone in ("8f2kq", "7xk2p", "ops-x01", "fleet-x01", "example-widgets", "10.9."):
+            self.assertNotIn(gone, out)
+        for keep in ("vcfmgmt-mgmt-cp-01", "vcfmgmt-mgmt-worker-01", "endpoint-01.domain-01", "endpoint-02"):
+            self.assertIn(keep, out)
+
+
 class GuiApi(unittest.TestCase):
     """The browser GUI's local web API, without contacting any host."""
 
