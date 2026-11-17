@@ -57,7 +57,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
-VERSION = "1.11.0"
+VERSION = "1.11.1"
 
 # ----------------------------------------------------------------------------
 # Diagnostic catalog
@@ -3455,6 +3455,18 @@ def tls_context(verify=True, ca_file=None):
     return ctx
 
 
+CLIENT_CERT_MSG = ("the server at %s asks for a client certificate during the connection (for example a CAC / DoD "
+                   "PKI certificate). An API key alone is not accepted there. Ask the service's administrators "
+                   "whether API access works with a key only (and at which address), or whether it needs a "
+                   "certificate-based login")
+
+
+def client_cert_required(err):
+    text = str(err).upper()
+    return any(k in text for k in ("CERTIFICATE_REQUIRED", "ALERT_HANDSHAKE_FAILURE", "PEER DID NOT RETURN A CERTIFICATE",
+                                   "BAD_CERTIFICATE", "CERTIFICATE_UNKNOWN"))
+
+
 AI_PROVIDERS = {
     "openai": "OpenAI-compatible endpoint (most AI gateways, vLLM, Ollama, LM Studio)",
     "asksage": "Ask Sage (including CAPRA and other government Ask Sage servers)",
@@ -3531,6 +3543,10 @@ class AiClient:
                 h["x-access-tokens"] = self.key
             elif self.auth == "api-key":
                 h["api-key"] = self.key
+            elif self.auth == "x-api-key":
+                h["x-api-key"] = self.key
+            elif self.auth == "token":
+                h["Authorization"] = "Token " + self.key
             else:
                 h["Authorization"] = "Bearer " + self.key
         return h
@@ -3576,6 +3592,8 @@ class AiClient:
                 if isinstance(e.reason, ssl.SSLCertVerificationError):
                     raise AiError("the AI server's certificate is not trusted (%s). Give its CA file under More "
                                   "AI options, or turn off the certificate check" % e.reason.verify_message)
+                if client_cert_required(e.reason):
+                    raise AiError(CLIENT_CERT_MSG % url)
                 if "WRONG_VERSION_NUMBER" in str(e.reason):
                     raise AiError("the server at %s does not speak HTTPS on that port; if it really is plain HTTP, "
                                   "write http:// in front of the address" % url)
@@ -3590,8 +3608,14 @@ class AiClient:
                     raise AiError("this computer cannot look up the server name in %s (%s). Check the spelling; if your "
                                   "browser opens it, it probably goes through a proxy: enter that proxy under More AI "
                                   "options, Proxy to use. Check connection step by step shows more" % (url, e.reason))
+                if isinstance(e.reason, ConnectionResetError):
+                    raise AiError("the AI server at %s ended the connection (%s). A server that requires a client "
+                                  "certificate (CAC / PKI) can end connections this way; Check connection step by "
+                                  "step tells whether it asks for one" % (url, e.reason))
                 raise AiError("cannot reach the AI endpoint at %s: %s" % (url, e.reason))
             except (OSError, ValueError) as e:
+                if client_cert_required(e):
+                    raise AiError(CLIENT_CERT_MSG % url)
                 raise AiError("bad answer from the AI endpoint: %s" % e)
 
     def _proxy_applies(self, url):
@@ -3872,8 +3896,10 @@ def ai_connection_check(cfg, key):
         return "\n".join(lines)
     parts = urllib.parse.urlsplit(base)
     host, port = parts.hostname, parts.port or (443 if parts.scheme == "https" else 80)
-    step("settings used", None, "service=%s, address=%s, model=%s, use the Mac's proxy=%s, check certificate=%s, "
-         "CA file=%s, key entered=%s" % (cfg["provider"], base, cfg["model"] or "(none)",
+    step("settings used", None, "service=%s, address=%s, model=%s, key header=%s, use the Mac's proxy=%s, "
+         "check certificate=%s, CA file=%s, key entered=%s" % (cfg["provider"], base, cfg["model"] or "(none)",
+                                         "x-access-tokens / Bearer" if cfg["provider"] == "asksage" else
+                                         "api-key" if cfg["provider"] == "azure" else cfg["auth_header"],
                                          "yes" if cfg["use_proxy"] else "no", "yes" if cfg["tls_verify"] else "no",
                                          cfg["ca_file"] or "(none)", "yes" if key else "no"))
     proxies = urllib.request.getproxies()
@@ -3905,17 +3931,35 @@ def ai_connection_check(cfg, key):
             sock = socket.create_connection((host, port), timeout=10)
             step("direct network connection", True, "port %d on %s answers" % (port, host))
             if parts.scheme == "https":
+                asked = []
                 try:
                     ctx = tls_context(cfg["tls_verify"], cfg["ca_file"])
+                    try:      # watch the handshake for a request for a client certificate (debug hook)
+                        ctx._msg_callback = lambda conn, direction, ver, ctype, mtype, data: asked.append(1) if (
+                            direction == "read" and getattr(mtype, "name", str(mtype)) == "CERTIFICATE_REQUEST") else None
+                    except (AttributeError, TypeError):
+                        pass
                     with ctx.wrap_socket(sock, server_hostname=host) as tls:
                         cert = tls.getpeercert() or {}
+                        # With TLS 1.3 a demand for a client certificate only shows on the first read.
+                        tls.settimeout(10)
+                        tls.sendall(("HEAD / HTTP/1.0\r\nHost: %s\r\n\r\n" % host).encode())
+                        try:
+                            tls.recv(1)
+                        except socket.timeout:
+                            pass
                         subj = dict(x[0] for x in cert.get("subject", ())).get("commonName", "?")
                         iss = dict(x[0] for x in cert.get("issuer", ())).get("commonName", "?")
                         step("certificate", True, "trusted; issued to %s by %s" % (subj, iss) if cert
                              else "not checked (certificate check is off)")
+                    if asked:
+                        step("client certificate", False, CLIENT_CERT_MSG % base)
                 except (ssl.SSLError, AiError, OSError) as e:
-                    step("certificate", False, "%s. Give the server's CA file under More AI options, or turn off "
-                         "the certificate check" % (getattr(e, "verify_message", None) or e))
+                    if client_cert_required(e) or asked:
+                        step("certificate", False, CLIENT_CERT_MSG % base)
+                    else:
+                        step("certificate", False, "%s. Give the server's CA file under More AI options, or turn "
+                             "off the certificate check" % (getattr(e, "verify_message", None) or e))
             else:
                 sock.close()
         except OSError as e:
@@ -4737,7 +4781,9 @@ select { margin-top: 4px; padding: 8px 10px; border: 1px solid var(--line); bord
           placeholder="proxy.example.mil:8080"></label>
         <label class="f">Key goes in (OpenAI-compatible only)
           <select data-ai="auth_header"><option value="bearer">Authorization: Bearer (most endpoints)</option>
-            <option value="api-key">api-key header</option></select></label>
+            <option value="api-key">api-key header (Azure style)</option>
+            <option value="x-api-key">x-api-key header</option>
+            <option value="token">Authorization: Token</option></select></label>
       </div>
       <p class="muted">Certificates this Mac trusts (for example ones your organisation installed) are trusted
         automatically.</p>

@@ -415,6 +415,15 @@ Certificates your Mac trusts, such as organisation or DoD root certificates inst
 department, are trusted automatically for the AI, vCenter and NSX connections. If the test still
 says the certificate is not trusted, give the CA file under **More AI options**.
 
+### Other AI services (for example GenAI.mil)
+
+Choose **OpenAI-compatible** and enter the address the service gives you (an address ending in
+`/chat/completions` is accepted as it is). If the key is rejected, try the other **Key goes in**
+choices under **More AI options** (`Authorization: Bearer`, `api-key`, `x-api-key`, `Authorization:
+Token`). Some government services also require a client certificate (CAC / DoD PKI) for API calls;
+**Check connection step by step** recognises that and says so. An API key alone cannot replace
+such a certificate.
+
 ### Working with the reply
 
 In the window, use the **Analyst reply** tab. In the terminal, save the reply to a file and run:

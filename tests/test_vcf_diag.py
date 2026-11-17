@@ -1453,6 +1453,27 @@ class Conversation(unittest.TestCase):
             srv.server_close()
 
 
+class KeyHeaders(unittest.TestCase):
+    def test_header_styles(self):
+        for style, header, value in (("bearer", "Authorization", "Bearer k1"), ("api-key", "api-key", "k1"),
+                                     ("x-api-key", "x-api-key", "k1"), ("token", "Authorization", "Token k1")):
+            h = v.AiClient("https://api.example.mil/v1", "m", "k1", auth_header=style)._headers()
+            self.assertEqual(h.get(header), value, style)
+        self.assertEqual(v.AiClient("https://api.example.mil/v1/chat/completions", "m", "k").url,
+                         "https://api.example.mil/v1/chat/completions")
+
+    def test_client_certificate_demand_is_recognised(self):
+        self.assertTrue(v.client_cert_required(ssl_error("[SSL: TLSV13_ALERT_CERTIFICATE_REQUIRED] tlsv13 alert certificate required")))
+        self.assertTrue(v.client_cert_required(ssl_error("[SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] sslv3 alert handshake failure")))
+        self.assertFalse(v.client_cert_required(ssl_error("[SSL: CERTIFICATE_VERIFY_FAILED] self signed certificate")))
+        self.assertIn("client certificate", v.CLIENT_CERT_MSG % "https://api.example.mil")
+
+
+def ssl_error(text):
+    import ssl
+    return ssl.SSLError(text)
+
+
 class GuiApi(unittest.TestCase):
     """The browser GUI's local web API, without contacting any host."""
 
