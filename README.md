@@ -274,6 +274,55 @@ thousands of lines in total; select fewer groups or checks if that is too much f
 - Host keys are trusted on first use and written to your normal `~/.ssh/known_hosts`. Use
   `--strict-host-keys` to connect only to hosts you have already accepted.
 
+### Investigate with an AI (no copy and paste)
+
+The tool can drive the whole loop itself with any AI that offers an **OpenAI-compatible chat
+endpoint** (most internal AI gateways, Azure OpenAI, vLLM, Ollama, LM Studio and others). Add to
+the inventory:
+
+```ini
+[ai]
+base_url = https://ai.example.internal/v1
+model    = your-model-name
+```
+
+The API key is never written to a file: set it in the environment, or type it when asked (in
+the window, in the **AI API key** field).
+
+```bash
+export VCF_DIAG_AI_KEY='...'
+```
+
+Then use the **Investigate with AI** tab, or in the terminal:
+
+```bash
+python3 vcf_diag.py --investigate "VCF Automation login fails since this morning"
+```
+
+1. You describe the problem and choose a starting point: the latest report, a new collection of
+   what is selected on the Collect tab, or the description only.
+2. The AI reads it and either asks for read-only diagnostics or concludes.
+3. Each round of requested diagnostics is shown with the real hosts and commands. They run only
+   when you click **Run** (terminal: answer `y`). Steps that look as if they change something
+   are refused by the read-only check, and the AI is told why.
+4. The output goes back to the AI automatically, and the loop repeats, up to `max_rounds`.
+5. The AI ends with `ROOT CAUSE: ...`, the evidence from the reports, and the fix steps. **Fixes
+   are only shown, with a copy button; the tool never runs them.**
+
+What the AI sees follows the `anonymize` setting: with `anonymize = no` it sees real names; with
+anonymization on, it sees placeholders, including in your problem description, and its answers are
+translated back for you. Every investigation is saved as
+`vcf-diag-output/vcf-investigation-<timestamp>.md`, exactly as it was sent to the AI.
+
+Other `[ai]` options: `auth_header = api-key` (Azure OpenAI style), `ca_file` / `tls_verify` for
+an internal certificate, `use_proxy = no`, `max_rounds` (default 10), `max_tokens`, and
+`max_report_chars` / `max_context_chars` (defaults 150000 / 400000) to fit the model's context
+window: longer reports are shortened with a visible note, and older rounds are shortened first
+when the conversation grows too large. If the AI answers "too long", lower those two values.
+
+The quality of the investigation depends on the model. A small model may ask for unfocused
+checks or conclude too early; you see and approve every round, so you can stop it at any time.
+
 ### Working with the reply
 
 In the window, use the **Analyst reply** tab. In the terminal, save the reply to a file and run:
@@ -328,6 +377,9 @@ python3 vcf_diag.py --scrub-file vpxd-excerpt.log
     --max-lines N        output lines kept per check (default: max_lines setting, else 200)
     --no-anonymize       keep real names and addresses (secrets are still redacted)
     --strict-host-keys   refuse hosts not already in known_hosts
+    --investigate [TEXT] let the AI in [ai] investigate a problem (you approve each round)
+    --start MODE         with --investigate: latest (default), collect or none
+    --report FILE        with --investigate: start from this report
     --plan FILE          read an analyst reply: show fixes (never run), offer read-only follow-ups
     --scrub-file FILE..  anonymize existing text files
     --decode FILE        translate placeholders back (local only)

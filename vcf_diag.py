@@ -57,7 +57,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
-VERSION = "1.6.1"
+VERSION = "1.7.0"
 
 # ----------------------------------------------------------------------------
 # Diagnostic catalog
@@ -583,6 +583,19 @@ hosts =
 # VCF Automation          = auto.example.internal
 # Fleet lifecycle         = fleet.example.internal
 # Salt RaaS               = fleet.example.internal
+
+# AI for --investigate and the Investigate tab: any OpenAI-compatible chat endpoint.
+# The API key is never stored here: set the environment variable VCF_DIAG_AI_KEY,
+# or type it when asked.
+[ai]
+# base_url    = https://ai.example.internal/v1     (the tool adds /chat/completions)
+# model       = your-model-name
+# auth_header = bearer                 or api-key (Azure OpenAI style)
+# ca_file     = ~/internal-ca.pem      trust an internal CA; tls_verify = no skips the check
+# use_proxy   = yes                    use the system proxy settings to reach it
+# max_rounds  = 10                     rounds of diagnostics before the AI must conclude
+# max_report_chars  = 150000           longest report sent to the AI in one message
+# max_context_chars = 400000           older reports are shortened above this total
 
 # Add your own read-only commands to a component type:
 # [commands:esxi]
@@ -1947,8 +1960,10 @@ def load_inventory(path):
         die("cannot read inventory %s: %s" % (path, e))
     settings = dict(cp["settings"]) if cp.has_section("settings") else {}
     sections, custom, endpoints = [], {}, {}
+    if cp.has_section("ai"):
+        settings["_ai"] = dict(cp["ai"])
     for name in cp.sections():
-        if name == "settings":
+        if name in ("settings", "ai"):
             continue
         typ, _, label = name.partition(":")
         typ, label = typ.strip().lower(), label.strip()
@@ -2170,6 +2185,12 @@ def run_plan(ctx, plan, scrubber, ui=None):
         apply(targets, creds[sec["name"]])
         for t in targets:
             t.sso = sso.get(sec["name"])
+        if plan_needs_ssh(item) and not creds[sec["name"]][1]:
+            for t in targets:
+                t.errkind, t.errmsg = "skipped", "no password was entered for this group"
+            log("[%s] skipped: no password was entered" % sec["name"])
+            done.append((item, targets))
+            continue
         log("[%s] %d host(s), %d check(s) in total" % (
             sec["name"], len(targets), sum(len(g[2]) for t in targets for g in groups_of(t))))
         # Canary: try the first host alone, so a mistyped password costs one failed
@@ -3056,6 +3077,458 @@ def cmd_plan(args):
 
 
 # ----------------------------------------------------------------------------
+# AI-driven investigation: an OpenAI-compatible chat endpoint reads the reports,
+# asks for read-only diagnostics (approved by the admin round by round) and ends
+# with a root cause and fix steps. Fix steps are only shown, never run.
+# ----------------------------------------------------------------------------
+class AiError(Exception):
+    pass
+
+
+THINK_RX = re.compile(r"<think(?:ing)?>.*?</think(?:ing)?>\s*", re.S | re.I)
+
+
+def strip_think(text):
+    """Remove the reasoning section some models put in their reply."""
+    return THINK_RX.sub("", text or "").strip()
+
+
+class AiClient:
+    """Minimal client for an OpenAI-compatible /chat/completions endpoint (stdlib only).
+    The API key is held in memory only and sent in one header."""
+
+    def __init__(self, base_url, model, key, auth_header="bearer", verify=True, ca_file=None,
+                 timeout=600, max_tokens=None, use_proxy=True):
+        if not base_url or not model:
+            raise AiError("the [ai] section of the inventory needs base_url and model")
+        self.url = base_url.rstrip("/")
+        if not self.url.endswith("/chat/completions"):
+            self.url += "/chat/completions"
+        self.model, self.key, self.auth = model, key, auth_header.lower()
+        self.timeout, self.max_tokens = timeout, max_tokens
+        handlers = [] if use_proxy else [urllib.request.ProxyHandler({})]
+        if self.url.startswith("https:"):
+            if verify:
+                ctx = ssl.create_default_context(cafile=ca_file) if ca_file else ssl.create_default_context()
+            else:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+            handlers.append(urllib.request.HTTPSHandler(context=ctx))
+        self.opener = urllib.request.build_opener(*handlers)
+
+    def chat(self, messages, retries=2):
+        body = {"model": self.model, "messages": messages}
+        if self.max_tokens:
+            body["max_tokens"] = self.max_tokens
+        data = json.dumps(body).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self.key:
+            if self.auth == "api-key":
+                headers["api-key"] = self.key
+            else:
+                headers["Authorization"] = "Bearer " + self.key
+        for attempt in range(retries + 1):
+            req = urllib.request.Request(self.url, data=data, method="POST", headers=headers)
+            try:
+                with self.opener.open(req, timeout=self.timeout) as r:
+                    reply = json.loads(r.read().decode("utf-8", "replace"))
+                break
+            except urllib.error.HTTPError as e:
+                detail = e.read().decode("utf-8", "replace")[:500]
+                if e.code in (429, 500, 502, 503, 504) and attempt < retries:
+                    time.sleep(5 * (attempt + 1))
+                    continue
+                if e.code in (401, 403):
+                    raise AiError("the AI endpoint rejected the API key (HTTP %d)" % e.code)
+                if e.code == 404:
+                    raise AiError("the AI endpoint was not found (HTTP 404) at %s - check base_url and model"
+                                  % self.url)
+                if e.code == 400 and re.search(r"(?i)context|token|too long|maximum", detail):
+                    raise AiError("the AI rejected the request as too long (HTTP 400). Lower max_report_chars "
+                                  "and max_context_chars in the [ai] section. Detail: %s" % detail)
+                raise AiError("the AI endpoint returned HTTP %d: %s" % (e.code, detail))
+            except urllib.error.URLError as e:
+                if isinstance(e.reason, ssl.SSLCertVerificationError):
+                    raise AiError("the AI endpoint's certificate is not trusted (%s). Set ca_file in the [ai] "
+                                  "section, or tls_verify = no" % e.reason.verify_message)
+                if attempt < retries:
+                    time.sleep(5 * (attempt + 1))
+                    continue
+                raise AiError("cannot reach the AI endpoint: %s" % e.reason)
+            except (OSError, ValueError) as e:
+                raise AiError("bad answer from the AI endpoint: %s" % e)
+        try:
+            choice = reply["choices"][0]
+            content = choice["message"].get("content") or ""
+        except (KeyError, IndexError, TypeError, AttributeError):
+            raise AiError("unexpected answer from the AI endpoint: %s" % json.dumps(reply)[:300])
+        if isinstance(content, list):          # some gateways return content parts
+            content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
+        if choice.get("finish_reason") == "length":
+            content += "\n\n[The AI's reply was cut off at its output limit.]"
+        return strip_think(content)
+
+
+def ai_settings(settings):
+    ai = settings.get("_ai") or {}
+    return {
+        "base_url": (ai.get("base_url") or "").strip(),
+        "model": (ai.get("model") or "").strip(),
+        "auth_header": (ai.get("auth_header") or "bearer").strip(),
+        "tls_verify": (ai.get("tls_verify") or "yes").strip().lower() not in ("no", "false", "0", "off"),
+        "ca_file": os.path.expanduser((ai.get("ca_file") or "").strip()) or None,
+        "use_proxy": (ai.get("use_proxy") or "yes").strip().lower() not in ("no", "false", "0", "off"),
+        "max_rounds": _clamp(ai.get("max_rounds"), 10, 1, 50),
+        "max_tokens": _clamp(ai.get("max_tokens"), 0, 0, 1000000) or None,
+        "timeout": _clamp(ai.get("timeout"), 600, 30, 3600),
+        "max_report_chars": _clamp(ai.get("max_report_chars"), 150000, 5000, 5000000),
+        "max_context_chars": _clamp(ai.get("max_context_chars"), 400000, 20000, 20000000),
+        "key_env": (ai.get("key_env") or "VCF_DIAG_AI_KEY").strip(),
+    }
+
+
+def make_ai_client(cfg, key):
+    return AiClient(cfg["base_url"], cfg["model"], key, auth_header=cfg["auth_header"], verify=cfg["tls_verify"],
+                    ca_file=cfg["ca_file"], timeout=cfg["timeout"], max_tokens=cfg["max_tokens"],
+                    use_proxy=cfg["use_proxy"])
+
+
+def investigator_prompt(max_rounds, anonymized):
+    names = ("Hosts, domains and addresses are anonymized placeholders; use them exactly as written."
+             if anonymized else "Hosts are named as in the inventory; use those names exactly.")
+    return """You are an expert VMware Cloud Foundation 9.x troubleshooter (ESXi, vCenter, vSAN, NSX,
+SDDC Manager, the VCF management services and services runtime, vSphere Supervisor, VKS and
+Kubernetes). An administrator describes a problem; your job is to find its exact cause.
+
+You cannot reach the environment yourself. A collector tool runs read-only commands for you on
+the hosts in the inventory and returns their output as a report. %s
+
+Work in rounds. In every reply, either:
+1. ask for more data: explain briefly what you suspect and why, then add one vcf-plan block with
+   only [collect] steps (at most 8 per round, each focused on a hypothesis), or
+2. conclude: start with a line "ROOT CAUSE: <one sentence>" (or "NO ROOT CAUSE FOUND: <why>" when
+   read-only data cannot settle it), give the evidence by quoting the report lines that prove it,
+   then add one vcf-plan block with the [fix] steps in the order they must be applied, each with
+   impact and rollback in note:. Also say how to verify the fix worked.
+
+Rules:
+- Base conclusions on evidence in the reports, not on assumptions. Do not conclude early when one
+  more targeted check would confirm or rule out the cause; do not ask again for data you have.
+- The administrator approves every round, and you have at most %d rounds. Each message from the
+  tool says which round it is. In the last round you must conclude.
+- A [collect] step that looks as if it changes something, or that would print secrets, is refused
+  by the tool; you will be told which and why. Never put sudo in a command.
+- Prefer commands that print a bounded amount of output (tail, grep, head).
+
+Format of the plan block (the same as described in the reports):
+
+```vcf-plan
+plan: short title
+[collect] target=<host or @group>
+label: what this shows
+run: <one read-only shell command; {K} stands for kubectl on Kubernetes hosts>
+timeout: 60
+lines: 400
+
+[fix] target=<host or @group>
+label: what this does
+run: <command the administrator runs by hand>
+note: impact, rollback
+```""" % (names, max_rounds)
+
+
+def report_for_ai(report, limit):
+    """The part of a report the AI needs, shortened if it exceeds the limit (with a visible note)."""
+    report = re.sub(r"(?s)## How to reply \(for the analyst\)\n.*?(?=\n## )", "", report)
+    if len(report) <= limit:
+        return report, False
+    head = int(limit * 0.6)
+    tail = limit - head
+    return (report[:head] + "\n\n[... %d characters of this report were left out by the collector because it is "
+            "longer than max_report_chars. Ask for narrower checks if you need what is missing ...]\n\n"
+            % (len(report) - limit) + report[-tail:]), True
+
+
+def inventory_overview(args):
+    """The hosts and groups the AI may target, named as the AI will see them."""
+    settings, sections, _ = load_inventory(find_inventory(args))
+    plain = not anonymize_enabled(args, settings)
+    mapping = Mapping(None if plain else os.path.join(args.private_dir, "mapping.json"))
+    lines = ["Inventory (targets for vcf-plan steps; @<group> means every host of that group):"]
+    for s in sections:
+        names = []
+        for addr in s["hosts"]:
+            if plain:
+                names.append(addr)
+            else:
+                ph = mapping.lookup("target", addr) or (None if is_ip(addr) else
+                                                        mapping.lookup("host", addr.split(".")[0]))
+                names.append(ph or "(unnamed host)")
+        lines.append("- @%s  %s  (login user: %s): %s" % (
+            s["name"], COMPONENTS[s["type"]]["title"], s["user"], ", ".join(names)))
+        if s.get("endpoints"):
+            for name, svcs in s["endpoints"].items():
+                shown = name if plain else (mapping.lookup("host", name.split(".")[0]) or
+                                            (mapping.lookup("ipv4", name) if is_ip(name) else None) or "(endpoint)")
+                lines.append("    endpoint %s: %s" % (shown, ", ".join(svcs)))
+    return "\n".join(lines)
+
+
+class CachedUI:
+    """Asks for each group's login once per investigation, then reuses it."""
+
+    def __init__(self, ui):
+        self.ui = ui
+        self.creds, self.sso = {}, {}
+
+    def initial_credentials(self, sec):
+        if sec["name"] not in self.creds:
+            self.creds[sec["name"]] = self.ui.initial_credentials(sec)
+        return self.creds[sec["name"]]
+
+    def sso_credentials(self, sec):
+        if sec["name"] not in self.sso:
+            self.sso[sec["name"]] = self.ui.sso_credentials(sec)
+        return self.sso[sec["name"]]
+
+    def retry_credentials(self, sec, what, message, default=True):
+        new = self.ui.retry_credentials(sec, what, message, default)
+        if new and what.startswith("["):
+            self.creds[sec["name"]] = new
+        return new
+
+
+def latest_report(args):
+    try:
+        names = sorted(n for n in os.listdir(args.output_dir) if re.match(r"vcf-(report|followup)-.*\.md$", n))
+    except OSError:
+        return None
+    return os.path.join(args.output_dir, names[-1]) if names else None
+
+
+class Investigation:
+    """The investigation loop, independent of terminal or window.
+    emit(kind, text) reports progress; approve(prep) decides on each round of diagnostics;
+    stopped() is checked between steps; collect runs a prepared plan."""
+
+    def __init__(self, args, ai, cfg, problem, ui, emit, approve, stopped=lambda: False,
+                 start_report=None, collect=None):
+        self.args, self.ai, self.cfg = args, ai, cfg
+        self.problem, self.ui, self.emit, self.approve, self.stopped = problem, ui, emit, approve, stopped
+        self.start_report = start_report
+        self.collect = collect or collect_and_report
+        self.messages = []
+        self.final = None
+
+    def _trim_context(self):
+        """Keep the conversation under max_context_chars by shortening the oldest tool reports."""
+        limit = self.cfg["max_context_chars"]
+        total = sum(len(m["content"]) for m in self.messages)
+        for m in self.messages[1:-1]:
+            if total <= limit:
+                break
+            if m["role"] == "user" and m.get("_report") and not m.get("_trimmed"):
+                short = m["content"][:1500] + "\n\n[... the rest of this earlier report was removed to stay " \
+                    "within max_context_chars; your reply to it above summarizes what mattered ...]"
+                total -= len(m["content"]) - len(short)
+                m["content"], m["_trimmed"] = short, True
+        if total > limit:
+            self.emit("warn", "The conversation is still larger than max_context_chars after shortening "
+                              "earlier reports.")
+
+    def _ask_ai(self):
+        self._trim_context()
+        self.emit("status", "Waiting for the AI ...")
+        reply = self.ai.chat([{"role": m["role"], "content": m["content"]} for m in self.messages])
+        self.messages.append({"role": "assistant", "content": reply})
+        return reply
+
+    def run(self):
+        settings, sections, _ = load_inventory(find_inventory(self.args))
+        anonymized = anonymize_enabled(self.args, settings)
+        scrubber = make_scrubber(self.args, settings)
+        learn_inventory(scrubber, sections)        # so that every inventory host has its placeholder
+        scrubber.m.save()
+        problem = scrub_texts(self.args, [self.problem])[1][0]
+        first = ["Problem reported by the administrator:", problem.strip() or "(no description given)", "",
+                 inventory_overview(self.args)]
+        if self.start_report:
+            text, cut = report_for_ai(self.start_report, self.cfg["max_report_chars"])
+            if cut:
+                self.emit("warn", "The starting report was shortened to max_report_chars for the AI.")
+            first += ["", "Current diagnostic report:", "", text]
+        else:
+            first += ["", "No report has been collected yet. Ask for the diagnostics you need."]
+        max_rounds = self.cfg["max_rounds"]
+        first += ["", "Round 1 of %d." % max_rounds]
+        self.messages = [{"role": "system", "content": investigator_prompt(max_rounds, anonymized)},
+                         {"role": "user", "content": "\n".join(first), "_report": bool(self.start_report)}]
+        prep = None
+        for rnd in range(1, max_rounds + 1):
+            if self.stopped():
+                return self._finish("stopped", prep)
+            reply = self._ask_ai()
+            prep = prepare_plan(self.args, reply)
+            self.emit("ai", prep["translated"])
+            if not prep["collect"]:
+                if prep["problems"] and not prep["manual"] and rnd < max_rounds:
+                    self.messages.append({"role": "user", "content": "The tool could not use your plan: %s "
+                                          "Round %d of %d." % (" ".join(prep["problems"]), rnd + 1, max_rounds)})
+                    continue
+                return self._finish("concluded", prep)
+            if rnd == max_rounds:
+                break
+            if self.stopped():
+                return self._finish("stopped", prep)
+            if not self.approve(prep):
+                return self._finish("declined", prep)
+            self.emit("status", "Running %d read-only diagnostic(s) ..." % len(prep["collect"]))
+            res = self.collect(self.args, prep["settings"], prep["sections"], prep["plan"], self.ui,
+                               kind="followup", title=prep["title"])
+            if res is None:
+                return self._finish("stopped", prep)
+            self.emit("report", res["path"])
+            text, cut = report_for_ai(res["report"], self.cfg["max_report_chars"])
+            if cut:
+                self.emit("warn", "The round %d report was shortened to max_report_chars for the AI." % rnd)
+            notes = []
+            for e in prep["manual"]:
+                if e["kind"] == "blocked":
+                    notes.append("- Refused [collect] step '%s': %s." % (e["label"], e["reason"]))
+            notes += ["- %s" % p for p in prep["problems"]]
+            msg = ["Results of round %d." % rnd]
+            if notes:
+                msg += ["Steps the tool could not run:"] + notes
+            msg += ["", text, "", "Round %d of %d.%s" % (rnd + 1, max_rounds,
+                                                        " This is the last round: conclude now."
+                                                        if rnd + 1 == max_rounds else "")]
+            self.messages.append({"role": "user", "content": "\n".join(msg), "_report": True})
+        self.messages.append({"role": "user", "content": "The round limit is reached. Conclude now with the "
+                              "evidence you have, in the conclusion format."})
+        reply = self._ask_ai()
+        prep = prepare_plan(self.args, reply)
+        self.emit("ai", prep["translated"])
+        return self._finish("concluded", prep)
+
+    def _finish(self, how, prep):
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        os.makedirs(self.args.output_dir, exist_ok=True)
+        path = os.path.join(self.args.output_dir, "vcf-investigation-%s.md" % stamp)
+        out = ["# VCF investigation (%s)" % how, "", "- Tool: vcf_diag %s" % VERSION,
+               "- AI model: %s" % self.cfg["model"], ""]
+        for m in self.messages[1:]:
+            out += ["## %s" % ("Collector" if m["role"] == "user" else "AI"), "", m["content"], ""]
+        write_private(path, "\n".join(out))
+        self.final = {"how": how, "path": os.path.abspath(path),
+                      "conclusion": prep["translated"] if prep else "",
+                      "manual": prep["manual"] if prep else [], "problems": prep["problems"] if prep else []}
+        return self.final
+
+
+def print_plan_steps(prep, include_collect=True):
+    def show(e):
+        print("  - %s" % e["label"])
+        print("      on:  %s" % (", ".join("%s (%s)" % (t["address"], t["placeholder"]) for t in e["targets"]) or "?"))
+        for i, ln in enumerate(e["command"].split("\n")):
+            print("      %s %s" % ("run:" if i == 0 else "    ", ln))
+        if e["note"]:
+            print("      note: %s" % e["note"])
+        if e["reason"]:
+            print("      NOT RUN by this tool: %s" % e["reason"])
+
+    for p in prep["problems"]:
+        print("warning: %s" % p)
+    if prep["manual"]:
+        print("\nTo apply by hand (this tool never runs these):")
+        for e in prep["manual"]:
+            show(e)
+    if include_collect and prep["collect"]:
+        print("\nRead-only diagnostics requested:")
+        for e in prep["collect"]:
+            show(e)
+
+
+def cmd_investigate(args):
+    inv = find_inventory(args)
+    if not inv:
+        die("no inventory file found. Create one with:  python3 %s --init" % os.path.basename(__file__))
+    settings, sections, custom = load_inventory(inv)
+    cfg = ai_settings(settings)
+    if not cfg["base_url"] or not cfg["model"]:
+        die("add an [ai] section with base_url and model to the inventory (see inventory.example.ini)")
+    if args.parallel is None:
+        args.parallel = int(settings.get("parallel", 4))
+    problem = args.investigate.strip()
+    if not problem:
+        print("Describe the problem (finish with an empty line):")
+        lines = []
+        while True:
+            ln = input()
+            if not ln.strip():
+                break
+            lines.append(ln)
+        problem = "\n".join(lines)
+    key = os.environ.get(cfg["key_env"]) or getpass.getpass("API key for %s (hidden; Return for none): "
+                                                             % cfg["base_url"])
+    start_text = None
+    start = args.start or ("latest" if latest_report(args) else "none")
+    if args.report:
+        with open(args.report, encoding="utf-8", errors="replace") as fh:
+            start_text = fh.read()
+        print("Starting from %s" % args.report)
+    elif start == "latest":
+        path = latest_report(args)
+        if path:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                start_text = fh.read()
+            print("Starting from the latest report: %s" % path)
+        else:
+            print("No earlier report found; the AI starts from the description only.")
+    elif start == "collect":
+        plan = build_plan(sections, custom, args.all)
+        if not plan:
+            die("nothing selected", 0)
+        res = collect_and_report(args, settings, sections, plan, ConsoleUI())
+        print_result(args, res)
+        start_text = res["report"]
+    ui = CachedUI(ConsoleUI())
+
+    def emit(kind, text):
+        if kind == "ai":
+            print("\n" + "=" * 78 + "\nAI\n" + "=" * 78 + "\n" + text + "\n")
+        elif kind == "report":
+            print("Follow-up report: %s" % text)
+        elif kind == "warn":
+            print("note: %s" % text)
+        else:
+            print(text)
+
+    def approve(prep):
+        print_plan_steps(prep, include_collect=True)
+        return ask_yes("\nRun these %d read-only diagnostic(s) now?" % len(prep["collect"]), default=False)
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda *_: sys.exit(143))
+    try:
+        result = Investigation(args, make_ai_client(cfg, key), cfg, problem, ui, emit, approve,
+                               start_report=start_text).run()
+    except AiError as e:
+        die(str(e))
+    except KeyboardInterrupt:
+        print("\nInvestigation interrupted.")
+        return 130
+    print("\n" + "=" * 78)
+    print({"concluded": "Investigation finished.", "declined": "Investigation stopped: you declined a round.",
+           "stopped": "Investigation stopped."}[result["how"]])
+    fixes = [e for e in result["manual"] if e["kind"] == "fix"]
+    if fixes:
+        print_plan_steps({"problems": [], "manual": fixes, "collect": []}, include_collect=False)
+    print("\nTranscript (as sent to the AI): %s" % result["path"])
+    return 0
+
+
+# ----------------------------------------------------------------------------
 # Browser GUI (python3 vcf_diag.py --gui). Served to this machine only.
 # ----------------------------------------------------------------------------
 GUI_HTML = r"""<!doctype html>
@@ -3160,6 +3633,7 @@ td.mono { font-family: ui-monospace, Menlo, monospace; font-size: 13px; overflow
   </div>
   <nav role="tablist">
     <button role="tab" data-tab="collect" aria-selected="true">Collect</button>
+    <button role="tab" data-tab="investigate" aria-selected="false">Investigate with AI</button>
     <button role="tab" data-tab="reply" aria-selected="false">Analyst reply</button>
     <button role="tab" data-tab="scrub" aria-selected="false">Anonymize text</button>
   </nav>
@@ -3239,6 +3713,58 @@ td.mono { font-family: ui-monospace, Menlo, monospace; font-size: 13px; overflow
   <pre id="scrubOut" hidden></pre>
 </section>
 
+<section id="tab-investigate" hidden>
+  <div id="aiMissing" class="note warn" hidden>No AI is configured. Click <b>Edit inventory</b> and fill in the
+    <code>[ai]</code> section: <code>base_url</code> (an OpenAI-compatible endpoint) and <code>model</code>.</div>
+  <div id="invSetup">
+    <p class="muted">Describe the problem. The AI reads the diagnostics, asks for the read-only checks it needs
+      (you approve every round), and ends with the root cause and the fix steps. Fixes are only shown, never run.
+      <span id="aiWho"></span></p>
+    <label class="f">Problem description
+      <textarea id="invProblem" style="min-height:120px;font-family:inherit"
+        placeholder="For example: VCF Automation login fails since this morning with error ..."></textarea></label>
+    <div class="fields">
+      <fieldset style="border:1px solid var(--line);border-radius:8px;padding:8px 12px">
+        <legend class="muted" style="font-size:13px">Start from</legend>
+        <label style="display:block"><input type="radio" name="invStart" value="latest" checked>
+          the latest report <span class="muted" id="invLatest"></span></label>
+        <label style="display:block"><input type="radio" name="invStart" value="collect">
+          a new collection of what is selected on the Collect tab</label>
+        <label style="display:block"><input type="radio" name="invStart" value="none">
+          only the description</label>
+      </fieldset>
+      <label class="f">AI API key <input type="password" id="aiKey" autocomplete="off"></label>
+    </div>
+    <details id="invLogins"><summary>Logins for the hosts the AI may ask about</summary>
+      <p class="muted">Fill in the groups you expect to be involved. If the AI asks about another group, you are
+        asked for its login then. Passwords stay in memory on this Mac.</p>
+      <div id="invCreds"></div></details>
+    <div class="actions"><button class="btn primary" id="invGo">Start investigation</button>
+      <span class="muted" id="invMsg"></span></div>
+  </div>
+  <div id="invView" hidden>
+    <h2><span class="spin" id="invSpin"></span> <span id="invTitle">Investigating ...</span></h2>
+    <div id="invEntries"></div>
+    <pre id="invLog" hidden></pre>
+    <div id="invApprove" class="card on" hidden>
+      <b>The AI asks for these read-only diagnostics</b>
+      <p class="muted">Check the commands and hosts. They run only if you click Run.</p>
+      <div class="tablewrap"><table><thead><tr><th>Host</th><th>What</th><th>Command</th></tr></thead>
+        <tbody id="invApproveRows"></tbody></table></div>
+      <div id="invRefused"></div>
+      <div class="actions"><button class="btn primary" id="invRun">Run these diagnostics</button>
+        <button class="btn" id="invDecline">Stop the investigation</button></div>
+    </div>
+    <div id="invFinal" hidden>
+      <h2 id="invFinalTitle"></h2>
+      <div id="invFixes"></div>
+      <p class="muted" id="invPath"></p>
+    </div>
+    <div class="actions"><button class="btn" id="invStop">Stop</button>
+      <button class="btn" id="invAgain" hidden>New investigation</button></div>
+  </div>
+</section>
+
 <section id="tab-reply" hidden>
   <p class="muted">Paste the analyst's whole reply. Placeholders are translated back to your real names.
     Fixes are only shown, for you to apply by hand: this tool never runs them. Read-only follow-up
@@ -3316,7 +3842,7 @@ let sections = [], lastReport = "", logNext = 0, timer = null;
 // ---- tabs ----
 $$("nav button").forEach(b => b.onclick = () => {
   $$("nav button").forEach(x => x.setAttribute("aria-selected", x === b));
-  ["collect", "reply", "scrub"].forEach(t => $("#tab-" + t).hidden = t !== b.dataset.tab);
+  ["collect", "investigate", "reply", "scrub"].forEach(t => $("#tab-" + t).hidden = t !== b.dataset.tab);
 });
 
 // ---- selection ----
@@ -3392,9 +3918,11 @@ async function loadState() {
   $("#optParallel").value = st.parallel;
   $("#optLines").value = st.max_lines;
   $("#plainMode").hidden = st.anonymize !== false;
+  renderInvestigateSetup(st);
   renderGroups();
   updateHint();
-  if (st.busy) startPolling();
+  if (st.busy && st.busy_kind === "investigate") { $('nav button[data-tab="investigate"]').click(); startInvPolling(); }
+  else if (st.busy) startPolling();
 }
 
 // ---- run ----
@@ -3446,8 +3974,8 @@ async function poll() {
     log.scrollTop = log.scrollHeight;
     logNext = st.next;
   }
-  if (st.prompt && $("#credModal").hidden) showCred(st.prompt);
-  if (!st.prompt) $("#credModal").hidden = true;
+  if (st.prompt && st.prompt.kind !== "approve" && $("#credModal").hidden) showCred(st.prompt);
+  if (!st.prompt || st.prompt.kind === "approve") $("#credModal").hidden = true;
   if (st.state === "running") return;
   clearInterval(timer);
   $("#spin").hidden = true; $("#cancel").hidden = true; $("#again").hidden = false;
@@ -3639,6 +4167,134 @@ $("#planRun").onclick = async () => {
   startPolling();
 };
 
+// ---- investigate with AI ----
+let invTimer = null, invShown = 0, invLogNext = 0;
+function renderInvestigateSetup(st) {
+  const ai = st.ai || {};
+  $("#aiMissing").hidden = !!ai.configured;
+  $("#invGo").disabled = !ai.configured;
+  $("#aiWho").textContent = ai.configured ? "AI: " + ai.model + " at " + ai.base_url + ", up to " + ai.max_rounds + " rounds." : "";
+  $("#invLatest").textContent = ai.latest_report ? "(" + ai.latest_report + ")" : "(none yet)";
+  $("#aiKey").placeholder = ai.key_from_env ? "using " + ai.key_env + " from the environment" : "";
+  const box = $("#invCreds");
+  if (!box.children.length || box.dataset.n !== String(sections.length)) {
+    box.textContent = "";
+    sections.forEach(s => box.append(credFields({ name: s.name, title: s.title, user: s.user, escalate: s.escalate })));
+    box.dataset.n = String(sections.length);
+  }
+}
+function invCreds() {
+  const out = {};
+  for (const card of $$("#invCreds .card"))
+    out[card.dataset.name] = { user: $(".user", card).value.trim(), password: $(".pass", card).value,
+      su_password: $(".su", card) ? $(".su", card).value : null };
+  return out;
+}
+$("#invGo").onclick = async () => {
+  const start = $('input[name="invStart"]:checked').value;
+  const req = { problem: $("#invProblem").value, start, key: $("#aiKey").value, creds: invCreds(),
+    options: { parallel: +$("#optParallel").value, max_lines: +$("#optLines").value, strict: $("#optStrict").checked } };
+  if (start === "collect") {
+    req.collect = {};
+    for (const card of $$("#groups .card")) {
+      if (!$(".sec", card).checked) continue;
+      req.collect[card.dataset.name] = { hosts: $$(".host:checked", card).map(i => i.value),
+        groups: $$(".grp:checked", card).map(i => i.value), user: $(".user", card).value.trim(),
+        password: $(".pass", card).value || (req.creds[card.dataset.name] || {}).password || "",
+        su_password: $(".su", card) ? $(".su", card).value : null,
+        sso_user: $(".ssouser", card) ? $(".ssouser", card).value.trim() : null,
+        sso_password: $(".ssopass", card) ? $(".ssopass", card).value : null };
+    }
+    if (!Object.keys(req.collect).length) { $("#invMsg").textContent = "Select groups on the Collect tab first"; return; }
+  }
+  try { await api("investigate", req); } catch (e) { $("#invMsg").textContent = e.message; return; }
+  $("#invMsg").textContent = "";
+  $$("#invCreds input[type=password], #aiKey").forEach(i => i.value = "");
+  startInvPolling();
+};
+function startInvPolling() {
+  invShown = 0; invLogNext = 0;
+  $("#invEntries").textContent = ""; $("#invLog").textContent = ""; $("#invLog").hidden = true;
+  $("#invSetup").hidden = true; $("#invView").hidden = false; $("#invFinal").hidden = true;
+  $("#invApprove").hidden = true; $("#invSpin").hidden = false; $("#invStop").hidden = false; $("#invAgain").hidden = true;
+  $("#invTitle").textContent = "Investigating ...";
+  clearInterval(invTimer);
+  invTimer = setInterval(invPoll, 800);
+  invPoll();
+}
+function invEntry(e) {
+  if (e.kind === "ai") {
+    const card = el("div", { className: "card" }, el("b", { textContent: "AI" }), el("pre", { textContent: e.text }));
+    return card;
+  }
+  if (e.kind === "warn") return el("div", { className: "note warn", textContent: e.text });
+  if (e.kind === "report") return el("p", { className: "muted", textContent: "Report saved: " + e.text });
+  return el("p", { className: "muted", textContent: e.text });
+}
+function renderApprove(plan) {
+  const tb = $("#invApproveRows");
+  tb.textContent = "";
+  for (const e of plan.collect)
+    tb.append(el("tr", {}, el("td", { className: "mono", textContent: e.targets.map(t => t.address).join("\n") }),
+      el("td", { textContent: e.label }), el("td", { className: "mono", textContent: e.command })));
+  const ref = $("#invRefused");
+  ref.textContent = "";
+  const blocked = plan.manual.filter(e => e.kind === "blocked");
+  if (blocked.length)
+    ref.append(el("div", { className: "note warn", textContent: "Refused by the read-only check (not run; the AI is told): " +
+      blocked.map(e => e.label + " (" + e.reason + ")").join("; ") }));
+  if (plan.problems.length) ref.append(el("div", { className: "note warn", textContent: plan.problems.join(" ") }));
+  $("#invApprove").hidden = false;
+  $("#invApprove").scrollIntoView({ behavior: "smooth", block: "center" });
+}
+async function invPoll() {
+  let st;
+  try { st = await api("status?since=" + invLogNext); } catch (e) { return; }
+  if (st.lines.length) {
+    const log = $("#invLog");
+    log.hidden = false;
+    log.append(st.lines.join("\n") + "\n");
+    log.scrollTop = log.scrollHeight;
+    invLogNext = st.next;
+  }
+  const inv = st.inv;
+  if (!inv) return;
+  const box = $("#invEntries");
+  for (; invShown < inv.entries.length; invShown++) box.append(invEntry(inv.entries[invShown]));
+  const ap = st.prompt && st.prompt.kind === "approve";
+  if (ap && $("#invApprove").hidden) renderApprove(st.prompt.plan);
+  if (!ap) $("#invApprove").hidden = true;
+  if (st.prompt && !ap && $("#credModal").hidden) showCred(st.prompt);
+  if (inv.state === "running") return;
+  clearInterval(invTimer);
+  $("#invSpin").hidden = true; $("#invStop").hidden = true; $("#invAgain").hidden = false; $("#credModal").hidden = true;
+  if (inv.state === "error") { $("#invTitle").textContent = "Stopped: " + inv.error; return; }
+  const f = inv.final;
+  $("#invTitle").textContent = { concluded: "Investigation finished", declined: "Investigation stopped by you",
+    stopped: "Investigation stopped" }[f.how] || "Investigation finished";
+  $("#invFinal").hidden = false;
+  const fixes = f.manual.filter(e => e.kind === "fix");
+  $("#invFinalTitle").textContent = fixes.length ? "Fixes to apply by hand, in this order" : "No fix steps were proposed";
+  const fx = $("#invFixes");
+  fx.textContent = "";
+  fixes.forEach((e, i) => {
+    const msg = el("span", { className: "muted" });
+    const card = el("div", { className: "card" },
+      el("div", { className: "row" }, el("b", { textContent: (i + 1) + ". " + e.label }),
+        el("span", { className: "pill warn", textContent: "changes the system" })),
+      el("p", { textContent: "On: " + hostNames(e.targets) }));
+    if (e.note) card.append(el("p", { textContent: e.note }));
+    card.append(el("pre", { textContent: e.command }), el("div", { className: "actions" },
+      el("button", { className: "btn", textContent: "Copy command", onclick: () => copyText(e.command, msg) }), msg));
+    fx.append(card);
+  });
+  $("#invPath").textContent = "Transcript (as sent to the AI): " + f.path;
+}
+$("#invRun").onclick = () => { $("#invApprove").hidden = true; api("answer", { approve: true }).catch(() => {}); };
+$("#invDecline").onclick = () => { $("#invApprove").hidden = true; api("answer", { approve: false }).catch(() => {}); };
+$("#invStop").onclick = () => { $("#invTitle").textContent = "Stopping ..."; api("cancel", {}).catch(() => {}); };
+$("#invAgain").onclick = () => { $("#invView").hidden = true; $("#invSetup").hidden = false; loadState(); };
+
 $("#quit").onclick = async () => {
   if (!confirm("Stop the tool? A collection that is still running will be cancelled.")) return;
   await api("quit", {}).catch(() => {});
@@ -3666,6 +4322,13 @@ class GuiUI:
 
     def initial_credentials(self, sec):
         c = self.creds.get(sec["name"], {})
+        if not c.get("password") and self.gui.inv and self.gui.inv["state"] == "running":
+            new = self.gui.ask({"kind": "creds", "section": sec["name"], "what": "[%s]" % sec["name"],
+                                "message": "The AI asked for diagnostics on [%s] %s, and no login was entered "
+                                           "for it." % (sec["name"], COMPONENTS[sec["type"]]["title"]),
+                                "user": c.get("user") or sec["user"], "needs_su": sec.get("escalate") == "su"})
+            if new:
+                return new
         return (c.get("user") or sec["user"], c.get("password") or "", c.get("su_password") or None)
 
     def sso_credentials(self, sec):
@@ -3693,6 +4356,8 @@ class Gui:
         self.error = ""
         self.ctx = None
         self.httpd = None
+        self.inv = None                    # state of the current or last investigation
+        self.inv_stop = threading.Event()
         _log_sinks.append(lambda msg: self.lines.append(msg) if msg.strip() else None)
 
     # ---- helpers -----------------------------------------------------------
@@ -3704,13 +4369,15 @@ class Gui:
             self.prompt, self.answer = prompt, None
             self.answered.clear()
         while not self.answered.wait(0.5):
-            if self.ctx is not None and self.ctx.cancel.is_set():
+            if (self.ctx is not None and self.ctx.cancel.is_set()) or self.inv_stop.is_set():
                 break
         with self.lock:
             self.prompt = None
             return self.answer
 
     def cancel(self):
+        self.inv_stop.set()
+        self.answered.set()
         ctx = self.ctx
         if ctx is not None:
             ctx.cancel.set()
@@ -3721,6 +4388,8 @@ class Gui:
     # ---- API ---------------------------------------------------------------
     def api_state(self):
         out = {"version": VERSION, "sections": [], "error": "", "busy": self.state == "running",
+               "busy_kind": "investigate" if (self.inv and self.inv["state"] == "running") else "collect",
+               "ai": {"configured": False},
                "parallel": self.args.parallel or 4, "max_lines": self.args.max_lines or 200,
                "anonymize": True}
         if ssh_version()[0] is None:
@@ -3737,6 +4406,12 @@ class Gui:
         if not self.args.parallel:
             out["parallel"] = int(settings.get("parallel", 4))
         out["max_lines"] = max_lines_for(self.args, settings)
+        cfg = ai_settings(settings)
+        latest = latest_report(self.args)
+        out["ai"] = {"configured": bool(cfg["base_url"] and cfg["model"]), "model": cfg["model"],
+                     "base_url": cfg["base_url"], "key_env": cfg["key_env"],
+                     "key_from_env": bool(os.environ.get(cfg["key_env"])), "max_rounds": cfg["max_rounds"],
+                     "latest_report": os.path.basename(latest) if latest else None}
         out["anonymize"] = anonymize_enabled(self.args, settings)
         for s in sections:
             out["sections"].append({
@@ -3779,9 +4454,21 @@ class Gui:
             self.state = "running"
         try:
             settings, sections, custom = load_inventory(self.inventory_path())
+            plan, creds = self._plan_from_selection(body.get("sections") or {}, sections, custom)
+            args = self._run_args(body, settings)
+            scale = self.args.timeout_scale
+            scale_timeouts(plan, scale if scale is not None else float(settings.get("timeout", 30)) / 30.0)
+        except Exception:
+            with self.lock:
+                self.state = "idle"
+            raise
+        return self._start(args, settings, sections, plan, creds, "health", "")
+
+    def _plan_from_selection(self, selection, sections, custom):
+        if True:
             byname = {s["name"]: s for s in sections}
             plan, creds = [], {}
-            for name, sel in (body.get("sections") or {}).items():
+            for name, sel in selection.items():
                 sec = byname.get(name)
                 if not sec:
                     raise Fatal("unknown inventory section [%s]" % name)
@@ -3801,14 +4488,7 @@ class Gui:
                                "sso_password": str(sel.get("sso_password") or "")}
             if not plan:
                 raise Fatal("nothing selected")
-            args = self._run_args(body, settings)
-            scale = self.args.timeout_scale
-            scale_timeouts(plan, scale if scale is not None else float(settings.get("timeout", 30)) / 30.0)
-        except Exception:
-            with self.lock:
-                self.state = "idle"
-            raise
-        return self._start(args, settings, sections, plan, creds, "health", "")
+            return plan, creds
 
     def _run_args(self, body, settings):
         opt = body.get("options") or {}
@@ -3825,6 +4505,95 @@ class Gui:
         threading.Thread(target=self._run, args=(args, settings, sections, plan, creds, kind, title),
                          daemon=True).start()
         return {"ok": True}
+
+    def api_investigate(self, body):
+        """Start an AI investigation in the background."""
+        with self.lock:
+            if self.state == "running":
+                raise Fatal("a collection or investigation is already running")
+            self.state = "running"
+        try:
+            settings, sections, custom = load_inventory(self.inventory_path())
+            cfg = ai_settings(settings)
+            if not (cfg["base_url"] and cfg["model"]):
+                raise Fatal("add an [ai] section with base_url and model to the inventory first")
+            key = str(body.get("key") or "") or os.environ.get(cfg["key_env"], "")
+            problem = str(body.get("problem") or "").strip()
+            if not problem:
+                raise Fatal("describe the problem first")
+            start = body.get("start") or "latest"
+            creds = {}
+            for name, c in (body.get("creds") or {}).items():
+                creds[name] = {"user": str(c.get("user") or "").strip(), "password": str(c.get("password") or ""),
+                               "su_password": c.get("su_password"), "sso_user": str(c.get("sso_user") or "").strip(),
+                               "sso_password": str(c.get("sso_password") or "")}
+            collect_plan = None
+            if start == "collect":
+                collect_plan, ccreds = self._plan_from_selection(body.get("collect") or {}, sections, custom)
+                for name, c in ccreds.items():
+                    if not (creds.get(name) or {}).get("password"):
+                        creds[name] = c
+            args = self._run_args(body, settings)
+            ai = make_ai_client(cfg, key)
+        except Exception:
+            with self.lock:
+                self.state = "idle"
+            raise
+        with self.lock:
+            del self.lines[:]
+            self.result, self.error, self.prompt = None, "", None
+            self.inv = {"state": "running", "entries": [], "final": None, "error": "", "model": cfg["model"]}
+            self.inv_stop.clear()
+        threading.Thread(target=self._investigate, args=(args, settings, sections, cfg, ai, problem, start,
+                                                         collect_plan, creds), daemon=True).start()
+        return {"ok": True}
+
+    def _inv_emit(self, kind, text):
+        with self.lock:
+            self.inv["entries"].append({"kind": kind, "text": text})
+
+    def _inv_approve(self, prep):
+        return bool(self.ask({"kind": "approve", "plan": plan_public(prep)}))
+
+    def _investigate(self, args, settings, sections, cfg, ai, problem, start, collect_plan, creds):
+        state, error, final = "finished", "", None
+        ui = CachedUI(GuiUI(self, creds))
+        try:
+            start_text = None
+            if start == "latest":
+                path = latest_report(args)
+                if path:
+                    with open(path, encoding="utf-8", errors="replace") as fh:
+                        start_text = fh.read()
+                    self._inv_emit("status", "Starting from the latest report: %s" % os.path.basename(path))
+                else:
+                    self._inv_emit("warn", "No earlier report found; the AI starts from the description only.")
+            elif start == "collect":
+                self._inv_emit("status", "Collecting the selected health checks first ...")
+                res = collect_and_report(args, settings, sections, collect_plan, ui,
+                                         on_context=lambda ctx: setattr(self, "ctx", ctx))
+                if res is None:
+                    raise Fatal("the starting collection was cancelled")
+                start_text = res["report"]
+                self._inv_emit("report", res["path"])
+
+            def collect(a, st, secs, plan, u, kind, title):
+                return collect_and_report(a, st, secs, plan, u, kind=kind, title=title,
+                                          on_context=lambda ctx: setattr(self, "ctx", ctx))
+
+            final = Investigation(args, ai, cfg, problem, ui, self._inv_emit, self._inv_approve,
+                                  stopped=self.inv_stop.is_set, start_report=start_text, collect=collect).run()
+        except (AiError, Fatal) as e:
+            state, error = "error", str(e)
+        except Exception as e:
+            state, error = "error", "unexpected error: %r" % (e,)
+        finally:
+            creds.clear()
+            ui.creds.clear()
+            with self.lock:
+                self.ctx, self.prompt = None, None
+                self.inv.update(state=state, error=error, final=final)
+                self.state = "idle"
 
     def api_plan(self, body):
         text = str(body.get("text", ""))
@@ -3877,7 +4646,8 @@ class Gui:
     def api_status(self, since):
         with self.lock:
             out = {"state": self.state, "lines": self.lines[since:], "next": len(self.lines),
-                   "prompt": self.prompt, "error": self.error, "result": None}
+                   "prompt": self.prompt, "error": self.error, "result": None,
+                   "inv": dict(self.inv, entries=list(self.inv["entries"])) if self.inv else None}
             r = self.result
             if self.state == "done" and r:
                 out["result"] = {k: r[k] for k in ("path", "total", "failed", "review", "targets")}
@@ -3889,6 +4659,10 @@ class Gui:
         with self.lock:
             if not self.prompt:
                 return {"ok": False}
+            if self.prompt.get("kind") == "approve":
+                self.answer = bool(body.get("approve"))
+                self.answered.set()
+                return {"ok": True}
             self.answer = None if body.get("skip") or not body.get("password") else (
                 str(body.get("user") or self.prompt["user"]).strip(), str(body["password"]),
                 body.get("su_password") or None)
@@ -3938,6 +4712,8 @@ class Gui:
                 return self.api_plan(body)
             if route == "plan_run":
                 return self.api_plan_run(body)
+            if route == "investigate":
+                return self.api_investigate(body)
             if route == "answer":
                 return self.api_answer(body)
             if route == "cancel":
@@ -4131,6 +4907,12 @@ def main(argv=None):
                     help="only connect to hosts already in known_hosts (default: trust on first use)")
     ap.add_argument("--scrub-file", nargs="+", metavar="FILE",
                     help="anonymize existing text files with the same mapping, then exit")
+    ap.add_argument("--investigate", nargs="?", const="", metavar="PROBLEM",
+                    help="let the AI in the [ai] section investigate a problem: it asks for read-only diagnostics, "
+                         "you approve each round, and it ends with the root cause and fix steps (never run)")
+    ap.add_argument("--start", choices=("latest", "collect", "none"),
+                    help="with --investigate: start from the latest report (default), a new collection, or nothing")
+    ap.add_argument("--report", metavar="FILE", help="with --investigate: start from this report")
     ap.add_argument("--plan", metavar="FILE",
                     help="read an analyst reply: show its fixes translated to real names (never run) and "
                          "offer to run the read-only diagnostics it asks for")
@@ -4157,6 +4939,8 @@ def dispatch(args):
         return cmd_decode(args)
     if args.scrub_file:
         return cmd_scrub_files(args)
+    if args.investigate is not None:
+        return cmd_investigate(args)
     if args.plan:
         return cmd_plan(args)
     if args.gui:

@@ -727,6 +727,145 @@ class FollowUpRegression(unittest.TestCase):
         self.assertEqual(step["mode"], "sh")      # not a Kubernetes section: left as written
 
 
+def fake_ai(target):
+    """A local stand-in for an OpenAI-compatible chat endpoint: asks for one diagnostic,
+    then concludes once it has seen the results."""
+    import http.server
+    import json as _json
+    import threading
+    seen = []
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            body = _json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            seen.append({"path": self.path, "auth": self.headers.get("Authorization"), "body": body})
+            last = body["messages"][-1]["content"]
+            if "Results of round 1" in last:
+                text = ("<think>private reasoning</think>ROOT CAUSE: kubelet on %s cannot reach the API server.\n"
+                        "Evidence: the report shows the error.\n\n```vcf-plan\n[fix] target=%s\n"
+                        "label: Restart kubelet\nrun: systemctl restart kubelet\nnote: brief node blip\n```" % (target, target))
+            else:
+                text = ("I suspect kubelet.\n\n```vcf-plan\nplan: kubelet check\n[collect] target=%s\n"
+                        "label: kubelet log\nrun: journalctl -u kubelet -n 20\n[collect] target=%s\n"
+                        "label: bad step\nrun: rm -rf /var/lib/kubelet\n```" % (target, target))
+            data = _json.dumps({"choices": [{"message": {"role": "assistant", "content": text},
+                                             "finish_reason": "stop"}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, "http://127.0.0.1:%d/v1" % srv.server_address[1], seen
+
+
+class Investigations(unittest.TestCase):
+    def run_case(self, anonymize):
+        import argparse
+        with tempfile.TemporaryDirectory() as d:
+            inv = os.path.join(d, "inventory.ini")
+            with open(inv, "w") as fh:
+                fh.write("[settings]\nanonymize = %s\n[vcfmgmt:mgmt]\ncontrol_planes = 10.9.0.11\n"
+                         "[ai]\nbase_url = placeholder\nmodel = test-model\n" % ("yes" if anonymize else "no"))
+            target = "vcfmgmt-mgmt-01" if anonymize else "10.9.0.11"
+            srv, base, seen = fake_ai(target)
+            try:
+                args = argparse.Namespace(inventory=inv, private_dir=os.path.join(d, "private"),
+                                          output_dir=os.path.join(d, "out"), no_anonymize=False, max_lines=None)
+                settings, _, _ = v.load_inventory(inv)
+                cfg = v.ai_settings(settings)
+                cfg["base_url"] = base
+                events, approvals, collected = [], [], []
+
+                def collect(a, st, secs, plan, ui, kind, title):
+                    collected.append(plan)
+                    return {"path": "/x/followup.md", "report": "kubelet: dial tcp 10.9.0.11:6443: connection refused"}
+
+                def approve(prep):
+                    approvals.append([e["command"] for e in prep["collect"]])
+                    return True
+
+                inv_run = v.Investigation(args, v.make_ai_client(cfg, "sk-test"), cfg,
+                                          "Pods on 10.9.0.11 keep restarting", None,
+                                          lambda k, t: events.append((k, t)), approve, collect=collect)
+                result = inv_run.run()
+                return result, seen, events, approvals, collected
+            finally:
+                srv.shutdown()
+                srv.server_close()
+
+    def test_loop_plain(self):
+        result, seen, events, approvals, collected = self.run_case(False)
+        self.assertEqual(result["how"], "concluded")
+        self.assertEqual(len(seen), 2)
+        self.assertTrue(seen[0]["path"].endswith("/v1/chat/completions"))
+        self.assertEqual(seen[0]["auth"], "Bearer sk-test")
+        self.assertEqual(seen[0]["body"]["model"], "test-model")
+        self.assertEqual(seen[0]["body"]["messages"][0]["role"], "system")
+        self.assertIn("Pods on 10.9.0.11 keep restarting", seen[0]["body"]["messages"][1]["content"])
+        self.assertIn("@vcfmgmt:mgmt", seen[0]["body"]["messages"][1]["content"])
+        # only the read-only step was approved and run; the destructive one was refused and reported
+        self.assertEqual(approvals, [["journalctl -u kubelet -n 20"]])
+        self.assertNotIn("rm -rf", str(collected))
+        round2 = seen[1]["body"]["messages"][-1]["content"]
+        self.assertIn("Refused [collect] step 'bad step'", round2)
+        self.assertIn("connection refused", round2)
+        self.assertTrue(result["conclusion"].startswith("ROOT CAUSE: kubelet on 10.9.0.11"))
+        self.assertNotIn("private reasoning", result["conclusion"])
+        self.assertEqual([e["command"] for e in result["manual"] if e["kind"] == "fix"], ["systemctl restart kubelet"])
+        self.assertTrue(os.path.basename(result["path"]).startswith("vcf-investigation-"))
+
+    def test_loop_anonymized(self):
+        result, seen, events, approvals, collected = self.run_case(True)
+        first = seen[0]["body"]["messages"][1]["content"]
+        self.assertNotIn("10.9.0.11", first)                   # the admin's text is anonymized too
+        self.assertIn("vcfmgmt-mgmt-01", first)
+        self.assertEqual(list(collected[0][0]["host_groups"]), ["10.9.0.11"])   # translated back to run
+        self.assertIn("ROOT CAUSE: kubelet on 10.9.0.11", result["conclusion"])  # shown with real names
+
+    def test_round_limit_forces_a_conclusion(self):
+        import argparse
+        srv, base, seen = fake_ai("10.9.0.11")
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                inv = os.path.join(d, "inventory.ini")
+                with open(inv, "w") as fh:
+                    fh.write("[settings]\nanonymize = no\n[vcfmgmt:mgmt]\ncontrol_planes = 10.9.0.11\n"
+                             "[ai]\nbase_url = x\nmodel = m\nmax_rounds = 1\n")
+                args = argparse.Namespace(inventory=inv, private_dir=os.path.join(d, "p"),
+                                          output_dir=os.path.join(d, "o"), no_anonymize=False, max_lines=None)
+                cfg = v.ai_settings(v.load_inventory(inv)[0])
+                cfg["base_url"] = base
+                ran = []
+                v.Investigation(args, v.make_ai_client(cfg, ""), cfg, "x", None, lambda k, t: None,
+                                lambda p: ran.append(p) or True, collect=lambda *a, **k: None).run()
+                self.assertEqual(ran, [])                      # no diagnostics beyond the limit
+                self.assertIn("round limit is reached", seen[-1]["body"]["messages"][-1]["content"])
+                self.assertIsNone(seen[0]["auth"])             # no key, no header
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_errors_are_explained(self):
+        with self.assertRaises(v.AiError):
+            v.AiClient("", "m", "k")
+        c = v.AiClient("http://127.0.0.1:9/v1", "m", "k", timeout=2)
+        with self.assertRaises(v.AiError) as e:
+            c.chat([{"role": "user", "content": "x"}], retries=0)
+        self.assertIn("cannot reach", str(e.exception))
+
+    def test_long_reports_are_shortened_visibly(self):
+        text, cut = v.report_for_ai("## How to reply (for the analyst)\nguide\n## Summary\n" + "x" * 20000, 6000)
+        self.assertTrue(cut)
+        self.assertNotIn("guide", text)
+        self.assertIn("left out by the collector", text)
+
+
 class GuiApi(unittest.TestCase):
     """The browser GUI's local web API, without contacting any host."""
 
@@ -817,6 +956,21 @@ class GuiApi(unittest.TestCase):
         code, out = self.call("api/plan_run", {"text": only_fix, "sections": {"vcenter": {"password": "x"}}})
         self.assertEqual(code, 400)
         self.assertIn("no read-only diagnostics", out["error"])
+        self.assertEqual(self.call("api/status?since=0")[1]["state"], "idle")
+
+    def test_investigate_needs_an_ai_and_a_problem(self):
+        self.call("api/inventory", {"text": "[esxi]\nhosts = esx01.corp.example-widgets.com\n"})
+        code, st = self.call("api/state")
+        self.assertFalse(st["ai"]["configured"])
+        code, out = self.call("api/investigate", {"problem": "x"})
+        self.assertEqual(code, 400)
+        self.assertIn("[ai] section", out["error"])
+        self.call("api/inventory", {"text": "[esxi]\nhosts = esx01.corp.example-widgets.com\n"
+                                            "[ai]\nbase_url = http://127.0.0.1:9/v1\nmodel = m\n"})
+        code, st = self.call("api/state")
+        self.assertTrue(st["ai"]["configured"])
+        code, out = self.call("api/investigate", {"problem": "  "})
+        self.assertEqual((code, out["error"]), (400, "describe the problem first"))
         self.assertEqual(self.call("api/status?since=0")[1]["state"], "idle")
 
     def test_anonymize_and_translate_back(self):
