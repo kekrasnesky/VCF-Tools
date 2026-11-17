@@ -378,8 +378,9 @@ browser (for example `capra1.example.mil`; `https://` is added for you), paste t
 created in Ask Sage, click **Find models**, pick one in the **Model** field, then **Test
 connection** and **Save settings**.
 
-The tool first tries Ask Sage's OpenAI-compatible API (`/server/openai/v1`) and, if the server
-does not offer it, Ask Sage's own API (`/server/query`, with the key in the `x-access-tokens`
+Ask Sage usually serves its web page on `chat.<domain>` and its API on `api.<domain>`; when you
+enter a server name, the tool tries both. On each it first tries Ask Sage's OpenAI-compatible API
+(`/server/openai/v1`) and, if the server does not offer it, Ask Sage's own API (`/server/query`, with the key in the `x-access-tokens`
 header). The test tells you which one answered. If your server uses a different address for the
 API, enter the full URL ending in `/v1` instead of the server name.
 

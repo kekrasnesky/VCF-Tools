@@ -57,7 +57,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
-VERSION = "1.10.3"
+VERSION = "1.10.4"
 
 # ----------------------------------------------------------------------------
 # Diagnostic catalog
@@ -3499,6 +3499,15 @@ class AiClient:
         parts = urllib.parse.urlsplit(self.base)
         self.native = "%s://%s/server" % (parts.scheme, parts.netloc)     # Ask Sage native API
         self.flavor = "native" if (self.provider == "asksage" and not parts.path.endswith("/v1")) else "openai"
+        # Ask Sage serves its web page on chat.<domain> and its API on api.<domain>: when only the
+        # server name was given, the api. variant is tried too.
+        self.roots = [(self.base, self.native)]
+        host = parts.hostname or ""
+        if self.provider == "asksage" and parts.path == "/server/openai/v1" and not host.startswith("api."):
+            alt = "api." + (host[5:] if host.startswith("chat.") else host)
+            netloc = alt + (":%d" % parts.port if parts.port else "")
+            self.roots.append(("%s://%s/server/openai/v1" % (parts.scheme, netloc), "%s://%s/server" % (parts.scheme, netloc)))
+        self.root_i = 0
         self.model, self.key = model, key
         self.auth = "api-key" if self.provider == "azure" else (auth_header or "bearer").lower()
         self.timeout, self.max_tokens = timeout, max_tokens
@@ -3603,19 +3612,55 @@ class AiClient:
         return True
 
     # ---- chat --------------------------------------------------------------
+    def _use_root(self, i):
+        self.root_i = i
+        self.base, self.native = self.roots[i]
+        self.url = self.base + "/chat/completions"
+
+    def _each_root(self, attempt):
+        """Run attempt() on the current API address, then on the alternatives (Ask Sage api. host).
+        The first address that answers is kept for the rest of the session."""
+        tried = []
+        for i in range(self.root_i, len(self.roots)):
+            self._use_root(i)
+            try:
+                return attempt(tried)
+            except _NotHere as e:
+                tried.append("%s (HTTP %d)" % (e.url, e.code))
+            except AiError as e:
+                if i == len(self.roots) - 1 or not re.search(r"cannot look up|cannot reach", str(e)):
+                    if tried and i > 0:
+                        raise AiError("%s. Also tried: %s" % (e, ", ".join(tried)))
+                    raise
+                tried.append("%s (%s)" % (self.base, str(e).split(":")[0]))
+        self._use_root(0)
+        raise _Exhausted(tried)
+
     def chat(self, messages, retries=2):
-        if self.flavor == "openai":
+        if self.provider != "asksage":
             try:
                 return self._chat_openai(messages, retries)
             except _NotHere as e:
-                if self.provider != "asksage":
-                    raise AiError("the AI endpoint was not found (HTTP %d) at %s - check the address" % (e.code, e.url))
-                self.flavor = "native"           # this Ask Sage server has no OpenAI-compatible API
+                raise AiError("the AI endpoint was not found (HTTP %d) at %s - check the address" % (e.code, e.url))
+
+        def attempt(tried):
+            if self.flavor == "openai":
+                try:
+                    return self._chat_openai(messages, retries)
+                except _NotHere as e:
+                    tried.append("%s (HTTP %d)" % (e.url, e.code))
+                    self.flavor = "native"
+            try:
+                return self._chat_native(messages, retries)
+            except _NotHere:
+                self.flavor = "openai"       # try both kinds again on the next address
+                raise
         try:
-            return self._chat_native(messages, retries)
-        except _NotHere as e:
-            raise AiError("no Ask Sage API answered at %s or %s (HTTP %d) - check the server address"
-                          % (self.url, self.native + "/query", e.code))
+            return self._each_root(attempt)
+        except _Exhausted as e:
+            raise AiError("no Ask Sage API answered. Tried: %s. Ask your Ask Sage administrators for the API address "
+                          "(it often starts with api.) and enter it as https://<api address>/server/openai/v1"
+                          % ", ".join(e.tried))
 
     def _chat_openai(self, messages, retries):
         body = {"model": self.model, "messages": messages}
@@ -3654,13 +3699,31 @@ class AiClient:
     # ---- models ------------------------------------------------------------
     def list_models(self):
         """Model names the endpoint offers (OpenAI /models, or Ask Sage /server/get-models)."""
-        names, errors = [], []
+        if self.provider != "asksage":
+            return self._list_models_here()
+
+        def attempt(tried):
+            try:
+                return self._list_models_here(strict=True)
+            except _NotHere:
+                raise
+        try:
+            return self._each_root(attempt)
+        except _Exhausted as e:
+            raise AiError("no Ask Sage API answered. Tried: %s. Ask your Ask Sage administrators for the API address "
+                          "(it often starts with api.), or type the model name" % ", ".join(e.tried))
+
+    def _list_models_here(self, strict=False):
+        names, errors, missing = [], [], None
         if self.flavor == "openai" or self.provider != "asksage":
             try:
                 r = self._request("GET", self.base + "/models", timeout=60)
                 data = r.get("data") if isinstance(r, dict) else r
                 names = [m.get("id") if isinstance(m, dict) else m for m in (data or [])]
-            except (_NotHere, AiError) as e:
+            except _NotHere as e:
+                errors.append(str(e))
+                missing = e
+            except AiError as e:
                 errors.append(str(e))
         if not names and self.provider == "asksage":
             try:
@@ -3669,13 +3732,25 @@ class AiClient:
                 if isinstance(data, dict):
                     data = data.get("models") or data.get("data") or list(data)
                 names = [m.get("id") or m.get("name") if isinstance(m, dict) else m for m in (data or [])]
-            except (_NotHere, AiError) as e:
+            except _NotHere as e:
                 errors.append(str(e))
+                if strict and missing is not None:
+                    raise e                     # neither kind of API exists at this address
+            except AiError as e:
+                errors.append(str(e))
+                if strict and re.search(r"cannot look up|cannot reach", str(e)):
+                    raise
         names = sorted({str(n) for n in names if n})
         if not names:
             raise AiError("the endpoint did not return a model list" + (": " + errors[-1] if errors else "") +
                           ". Type the model name your AI provider gives you")
         return names
+
+
+class _Exhausted(Exception):
+    def __init__(self, tried):
+        Exception.__init__(self, ", ".join(tried))
+        self.tried = tried
 
 
 class _AlwaysProxy(urllib.request.ProxyHandler):

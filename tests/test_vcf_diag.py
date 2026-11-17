@@ -1262,6 +1262,58 @@ class NamedProxy(unittest.TestCase):
         self.assertNotIn("sk-", text)
 
 
+class AskSageApiHost(unittest.TestCase):
+    def test_api_host_is_derived_from_the_chat_host(self):
+        c = v.AiClient("chat.capra.example.mil", "m", "k", provider="asksage")
+        self.assertEqual([r[0] for r in c.roots], ["https://chat.capra.example.mil/server/openai/v1",
+                                                   "https://api.capra.example.mil/server/openai/v1"])
+        self.assertEqual(c.roots[1][1], "https://api.capra.example.mil/server")
+        self.assertEqual(len(v.AiClient("api.capra.example.mil", "m", "k", provider="asksage").roots), 1)
+        self.assertEqual(len(v.AiClient("https://x.example.mil/custom/v1", "m", "k", provider="asksage").roots), 1)
+        self.assertEqual(len(v.AiClient("chat.example.mil", "m", "k").roots), 1)        # only for Ask Sage
+
+    def test_falls_through_to_the_api_host(self):
+        import http.server
+        import threading
+
+        class Nothing(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def nope(self):
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            do_GET = do_POST = nope
+
+        chat = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Nothing)
+        threading.Thread(target=chat.serve_forever, daemon=True).start()
+        api, api_base, seen = fake_asksage(openai_compatible=False)
+        chat_base = "http://127.0.0.1:%d" % chat.server_address[1]
+        try:
+            c = v.AiClient(chat_base, "gpt-4o-gov", "sk-sage", provider="asksage")
+            c.roots = [(chat_base + "/server/openai/v1", chat_base + "/server"),
+                       (api_base + "/server/openai/v1", api_base + "/server")]
+            self.assertIn("gpt-4o-gov", c.list_models())
+            self.assertEqual(c.root_i, 1)                  # remembered
+            self.assertEqual(c.chat([{"role": "user", "content": "x"}], retries=0), "OK from native")
+            c2 = v.AiClient(chat_base, "m", "sk-sage", provider="asksage")
+            c2.roots = [(chat_base + "/server/openai/v1", chat_base + "/server")]
+            with self.assertRaises(v.AiError) as e:
+                c2.chat([{"role": "user", "content": "x"}], retries=0)
+            self.assertIn("no Ask Sage API answered. Tried:", str(e.exception))
+            self.assertIn("/server/query (HTTP 404)", str(e.exception))
+            with self.assertRaises(v.AiError) as e:
+                c2.list_models()
+            self.assertIn("no Ask Sage API answered", str(e.exception))
+        finally:
+            chat.shutdown()
+            chat.server_close()
+            api.shutdown()
+            api.server_close()
+
+
 class GuiApi(unittest.TestCase):
     """The browser GUI's local web API, without contacting any host."""
 
