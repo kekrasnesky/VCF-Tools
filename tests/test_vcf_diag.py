@@ -1204,6 +1204,64 @@ class ProxyFallback(unittest.TestCase):
             proxy.server_close()
 
 
+class NamedProxy(unittest.TestCase):
+    def test_proxy_named_in_settings_is_used(self):
+        """A working forward proxy given in the settings carries the request (like the proxy a PAC
+        file would choose), even when the Mac has no proxy configured."""
+        import http.server
+        import socketserver
+        import threading
+        used = []
+
+        class Forward(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def relay(self):
+                used.append(self.path)
+                n = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(n) if n else None
+                req = urllib.request.Request(self.path, data=body, method=self.command,
+                                             headers={k: v_ for k, v_ in self.headers.items() if k.lower() != "host"})
+                direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                with direct.open(req) as r:
+                    data = r.read()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            do_GET = do_POST = relay
+
+        import urllib.request
+        proxy = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Forward)
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        srv, base, seen = fake_asksage(openai_compatible=True)
+        try:
+            c = v.AiClient(base, "gpt-4o", "sk-sage", provider="asksage", use_proxy=False,
+                           proxy="127.0.0.1:%d" % proxy.server_address[1])
+            self.assertEqual(c.chat([{"role": "user", "content": "x"}], retries=0), "OK")
+            self.assertTrue(used and used[0].startswith(base))
+            self.assertEqual(c.note, "")
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            proxy.shutdown()
+            proxy.server_close()
+
+    def test_name_lookup_failure_is_explained(self):
+        with self.assertRaises(v.AiError) as e:
+            v.AiClient("capra1.example.invalid", "m", "k", provider="asksage", use_proxy=False).chat(
+                [{"role": "user", "content": "x"}], retries=0)
+        self.assertIn("cannot look up the server name", str(e.exception))
+        cfg = v.ai_settings({"_ai": {"provider": "asksage", "base_url": "capra1.example.invalid", "model": "m",
+                                     "use_proxy": "no"}})
+        text = v.ai_connection_check(cfg, "")
+        self.assertIn("[FAIL] name lookup", text)
+        self.assertIn("route the tool will use: direct (no proxy)", text)
+        self.assertNotIn("sk-", text)
+
+
 class GuiApi(unittest.TestCase):
     """The browser GUI's local web API, without contacting any host."""
 

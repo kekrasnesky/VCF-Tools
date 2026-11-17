@@ -57,7 +57,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
-VERSION = "1.10.1"
+VERSION = "1.10.3"
 
 # ----------------------------------------------------------------------------
 # Diagnostic catalog
@@ -2219,7 +2219,7 @@ SETTINGS_FIELDS = [("anonymize", "yes"), ("max_lines", "200"), ("parallel", "4")
                    ("extra_domains", ""), ("keep_literals", "9.1.1.0"), ("keep_namespaces", "")]
 AI_FIELDS = [("provider", "openai"), ("base_url", ""), ("model", ""), ("auth_header", "bearer"), ("max_rounds", "10"), ("max_tokens", ""),
              ("timeout", "600"), ("max_report_chars", "150000"), ("max_context_chars", "400000"), ("ca_file", ""),
-             ("tls_verify", "yes"), ("use_proxy", "yes"), ("key_env", "")]
+             ("tls_verify", "yes"), ("use_proxy", "yes"), ("proxy", ""), ("key_env", "")]
 GROUP_FIELDS = ["user", "port", "sudo", "escalate", "kubeconfig", "kubectl", "ssh_workers", "sso_user", "ca_file",
                 "tls_verify", "api_base", "ssh_options"]
 STANDARD_MGMT_SERVICES = ["VCF Operations", "VCF Operations for networks", "VCF Automation", "VCF services runtime",
@@ -3490,7 +3490,7 @@ class AiClient:
     API is used when that is not offered. The API key is held in memory only."""
 
     def __init__(self, base_url, model, key, auth_header="bearer", verify=True, ca_file=None,
-                 timeout=600, max_tokens=None, use_proxy=True, provider="openai"):
+                 timeout=600, max_tokens=None, use_proxy=True, provider="openai", proxy=""):
         self.provider = provider if provider in AI_PROVIDERS else "openai"
         self.base = normalize_ai_url(base_url, self.provider)
         if not self.base:
@@ -3504,7 +3504,14 @@ class AiClient:
         self.timeout, self.max_tokens = timeout, max_tokens
         tls = [urllib.request.HTTPSHandler(context=tls_context(verify, ca_file))] if self.base.startswith("https:") else []
         self.direct = urllib.request.build_opener(urllib.request.ProxyHandler({}), *tls)
-        self.opener = urllib.request.build_opener(*tls) if use_proxy else self.direct
+        proxy = (proxy or "").strip()
+        if proxy and "://" not in proxy:
+            proxy = "http://" + proxy
+        self.proxy = proxy
+        if proxy:          # a proxy named in the settings, e.g. the one a PAC file picks for this server
+            self.opener = urllib.request.build_opener(_AlwaysProxy({"http": proxy, "https": proxy}), *tls)
+        else:
+            self.opener = urllib.request.build_opener(*tls) if use_proxy else self.direct
         self.note = ""          # set when the tool had to go around the proxy
 
     # ---- transport ---------------------------------------------------------
@@ -3570,6 +3577,10 @@ class AiClient:
                     raise AiError("cannot reach the AI endpoint at %s. This Mac's proxy refused it (%s), and a direct "
                                   "connection failed too (%s). Check that this Mac can reach the AI server (network, "
                                   "VPN), or ask for the proxy to allow it" % (url, self.proxy_why, e.reason))
+                if isinstance(e.reason, socket.gaierror):
+                    raise AiError("this computer cannot look up the server name in %s (%s). Check the spelling; if your "
+                                  "browser opens it, it probably goes through a proxy: enter that proxy under More AI "
+                                  "options, Proxy to use. Check connection step by step shows more" % (url, e.reason))
                 raise AiError("cannot reach the AI endpoint at %s: %s" % (url, e.reason))
             except (OSError, ValueError) as e:
                 raise AiError("bad answer from the AI endpoint: %s" % e)
@@ -3577,6 +3588,8 @@ class AiClient:
     def _proxy_applies(self, url):
         if self.opener is self.direct:
             return False
+        if self.proxy:
+            return True
         parts = urllib.parse.urlsplit(url)
         return bool(urllib.request.getproxies().get(parts.scheme)) and not urllib.request.proxy_bypass(parts.hostname or "")
 
@@ -3665,6 +3678,25 @@ class AiClient:
         return names
 
 
+class _AlwaysProxy(urllib.request.ProxyHandler):
+    """A proxy the person named explicitly: used for every request, ignoring the system's and
+    NO_PROXY's exception lists (which would otherwise silently bypass it)."""
+
+    def proxy_open(self, req, proxy, type):
+        orig_type = req.type
+        proxy_type, user, password, hostport = urllib.request._parse_proxy(proxy)
+        if proxy_type is None:
+            proxy_type = orig_type
+        if user and password:
+            creds = base64.b64encode(("%s:%s" % (urllib.parse.unquote(user),
+                                                 urllib.parse.unquote(password))).encode()).decode("ascii")
+            req.add_header("Proxy-authorization", "Basic " + creds)
+        req.set_proxy(urllib.parse.unquote(hostport), proxy_type)
+        if orig_type == proxy_type or orig_type == "https":
+            return None
+        return self.parent.open(req, timeout=req.timeout)
+
+
 class _NotHere(Exception):
     def __init__(self, url, code):
         Exception.__init__(self, "HTTP %d at %s" % (code, url))
@@ -3678,6 +3710,7 @@ def ai_settings(settings):
         "model": (ai.get("model") or "").strip(),
         "auth_header": (ai.get("auth_header") or "bearer").strip(),
         "provider": (ai.get("provider") or "openai").strip().lower(),
+        "proxy": (ai.get("proxy") or "").strip(),
         "tls_verify": (ai.get("tls_verify") or "yes").strip().lower() not in ("no", "false", "0", "off"),
         "ca_file": os.path.expanduser((ai.get("ca_file") or "").strip()) or None,
         "use_proxy": (ai.get("use_proxy") or "yes").strip().lower() not in ("no", "false", "0", "off"),
@@ -3728,10 +3761,116 @@ def resolve_ai_key(cfg, typed="", session=""):
     return typed or session or os.environ.get(cfg["key_env"], "") or keychain_get(cfg["base_url"])
 
 
+def mac_pac_url():
+    """The automatic proxy configuration (PAC) URL of this Mac, if one is set."""
+    if sys.platform != "darwin" or not shutil.which("scutil"):
+        return ""
+    try:
+        out = subprocess.run(["scutil", "--proxy"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, timeout=10).stdout.decode("utf-8", "replace")
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if re.search(r"ProxyAutoConfigEnable\s*:\s*1", out):
+        m = re.search(r"ProxyAutoConfigURLString\s*:\s*(\S+)", out)
+        return m.group(1) if m else "a PAC file"
+    if re.search(r"ProxyAutoDiscoveryEnable\s*:\s*1", out):
+        return "automatic proxy discovery (WPAD)"
+    return ""
+
+
+def _mask_proxy(url):
+    return re.sub(r"//[^/@]+@", "//***@", url or "")
+
+
+def ai_connection_check(cfg, key):
+    """Step-by-step connection check for the AI endpoint. Returns text a person can copy into a
+    support message: no key is included."""
+    lines = ["vcf_diag %s, Python %s, %s" % (VERSION, sys.version.split()[0], sys.platform)]
+
+    def step(name, ok, detail):
+        lines.append("[%s] %s: %s" % ("ok" if ok else "FAIL" if ok is False else "info", name, detail))
+
+    try:
+        base = normalize_ai_url(cfg["base_url"], cfg["provider"])
+    except AiError as e:
+        step("address", False, str(e))
+        return "\n".join(lines)
+    parts = urllib.parse.urlsplit(base)
+    host, port = parts.hostname, parts.port or (443 if parts.scheme == "https" else 80)
+    step("settings used", None, "service=%s, address=%s, model=%s, use the Mac's proxy=%s, check certificate=%s, "
+         "CA file=%s, key entered=%s" % (cfg["provider"], base, cfg["model"] or "(none)",
+                                         "yes" if cfg["use_proxy"] else "no", "yes" if cfg["tls_verify"] else "no",
+                                         cfg["ca_file"] or "(none)", "yes" if key else "no"))
+    proxies = urllib.request.getproxies()
+    shown = {k: _mask_proxy(v_) for k, v_ in proxies.items() if k in ("http", "https", "all")}
+    step("proxy settings Python sees", None, ", ".join("%s=%s" % kv for kv in shown.items()) or "none")
+    pac = mac_pac_url()
+    if pac:
+        step("automatic proxy configuration (PAC)", None, "this Mac uses %s. Python cannot read PAC files, so it may "
+             "use a different proxy for this server than your browser does. Ask your IT department (or look in the "
+             "PAC file) which proxy serves %s, and enter it under More AI options, Proxy to use" % (pac, host))
+    applies = bool(proxies.get(parts.scheme)) and not urllib.request.proxy_bypass(host)
+    if cfg.get("proxy"):
+        route = "through the proxy named in the settings: %s" % _mask_proxy(cfg["proxy"])
+    elif cfg["use_proxy"] and applies:
+        route = "through the Mac's proxy %s" % _mask_proxy(proxies.get(parts.scheme))
+    else:
+        route = "direct (no proxy)"
+    step("route the tool will use", None, route)
+    try:
+        addrs = sorted({a[4][0] for a in socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)})
+        step("name lookup", True, "%s -> %s" % (host, ", ".join(addrs)))
+    except OSError as e:
+        step("name lookup", False, "%s does not resolve on this Mac (%s). Check the spelling against the address "
+             "bar of your browser. If the browser can open it, the name probably only works through a proxy: "
+             "enter that proxy under Proxy to use%s" % (host, e, " (see the PAC line above)" if pac else ""))
+        addrs = []
+    if addrs:
+        try:
+            sock = socket.create_connection((host, port), timeout=10)
+            step("direct network connection", True, "port %d on %s answers" % (port, host))
+            if parts.scheme == "https":
+                try:
+                    ctx = tls_context(cfg["tls_verify"], cfg["ca_file"])
+                    with ctx.wrap_socket(sock, server_hostname=host) as tls:
+                        cert = tls.getpeercert() or {}
+                        subj = dict(x[0] for x in cert.get("subject", ())).get("commonName", "?")
+                        iss = dict(x[0] for x in cert.get("issuer", ())).get("commonName", "?")
+                        step("certificate", True, "trusted; issued to %s by %s" % (subj, iss) if cert
+                             else "not checked (certificate check is off)")
+                except (ssl.SSLError, AiError, OSError) as e:
+                    step("certificate", False, "%s. Give the server's CA file under More AI options, or turn off "
+                         "the certificate check" % (getattr(e, "verify_message", None) or e))
+            else:
+                sock.close()
+        except OSError as e:
+            step("direct network connection", False, "port %d on %s does not answer directly (%s)%s" % (
+                port, host, e, "; only the proxy may be able to reach it" if applies else ""))
+    try:
+        client = make_ai_client(dict(cfg, model=cfg["model"] or "-"), key)
+        client.timeout = 60
+        models = client.list_models()
+        step("API request (model list)", True, "%d model(s): %s%s" % (len(models), ", ".join(models[:8]),
+                                                                       " (%s)" % client.note if client.note else ""))
+    except AiError as e:
+        step("API request (model list)", False, str(e))
+    if cfg["model"]:
+        try:
+            client = make_ai_client(cfg, key)
+            client.timeout = 120
+            reply = client.chat([{"role": "user", "content": "Reply with the single word OK."}], retries=0)
+            step("API request (chat with %s)" % cfg["model"], True, "%s via %s%s" % (
+                reply[:60].replace("\n", " "), client.url if client.flavor == "openai" else client.native + "/query",
+                " (%s)" % client.note if client.note else ""))
+        except AiError as e:
+            step("API request (chat with %s)" % cfg["model"], False, str(e))
+    return "\n".join(lines)
+
+
 def make_ai_client(cfg, key):
     return AiClient(cfg["base_url"], cfg["model"], key, auth_header=cfg["auth_header"], verify=cfg["tls_verify"],
                     ca_file=cfg["ca_file"], timeout=cfg["timeout"], max_tokens=cfg["max_tokens"],
-                    use_proxy=cfg["use_proxy"], provider=cfg["provider"])
+                    use_proxy=cfg["use_proxy"], provider=cfg["provider"], proxy=cfg.get("proxy", ""))
 
 
 def investigator_prompt(max_rounds, anonymized):
@@ -4362,7 +4501,13 @@ select { margin-top: 4px; padding: 8px 10px; border: 1px solid var(--line); bord
       <button class="btn" id="setKeySave">Save in the macOS Keychain</button>
       <button class="btn" id="setKeyForget">Forget the key</button>
       <button class="btn primary" id="setAiTest">Test connection</button>
+      <button class="btn" id="setAiCheck">Check connection step by step</button>
       <span class="muted" id="setAiMsg"></span></div>
+    <div id="setAiCheckOut" hidden>
+      <pre id="setAiCheckText"></pre>
+      <div class="actions"><button class="btn" id="setAiCheckCopy">Copy the result</button>
+        <span class="muted" id="setAiCheckMsg">No key or password is included; you can send it for help.</span></div>
+    </div>
     <details><summary>More AI options</summary>
       <div class="fields">
         <label class="f">Longest report sent at once (characters)<input type="number" min="5000" data-ai="max_report_chars"></label>
@@ -4370,6 +4515,8 @@ select { margin-top: 4px; padding: 8px 10px; border: 1px solid var(--line); bord
         <label class="f">Reply length limit (tokens, empty = endpoint default)<input type="number" min="0" data-ai="max_tokens"></label>
         <label class="f">Wait for a reply (seconds)<input type="number" min="30" data-ai="timeout"></label>
         <label class="f">Trust this CA file (path)<input type="text" data-ai="ca_file" placeholder="~/internal-ca.pem"></label>
+        <label class="f">Proxy to use (optional, overrides the Mac's)<input type="text" data-ai="proxy"
+          placeholder="proxy.example.mil:8080"></label>
         <label class="f">Key goes in (OpenAI-compatible only)
           <select data-ai="auth_header"><option value="bearer">Authorization: Bearer (most endpoints)</option>
             <option value="api-key">api-key header</option></select></label>
@@ -4377,7 +4524,8 @@ select { margin-top: 4px; padding: 8px 10px; border: 1px solid var(--line); bord
       <p class="muted">Certificates this Mac trusts (for example ones your organisation installed) are trusted
         automatically.</p>
       <label class="chk"><input type="checkbox" data-ai-bool="tls_verify"> Check the endpoint's certificate</label>
-      <label class="chk"><input type="checkbox" data-ai-bool="use_proxy"> Use this Mac's proxy settings to reach it</label>
+      <label class="chk"><input type="checkbox" data-ai-bool="use_proxy"> Use this Mac's proxy settings to reach it
+        (ignored when a proxy is entered above)</label>
     </details>
   </div>
 
@@ -4898,6 +5046,14 @@ function providerHints() {
     "https:// is added if you leave it out. Most gateways end in /v1.";
 }
 $("#setProvider").addEventListener("change", providerHints);
+$("#setAiCheck").onclick = async () => {
+  $("#setAiMsg").textContent = "Checking step by step ...";
+  try {
+    const r = await api("ai_check", { ai: aiForm(), key: $("#setKey").value });
+    $("#setAiCheckText").textContent = r.text; $("#setAiCheckOut").hidden = false; $("#setAiMsg").textContent = "";
+  } catch (e) { $("#setAiMsg").textContent = e.message; }
+};
+$("#setAiCheckCopy").onclick = () => copyText($("#setAiCheckText").textContent, $("#setAiCheckMsg"));
 $("#setFindModels").onclick = async () => {
   $("#setModelsMsg").textContent = "Asking the endpoint ...";
   try {
@@ -5423,6 +5579,10 @@ class Gui:
                 "url": client.url if client.flavor == "openai" else client.native + "/query",
                 "flavor": "OpenAI-compatible API" if client.flavor == "openai" else "native Ask Sage API"}
 
+    def api_ai_check(self, body):
+        cfg = ai_settings({"_ai": body.get("ai") or {}})
+        return {"text": ai_connection_check(cfg, resolve_ai_key(cfg, str(body.get("key") or ""), self.ai_key))}
+
     def api_ai_models(self, body):
         cfg = ai_settings({"_ai": dict(body.get("ai") or {}, model=(body.get("ai") or {}).get("model") or "-")})
         key = resolve_ai_key(cfg, str(body.get("key") or ""), self.ai_key)
@@ -5680,6 +5840,8 @@ class Gui:
                 return self.api_ai_test(body)
             if route == "ai_models":
                 return self.api_ai_models(body)
+            if route == "ai_check":
+                return self.api_ai_check(body)
             if route == "ai_key":
                 return self.api_ai_key(body)
             if route == "open_folder":
@@ -5880,6 +6042,8 @@ def main(argv=None):
     ap.add_argument("--investigate", nargs="?", const="", metavar="PROBLEM",
                     help="let the AI in the [ai] section investigate a problem: it asks for read-only diagnostics, "
                          "you approve each round, and it ends with the root cause and fix steps (never run)")
+    ap.add_argument("--ai-check", action="store_true",
+                    help="check the connection to the AI in the [ai] section step by step, then exit")
     ap.add_argument("--start", choices=("latest", "collect", "none"),
                     help="with --investigate: start from the latest report (default), a new collection, or nothing")
     ap.add_argument("--report", metavar="FILE", help="with --investigate: start from this report")
@@ -5909,6 +6073,10 @@ def dispatch(args):
         return cmd_decode(args)
     if args.scrub_file:
         return cmd_scrub_files(args)
+    if args.ai_check:
+        cfg = ai_settings(load_inventory(find_inventory(args) or "inventory.ini")[0])
+        print(ai_connection_check(cfg, resolve_ai_key(cfg) or getpass.getpass("API key (hidden; Return for none): ")))
+        return 0
     if args.investigate is not None:
         return cmd_investigate(args)
     if args.plan:

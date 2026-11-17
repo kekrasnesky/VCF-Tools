@@ -387,6 +387,14 @@ If your Mac uses a web proxy that cannot reach the AI server (the error says "Tu
 failed: 503"), the tool retries without the proxy automatically and says so in the test result.
 To skip the proxy from the start, untick **Use this Mac's proxy settings** under **More AI options**.
 
+If the browser opens the AI server but the tool cannot ("nodename nor servname provided, or not
+known", or the proxy refuses), your Mac probably uses an automatic proxy configuration (PAC) file
+that sends that server through a specific proxy. Python cannot read PAC files. Enter that proxy
+under **More AI options**, **Proxy to use**; a proxy entered there is always used.
+**Check connection step by step** shows the settings used, the proxy Python sees, whether a PAC
+file is configured, the name lookup, the direct connection, the certificate and the API answer, as
+text you can copy (no key or password is included).
+
 Certificates your Mac trusts, such as organisation or DoD root certificates installed by your IT
 department, are trusted automatically for the AI, vCenter and NSX connections. If the test still
 says the certificate is not trusted, give the CA file under **More AI options**.
@@ -448,6 +456,7 @@ python3 vcf_diag.py --scrub-file vpxd-excerpt.log
     --investigate [TEXT] let the AI in [ai] investigate a problem (you approve each round)
     --start MODE         with --investigate: latest (default), collect or none
     --report FILE        with --investigate: start from this report
+    --ai-check           check the connection to the AI step by step
     --plan FILE          read an analyst reply: show fixes (never run), offer read-only follow-ups
     --scrub-file FILE..  anonymize existing text files
     --decode FILE        translate placeholders back (local only)
