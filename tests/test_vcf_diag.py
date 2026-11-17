@@ -1521,7 +1521,7 @@ class ServerNameOnly(unittest.TestCase):
 
 
 class KeyHeaderDiscovery(unittest.TestCase):
-    def serve(self, wants):
+    def serve(self, wants, refusal="Invalid API key: key expired on 2026-10-01"):
         import http.server
         import json as _json
         import threading
@@ -1536,7 +1536,7 @@ class KeyHeaderDiscovery(unittest.TestCase):
                 seen.append(dict(self.headers))
                 ok = self.headers.get(wants[0]) == wants[1]
                 data = _json.dumps({"choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}]} if ok
-                                   else {"error": {"message": "Invalid API key: key expired on 2026-10-01"}}).encode()
+                                   else {"error": {"message": refusal}}).encode()
                 self.send_response(200 if ok else 401)
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
@@ -1547,7 +1547,7 @@ class KeyHeaderDiscovery(unittest.TestCase):
         return srv, "http://127.0.0.1:%d/v1" % srv.server_address[1], seen
 
     def test_other_header_is_found_and_reported(self):
-        srv, base, seen = self.serve(("api-key", "k1"))
+        srv, base, seen = self.serve(("api-key", "k1"), refusal="Missing API key header")
         try:
             c = v.AiClient(base, "m", "k1")
             self.assertEqual(c.chat([{"role": "user", "content": "x"}], retries=0), "OK")
@@ -1563,12 +1563,12 @@ class KeyHeaderDiscovery(unittest.TestCase):
             with self.assertRaises(v.AiError) as e:
                 v.AiClient(base, "m", "k1").chat([{"role": "user", "content": "x"}], retries=0)
             msg = str(e.exception)
-            self.assertIn("Tried the key as: bearer, x-api-key, api-key, token", msg)
+            self.assertNotIn("Tried the key as", msg)          # no guessing after "invalid / expired"
             self.assertIn("key expired on 2026-10-01", msg)
-            self.assertEqual(len(seen), 4)
+            self.assertEqual(len(seen), 1)                     # one failed attempt only
             with self.assertRaises(v.AiError):     # an explicitly chosen header is not changed
                 v.AiClient(base, "m", "k1", auth_header="api-key").chat([{"role": "user", "content": "x"}], retries=0)
-            self.assertEqual(len(seen), 5)
+            self.assertEqual(len(seen), 2)
         finally:
             srv.shutdown()
             srv.server_close()
@@ -1630,9 +1630,18 @@ class GenAiLikeKeys(unittest.TestCase):
             self.chat("capra-key-0123456789")
         msg = str(e.exception)
         self.assertIn("Invalid API key", msg)                       # what the server said to Bearer
-        self.assertIn("expects keys that start with 'STARK_'", msg)
-        self.assertIn("20 characters", msg)
+        self.assertEqual(self.seen, ["Bearer capra-key-0123456789"])   # one attempt, nothing else tried
         self.assertNotIn("capra-key-0123456789", msg)               # the key itself is never shown
+        # when the refusal itself names the expected prefix, the message points it out
+        del self.seen[:]
+        with self.assertRaises(v.AiError) as e:
+            self.chat("")
+        c = v.AiClient(self.url, "m", "capra-key-0123456789")
+        c.refusals.append("Provide 'Authorization: Bearer STARK_...'")
+        with self.assertRaises(v.AiError) as e:
+            c.chat([{"role": "user", "content": "x"}], retries=0)
+        self.assertIn("expects keys that start with 'STARK_'", str(e.exception))
+        self.assertIn("20 characters", str(e.exception))
         with self.assertRaises(v.AiError) as e:
             self.chat("STARK_expired999")
         self.assertNotIn("expects keys that start", str(e.exception))
@@ -1649,6 +1658,53 @@ class GenAiLikeKeys(unittest.TestCase):
                                      "typed in the key field")
         self.assertIn("[info] key: starts with 'STARK_', 13 characters, typed in the key field", text)
         self.assertNotIn("good123", text)
+
+
+class LockedKey(unittest.TestCase):
+    def test_locked_key_stops_everything(self):
+        import http.server
+        import json as _json
+        import threading
+        hits = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def answer(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                if n:
+                    self.rfile.read(n)
+                hits.append(self.path)
+                data = _json.dumps({"error": {"type": "unauthorized", "message": "API key locked - visit the unlock URL "
+                                              "to re-enable your key", "unlock_url": "https://genai.example.mil/unlock/abc"}}).encode()
+                self.send_response(401)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            do_GET = do_POST = answer
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = "http://127.0.0.1:%d/v1" % srv.server_address[1]
+        try:
+            c = v.AiClient(base, "m", "STARK_x")
+            with self.assertRaises(v.AiError) as e:
+                c.chat([{"role": "user", "content": "x"}], retries=2)
+            self.assertIn("LOCKED", str(e.exception))
+            self.assertIn("https://genai.example.mil/unlock/abc", str(e.exception))
+            self.assertEqual(len(hits), 1)                     # no retries, no other headers
+            with self.assertRaises(v.AiError):
+                c.chat([{"role": "user", "content": "x"}])
+            self.assertEqual(len(hits), 1)                     # never sent again by this client
+            cfg = v.ai_settings({"_ai": {"base_url": base, "model": "m", "use_proxy": "no"}})
+            text = v.ai_connection_check(cfg, "STARK_x")
+            self.assertIn("skipped: the key was refused", text)
+            self.assertEqual(len(hits), 2)                     # the check made one attempt, not two
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 class GuiApi(unittest.TestCase):

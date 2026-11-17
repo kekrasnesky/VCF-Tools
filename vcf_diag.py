@@ -57,7 +57,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
-VERSION = "1.11.4"
+VERSION = "1.11.5"
 
 # ----------------------------------------------------------------------------
 # Diagnostic catalog
@@ -3532,6 +3532,7 @@ class AiClient:
         self.auth_tried = [self.auth]
         self.first_refusal = None
         self.refusals = []
+        self.locked = False
         self.timeout, self.max_tokens = timeout, max_tokens
         tls = [urllib.request.HTTPSHandler(context=tls_context(verify, ca_file))] if self.base.startswith("https:") else []
         self.direct = urllib.request.build_opener(urllib.request.ProxyHandler({}), *tls)
@@ -3564,6 +3565,9 @@ class AiClient:
         return h
 
     def _request(self, method, url, body=None, native=False, retries=0, timeout=None):
+        if self.locked:
+            raise AiError("this API key was reported as locked; unlock it in the service's web portal, then restart "
+                          "the test")
         data = json.dumps(body).encode("utf-8") if body is not None else None
         for attempt in range(retries + 1):
             try:
@@ -3590,8 +3594,22 @@ class AiClient:
                     if self.first_refusal is None:
                         self.first_refusal = (self.auth, detail)
                     self.refusals.append(detail)
+                    lock = re.search(r"(?i)\block(ed|out)\b|too many (failed|attempts)|disabled|suspended", detail)
+                    if lock:
+                        self.locked = True
+                        m = re.search(r'https?://[^\s"\'<>]+', detail)
+                        raise AiError("the AI service has LOCKED this API key (%s). The tool will not send it again "
+                                      "in this session. %s" % (
+                                          re.sub(r"\s+", " ", _json_message(detail))[:200],
+                                          ("Unlock it here, in your browser: " + m.group(0)) if m else
+                                          "Unlock or regenerate it in the service's web portal."))
                     names_bearer = re.search(r"(?i)authorization:?\s*bearer", detail)
-                    if not native and self.key and self.auth_auto and not names_bearer and self._next_auth():
+                    # Other headers are tried only when the server says the key header was missing or not
+                    # recognised; never after "invalid", "expired" or "locked", so failed attempts do not pile up.
+                    header_missing = re.search(r"(?i)missing|no (api )?key|not provided|required|unrecognized|"
+                                               r"unsupported (auth|scheme)", detail)
+                    if not native and self.key and self.auth_auto and header_missing and not names_bearer \
+                            and self._next_auth():
                         return self._request(method, url, body, native, retries, timeout)
                     if names_bearer and self.auth != "bearer":
                         # the server asks for Bearer: report what it said to the Bearer attempt
@@ -3694,7 +3712,7 @@ class AiClient:
             except _NotHere as e:
                 tried.append("%s (HTTP %d)" % (e.url, e.code))
             except AiError as e:
-                if i == len(self.roots) - 1 or not re.search(r"cannot look up|cannot reach", str(e)):
+                if self.locked or i == len(self.roots) - 1 or not re.search(r"cannot look up|cannot reach", str(e)):
                     if tried and i > 0:
                         raise AiError("%s. Also tried: %s" % (e, ", ".join(tried)))
                     raise
@@ -3822,6 +3840,15 @@ class AiClient:
             raise AiError("the endpoint did not return a model list" + (": " + errors[-1] if errors else "") +
                           ". Type the model name your AI provider gives you")
         return names
+
+
+def _json_message(text):
+    try:
+        d = json.loads(text)
+        e = d.get("error") if isinstance(d, dict) else None
+        return (e.get("message") if isinstance(e, dict) else None) or d.get("message") or text
+    except (ValueError, AttributeError):
+        return text
 
 
 class _Exhausted(Exception):
@@ -4064,6 +4091,9 @@ def ai_connection_check(cfg, key, source=""):
                                                                        " (%s)" % client.note if client.note else ""))
     except AiError as e:
         step("API request (model list)", False, str(e))
+        if re.search(r"rejected the API key|LOCKED", str(e)):
+            step("API request (chat)", None, "skipped: the key was refused, and repeated failed attempts can lock it")
+            return "\n".join(lines)
     if cfg["model"]:
         try:
             client = make_ai_client(cfg, key)
@@ -5401,11 +5431,16 @@ function providerHints() {
     "https:// is added if you leave it out. Most gateways end in /v1.";
 }
 $("#setProvider").addEventListener("change", providerHints);
+function linkify(box, text) {
+  box.textContent = "";
+  const parts = String(text).split(/(https?:\/\/[^\s"'<>]+)/);
+  parts.forEach((p, i) => box.append(i % 2 ? el("a", { href: p, textContent: p, target: "_blank", rel: "noopener noreferrer" }) : p));
+}
 $("#setAiCheck").onclick = async () => {
   $("#setAiMsg").textContent = "Checking step by step ...";
   try {
     const r = await api("ai_check", { ai: aiForm(), key: $("#setKey").value });
-    $("#setAiCheckText").textContent = r.text; $("#setAiCheckOut").hidden = false; $("#setAiMsg").textContent = "";
+    linkify($("#setAiCheckText"), r.text); $("#setAiCheckOut").hidden = false; $("#setAiMsg").textContent = "";
   } catch (e) { $("#setAiMsg").textContent = e.message; }
 };
 $("#setAiCheckCopy").onclick = () => copyText($("#setAiCheckText").textContent, $("#setAiCheckMsg"));
@@ -5418,7 +5453,7 @@ $("#setFindModels").onclick = async () => {
     if (!$("#setModel").value && r.models.length) $("#setModel").value = r.models[0];
     $("#setModelsMsg").textContent = r.models.length + " model(s) found: click the Model field to choose.";
     $("#setModel").focus();
-  } catch (e) { $("#setModelsMsg").textContent = e.message; }
+  } catch (e) { linkify($("#setModelsMsg"), e.message); }
 };
 $("#setAiTest").onclick = async () => {
   $("#setAiMsg").textContent = "Testing ...";
@@ -5427,7 +5462,7 @@ $("#setAiTest").onclick = async () => {
     $("#setAiMsg").textContent = "Connected through the " + r.flavor + ": the AI answered in " + r.seconds + " s (" +
       (r.reply || "empty reply").slice(0, 60) + ")." + (r.used_key ? "" : " No key was sent.") +
       (r.note ? " Note: " + r.note + "; you can untick the proxy option under More AI options." : "") + " Click Save settings to keep it.";
-  } catch (e) { $("#setAiMsg").textContent = e.message; }
+  } catch (e) { linkify($("#setAiMsg"), e.message); }
 };
 async function keyAction(action) {
   try {
