@@ -57,7 +57,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 
 # ----------------------------------------------------------------------------
 # Diagnostic catalog
@@ -76,6 +76,8 @@ def cmd(label, command, timeout=30, mode="sh", harvest=(), max_lines=None, k8s=N
 
 H_NAMESPACE = ("k8sns", r"(?m)^namespace: (\S+)", None)
 H_SUPERVISOR = ("vcluster", r"(?m)^supervisor: (.+?) \(", None)
+H_NSXNODE = ("host", r"(?m)(?:node|transport node|member): (\S+)", None)
+H_EDGECL = ("edgecl", r"(?m)^edge cluster: (.+?)  ", None)
 
 
 def apicmd(label, fn, shown, harvest=(), max_lines=600):
@@ -84,7 +86,8 @@ def apicmd(label, fn, shown, harvest=(), max_lines=600):
 
 
 def is_api_group(key):
-    return key.startswith("vc-api-")
+    """Checks answered by a REST API from this computer, not over SSH."""
+    return key.startswith(("vc-api-", "nsx-api-"))
 
 
 def plan_needs_ssh(item):
@@ -332,6 +335,15 @@ NSX_GROUPS = [
         ncli("Services", "get services", timeout=60, max_lines=400),
     ]),
     ("nsx-node", "Node resources, time, DNS", NSX_NODE_CMDS),
+    ("nsx-api-health", "NSX health from the NSX API (from this computer; needs an NSX API login)", [
+        apicmd("Cluster status (API)", "nsx_cluster", "GET /api/v1/cluster/status", harvest=[H_NSXNODE]),
+        apicmd("Open alarms", "nsx_alarms", "GET /api/v1/alarms?status=OPEN,ACKNOWLEDGED,SUPPRESSED",
+               harvest=[H_NSXNODE], max_lines=800),
+        apicmd("Transport nodes", "nsx_transport_nodes", "GET /api/v1/transport-nodes (+ state)",
+               harvest=[H_NSXNODE], max_lines=800),
+        apicmd("Edge clusters", "nsx_edge_clusters", "GET /api/v1/edge-clusters", harvest=[H_EDGECL]),
+        apicmd("Backups", "nsx_backups", "GET /api/v1/cluster/backups/history (+ config)"),
+    ]),
     ("os", "OS level (root shell only)", [
         cmd("Disk usage", "df -hP"),
         cmd("Failed units", "systemctl --failed --no-pager --no-legend 2>&1 | head -n 40"),
@@ -351,6 +363,12 @@ NSXEDGE_GROUPS = [
              harvest=[("lrouter",
                        r"(?m)^[0-9a-fA-F-]{36}\s+\d+\s+\d+\s+(\S+)\s+[A-Z][A-Z0-9_]+", None)]),
         ncli("Services", "get services", timeout=60, max_lines=300),
+    ]),
+    ("edge-dataplane", "Datapath: interfaces, tunnels, BFD (best effort)", [
+        ncli("Interfaces", "get interfaces", timeout=60, max_lines=300),
+        ncli("Tunnel ports", "get tunnel-ports", timeout=60),
+        ncli("BFD sessions", "get bfd-sessions", timeout=60, max_lines=300),
+        ncli("Datapath CPU", "get dataplane cpu stats", timeout=60),
     ]),
     ("edge-node", "Node resources, time, DNS", NSX_NODE_CMDS),
 ]
@@ -464,6 +482,26 @@ def is_cluster_group(key):
     return key.startswith("k8s-") or key == "endpoints"
 
 
+OPSNET_GROUPS = [
+    ("opsnet-cli", "Operations for networks CLI (works as consoleuser or support)", [
+        ncli("Version", "show-version"),
+        ncli("Service status", "show-service-status", timeout=90, max_lines=200),
+        ncli("SSH service", "ssh-service status"),
+    ]),
+    ("opsnet-health", "Service health and application logs (support user)", [
+        cmd("Service health check",
+            "cd ~ 2>/dev/null; if [ -x ./check-service-health.sh ]; then ./check-service-health.sh -d -p 2>&1 "
+            "| tail -n 250; else echo 'check-service-health.sh is not in the home directory of this user "
+            "(log in as support)'; fi", timeout=300, max_lines=300),
+        cmd("Appliance OS", "lsb_release -ds 2>/dev/null || head -n 4 /etc/os-release"),
+        cmd("Recent errors in application logs (last 4 h)",
+            "if [ -d /var/log/arkin ]; then find /var/log/arkin -name '*.log' -mmin -240 2>/dev/null | head -n 60 "
+            "| xargs -r grep -hiE ' error |exception|fatal' 2>/dev/null | tail -n 150; "
+            "else echo 'no /var/log/arkin on this node'; fi", timeout=120, max_lines=200, sudo=True),
+        cmd("Largest log directories", "du -xsh /var/log/* 2>/dev/null | sort -h | tail -n 10", sudo=True),
+    ]),
+] + linux_groups()
+
 COMPONENTS = {
     "esxi": {"title": "ESXi hosts", "user": "root", "prefix": "esxi", "groups": ESXI_GROUPS},
     "vcenter": {"title": "vCenter Server", "user": "root", "prefix": "vcenter",
@@ -473,6 +511,8 @@ COMPONENTS = {
     "nsxedge": {"title": "NSX Edge", "user": "admin", "prefix": "nsxedge",
                 "groups": NSXEDGE_GROUPS, "nsxcli": True, "nsxcli_wrap": "nsxcli -c {q}"},
     "sddc": {"title": "SDDC Manager", "user": "vcf", "prefix": "sddcmgr", "groups": SDDC_GROUPS},
+    "opsnet": {"title": "VCF Operations for networks (platform and collector nodes)", "user": "support",
+               "prefix": "opsnet", "groups": OPSNET_GROUPS, "nsxcli": True, "nsxcli_wrap": "{c}"},
     "k8s": {"title": "Kubernetes control plane (VCF services runtime, Operations, Automation)",
             "user": "vmware-system-user", "prefix": "k8snode",
             "groups": K8S_GROUPS + linux_groups(), "sudo": "auto"},
@@ -507,7 +547,8 @@ INVENTORY_TEMPLATE = """\
 #            workers found automatically     (vmware-system-user)
 #   supervisor  vSphere Supervisor control plane (root; the vCenter check
 #            "Supervisor clusters" shows its address)
-#   linux    Any other Linux appliance, e.g. Operations for logs / networks
+#   opsnet   VCF Operations for networks platform / collector nodes (support or consoleuser)
+#   linux    Any other Linux appliance, e.g. Operations for logs
 #
 # Per-section options (all optional):
 #   user       = default username offered at the prompt
@@ -545,6 +586,12 @@ hosts =
 
 [nsx]
 hosts =
+# NSX API health checks (alarms, cluster, transport nodes, backups) run from this computer:
+# sso_user = admin      ca_file = ~/nsx-ca.pem      tls_verify = no
+
+[opsnet]
+hosts =
+# user = support        (consoleuser runs the CLI checks only)
 
 [nsxedge]
 hosts =
@@ -813,7 +860,7 @@ RX_FQDN_ANY = re.compile(r"(?i)(?<![A-Za-z0-9_])((?:%s\.)+)(%s)(?![A-Za-z0-9_-])
                          % (LABEL, "|".join(GENERIC_TLDS + CC_TLDS)))
 RX_DOTTED_QUAD = re.compile(r"(?<![\w.])\d{1,3}(?:\.\d{1,3}){3}(?!\.?\d)(?!\w)")
 
-OBJECT_CATS = {"vcluster": "vcluster", "datastore": "datastore", "portgroup": "portgroup", "dvs": "dvs", "vm": "vm",
+OBJECT_CATS = {"edgecl": "edgecluster", "vcluster": "vcluster", "datastore": "datastore", "portgroup": "portgroup", "dvs": "dvs", "vm": "vm",
                "namespace": "ns", "k8sobj": "k8sobj", "lrouter": "lrouter", "term": "term"}
 
 
@@ -1579,7 +1626,7 @@ class Target:
         if "VDPROBE_42" in out:
             self.mode = "sh"
         elif self.comp.get("nsxcli"):
-            self.mode = "nsxcli"
+            self.mode = "nsxcli"      # a restricted CLI login (NSX admin, Operations for networks consoleuser)
         elif self.comp.get("pty_escalate"):
             if not self._open_pty(self.comp["pty_escalate"], None):
                 self.errmsg += (" - the login shell is not bash. Either enable the bash shell for this"
@@ -1642,7 +1689,9 @@ class Target:
 
     def probe_identity(self):
         t0 = time.time()
-        if self.mode == "nsxcli":
+        if self.mode == "nsxcli" and self.sec["type"] == "opsnet":
+            names = []
+        elif self.mode == "nsxcli":
             rc, out, _ = self.exec("get hostname", 20)
             names = [ln.strip() for ln in out.splitlines() if ln.strip() and " " not in ln.strip()]
         else:
@@ -1663,7 +1712,8 @@ class Target:
         command = c["cmd"]
         if c["mode"] == "sh":
             if self.mode == "nsxcli":
-                res.update(status="skipped", note="needs a root shell (logged in to the NSX CLI)")
+                res.update(status="skipped", note="needs the support user (logged in to the restricted CLI)"
+                           if self.sec["type"] == "opsnet" else "needs a root shell (logged in to the NSX CLI)")
                 return res
             sudo = self.sudo if (self.sec.get("sudo") == "yes" or c.get("sudo")) else None
             rc, out, to = self.sh(command, c["timeout"], sudo=sudo)
@@ -1671,7 +1721,7 @@ class Target:
             if self.mode == "nsxcli":
                 rc, out, to = self.exec(command, c["timeout"])
             else:
-                rc, out, to = self.sh(self.comp["nsxcli_wrap"].format(q=shlex.quote(command)) + " 2>&1",
+                rc, out, to = self.sh(self.comp["nsxcli_wrap"].format(q=shlex.quote(command), c=command) + " 2>&1",
                                       c["timeout"])
         else:  # kubectl
             if not self.kube:
@@ -1684,6 +1734,9 @@ class Target:
             rc, out, to = self.sh(pre + command, c["timeout"], sudo=self.kube["sudo"])
         if c["mode"] == "sh" and c.get("sudo") and self.mode == "sh" and not self.sudo:
             res["note"] = "sudo not available for this user: ran without it"
+        if c["mode"] == "nsxcli" and self.mode != "nsxcli" and self.sec["type"] == "opsnet" and rc == 127:
+            res.update(status="skipped", note="a consoleuser CLI command: not available to this login", dur=time.time() - t0)
+            return res
         res.update(rc=rc, out=out, dur=time.time() - t0)
         if to:
             res.update(status="timeout", note="timed out after %ds" % c["timeout"])
@@ -1719,6 +1772,9 @@ class VcApi:
         req = urllib.request.Request(self.base + path, method=method, headers=dict(headers or {}))
         if self.token:
             req.add_header("vmware-api-session-id", self.token)
+        if getattr(self, "basic", None):
+            req.add_header("Authorization", self.basic)
+            req.add_header("Accept", "application/json")
         try:
             with self.opener.open(req, timeout=self.timeout) as r:
                 body = r.read().decode("utf-8", "replace")
@@ -1874,7 +1930,144 @@ def api_services(api):
     return "\n".join(out)
 
 
-VCAPI_FUNCS = {"supervisors": api_supervisors, "namespaces": api_namespaces, "services": api_services}
+class NsxApi(VcApi):
+    """NSX Manager REST API: basic authentication on every GET (no session)."""
+
+    def login(self):
+        self.basic = "Basic " + base64.b64encode(("%s:%s" % (self.user, self.password)).encode("utf-8")).decode()
+        self.password = None
+        code, body = self._call("GET", "/api/v1/cluster/status")
+        if code in (401, 403):
+            raise VcApiError("NSX API login failed for %s (wrong user or password, or the account is locked)"
+                             % self.user)
+        if code >= 400:
+            raise VcApiError("NSX API answered HTTP %d: %s" % (code, body[:200]))
+
+    def logout(self):
+        self.basic = None
+
+    def paged(self, path, limit=10):
+        items, cursor = [], None
+        for _ in range(limit):
+            sep = "&" if "?" in path else "?"
+            page = self.get(path + (sep + "cursor=" + urllib.parse.quote(cursor) if cursor else "")) or {}
+            items += page.get("results") or []
+            cursor = page.get("cursor")
+            if not cursor:
+                break
+        return items
+
+
+def _ms(ts):
+    try:
+        return datetime.datetime.fromtimestamp(int(ts) / 1000.0, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "?"
+
+
+def nsx_cluster(api):
+    st = api.get("/api/v1/cluster/status") or {}
+    det = st.get("detailed_cluster_status") or {}
+    out = ["overall: %s   management cluster: %s   control cluster: %s" % (
+        det.get("overall_status"), (st.get("mgmt_cluster_status") or {}).get("status"),
+        (st.get("control_cluster_status") or {}).get("status"))]
+    for g in det.get("groups") or []:
+        out.append("group %s: %s" % (g.get("group_type"), g.get("group_status")))
+        for m in g.get("members") or []:
+            out.append("  member: %s  %s  %s" % (m.get("member_fqdn") or m.get("member_uuid"), m.get("member_ip"),
+                                                 m.get("member_status")))
+    return "\n".join(out)
+
+
+def nsx_alarms(api):
+    alarms = api.paged("/api/v1/alarms?status=OPEN,ACKNOWLEDGED,SUPPRESSED&page_size=500")
+    if not alarms:
+        return "No open, acknowledged or suppressed alarms."
+    order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+    alarms.sort(key=lambda a: (order.get(a.get("severity"), 9), -(a.get("last_reported_time") or 0)))
+    counts = {}
+    for a in alarms:
+        counts[(a.get("severity"), a.get("status"))] = counts.get((a.get("severity"), a.get("status")), 0) + 1
+    out = ["%d alarm(s): %s" % (len(alarms), ", ".join("%s %s %d" % (k[0], k[1], v) for k, v in sorted(
+        counts.items(), key=lambda kv: (order.get(kv[0][0], 9), kv[0][1] or ""))))]
+    for a in alarms[:200]:
+        out.append("")
+        out.append("%s %s  %s / %s  last %s  (node: %s)" % (
+            a.get("severity"), a.get("status"), a.get("feature_name"), a.get("event_type"),
+            _ms(a.get("last_reported_time")), a.get("node_display_name") or a.get("node_id") or "-"))
+        for k in ("summary", "description", "recommended_action"):
+            if a.get(k):
+                out.append("  %s: %s" % (k.replace("_", " "), re.sub(r"\s+", " ", str(a[k]))[:600]))
+    if len(alarms) > 200:
+        out.append("\n... %d more alarms not listed" % (len(alarms) - 200))
+    return "\n".join(out)
+
+
+def nsx_transport_nodes(api):
+    nodes = {n.get("id"): n for n in api.paged("/api/v1/transport-nodes?page_size=500")}
+    states = api.paged("/api/v1/transport-nodes/state?page_size=500")
+    counts, bad = {}, []
+    for s_ in states:
+        n = nodes.get(s_.get("transport_node_id")) or {}
+        kind = (n.get("node_deployment_info") or {}).get("resource_type") or "node"
+        state = s_.get("state")
+        counts[(kind, state)] = counts.get((kind, state), 0) + 1
+        dep = (s_.get("node_deployment_state") or {}).get("state")
+        if state != "success" or (dep and dep not in ("NODE_READY", "success")):
+            details = "; ".join(str(d.get("failure_message") or d.get("state") or d)
+                                for d in (s_.get("details") or []) if isinstance(d, dict))[:400]
+            bad.append("transport node: %s  type=%s  state=%s  deployment=%s  %s" % (
+                n.get("display_name") or s_.get("transport_node_id"), kind, state, dep,
+                (s_.get("failure_message") or details or "").strip()))
+    out = ["%d transport node(s)." % len(nodes), "Configuration state by type:"]
+    out += ["  %s %s: %d" % (k[0], k[1], v) for k, v in sorted(counts.items(), key=lambda kv: str(kv[0]))]
+    out += ["", "Nodes not in a good state:"] + (bad or ["  none"])
+    tz = api.get("/api/v1/transport-zones/transport-node-status") or {}
+    rows = tz.get("results") if isinstance(tz, dict) else None
+    if rows:
+        st = {}
+        for r in rows:
+            st[r.get("status")] = st.get(r.get("status"), 0) + 1
+        out += ["", "Tunnel / connection status: " + ", ".join("%s %d" % kv for kv in sorted(st.items(), key=str))]
+        down = [r for r in rows if r.get("status") not in ("UP", None)]
+        for r in down[:100]:
+            out.append("  transport node: %s  status=%s" % (r.get("node_display_name") or r.get("node_uuid"),
+                                                           r.get("status")))
+    return "\n".join(out)
+
+
+def nsx_edge_clusters(api):
+    clusters = api.paged("/api/v1/edge-clusters?page_size=200")
+    if not clusters:
+        return "No edge clusters."
+    out = []
+    for c in clusters:
+        out.append("edge cluster: %s  members=%d  deployment=%s" % (
+            c.get("display_name"), len(c.get("members") or []), c.get("deployment_type")))
+    return "\n".join(out)
+
+
+def nsx_backups(api):
+    cfg = api.get("/api/v1/cluster/backups/config") or {}
+    hist = api.get("/api/v1/cluster/backups/history") or {}
+    out = ["automatic backups: %s" % ("enabled" if cfg.get("backup_enabled") else "NOT enabled")]
+    sched = cfg.get("backup_schedule") or {}
+    if sched:
+        out.append("schedule: %s" % json.dumps(sched, sort_keys=True))
+    for kind in ("cluster_backup_statuses", "node_backup_statuses", "inventory_backup_statuses"):
+        rows = sorted(hist.get(kind) or [], key=lambda r: r.get("start_time") or 0)[-3:]
+        out.append("%s:" % kind.replace("_statuses", "").replace("_", " "))
+        for r in rows:
+            out.append("  %s  %s%s" % (_ms(r.get("start_time")), "succeeded" if r.get("success") else "FAILED",
+                                       ("  " + str(r.get("error_message") or r.get("error_code"))) if not r.get("success") else ""))
+        if not rows:
+            out.append("  no backups recorded")
+    return "\n".join(out)
+
+
+VCAPI_FUNCS = {"supervisors": api_supervisors, "namespaces": api_namespaces, "services": api_services,
+               "nsx_cluster": nsx_cluster, "nsx_alarms": nsx_alarms, "nsx_transport_nodes": nsx_transport_nodes,
+               "nsx_edge_clusters": nsx_edge_clusters, "nsx_backups": nsx_backups}
 
 
 def collect_api(t, groups):
@@ -1884,11 +2077,12 @@ def collect_api(t, groups):
     if not password:
         for g, c in todo:
             t.results.append({"group": g, "label": c["label"], "cmd": c["cmd"], "rc": None, "out": "", "dur": 0.0,
-                              "status": "skipped", "note": "no vCenter SSO login was entered", "spec": c})
+                              "status": "skipped", "note": "no API login was entered", "spec": c})
         return
     sec = t.sec
-    api = VcApi(t.address, user, password, verify=sec.get("tls_verify", True), ca_file=sec.get("ca_file"),
-                base_url=sec.get("api_base"))
+    api = (NsxApi if sec["type"] == "nsx" else VcApi)(
+        t.address, user, password, verify=sec.get("tls_verify", True), ca_file=sec.get("ca_file"),
+        base_url=sec.get("api_base"))
     try:
         api.login()
     except VcApiError as e:
@@ -2001,7 +2195,7 @@ def load_inventory(path):
             "kubectl": (s.get("kubectl") or "").strip() or None,
             "ssh_options": shlex.split(s.get("ssh_options", "")),
             "ssh_workers": (s.get("ssh_workers") or "no").strip().lower() in ("yes", "true", "1"),
-            "sso_user": (s.get("sso_user") or "administrator@vsphere.local").strip(),
+            "sso_user": (s.get("sso_user") or ("admin" if typ == "nsx" else "administrator@vsphere.local")).strip(),
             "tls_verify": (s.get("tls_verify") or "yes").strip().lower() not in ("no", "false", "0", "off"),
             "ca_file": os.path.expanduser((s.get("ca_file") or "").strip()) or None,
             "api_base": (s.get("api_base") or "").strip() or None,
@@ -2212,7 +2406,8 @@ class ConsoleUI:
         return prompt_credentials(sec)
 
     def sso_credentials(self, sec):
-        print("\nvCenter SSO login for the Supervisor namespace checks of [%s] (Return to skip)" % sec["name"])
+        print("\n%s for the API checks of [%s] (Return to skip)" % (
+            "NSX API login" if sec["type"] == "nsx" else "vCenter SSO login", sec["name"]))
         user = input("  SSO username [%s]: " % sec["sso_user"]).strip() or sec["sso_user"]
         return user, getpass.getpass("  SSO password for %s: " % user)
 
@@ -2292,6 +2487,13 @@ def run_plan(ctx, plan, scrubber, ui=None):
             node_groups = [g for g in item["groups"] if not is_cluster_group(g[0])]
             for i, t in enumerate(targets):
                 host_groups[t.address] = (cluster_groups if i == 0 else []) + node_groups
+
+        if sec["type"] == "nsx" and not host_groups and len(targets) > 1:
+            api_g = [g for g in item["groups"] if is_api_group(g[0])]
+            if api_g:
+                rest_g = [g for g in item["groups"] if not is_api_group(g[0])]
+                for i, t in enumerate(targets):
+                    host_groups[t.address] = item["groups"] if i == 0 else rest_g
 
         def groups_of(t):
             return host_groups.get(t.address, item["groups"])
@@ -4140,11 +4342,12 @@ function renderGroups() {
     if (s.escalate === "su")
       fields.append(el("label", { className: "f" }, "Root password for su",
         el("input", { type: "password", className: "su", autocomplete: "off" })));
-    if (s.type === "vcenter") {
+    if (s.type === "vcenter" || s.type === "nsx") {
       const su = el("input", { type: "text", className: "ssouser", value: s.sso_user, autocomplete: "off", spellcheck: false });
       su.setAttribute("autocapitalize", "off");
-      fields.append(el("label", { className: "f" }, "vCenter SSO user (namespace checks)", su),
-        el("label", { className: "f" }, "vCenter SSO password",
+      const what = s.type === "nsx" ? "NSX API" : "vCenter SSO";
+      fields.append(el("label", { className: "f" }, what + " user (" + (s.type === "nsx" ? "API health checks" : "namespace checks") + ")", su),
+        el("label", { className: "f" }, what + " password",
           el("input", { type: "password", className: "ssopass", autocomplete: "off" })));
     }
     const det = el("details", {}, el("summary", { textContent: "Choose hosts and checks" }),
@@ -4195,9 +4398,10 @@ $("#run").onclick = async () => {
   for (const card of $$("#groups .card")) {
     if (!$(".sec", card).checked) continue;
     const hosts = $$(".host:checked", card).map(i => i.value), groups = $$(".grp:checked", card).map(i => i.value);
-    const apiOnly = groups.length > 0 && groups.every(g => g.startsWith("vc-api-"));
+    const isApi = g => /^(vc|nsx)-api-/.test(g);
+    const apiOnly = groups.length > 0 && groups.every(isApi);
     const need = (apiOnly ? [] : [$(".pass", card)].concat($(".su", card) ? [$(".su", card)] : []))
-      .concat(groups.some(g => g.startsWith("vc-api-")) && $(".ssopass", card) ? [$(".ssopass", card)] : []);
+      .concat(groups.some(isApi) && $(".ssopass", card) ? [$(".ssopass", card)] : []);
     $$("input[type=password]", card).forEach(i => i.classList.remove("missing"));
     for (const i of need) { i.classList.toggle("missing", !i.value); if (!i.value && !bad) bad = i; }
     if (!hosts.length || !groups.length) {
@@ -4370,13 +4574,18 @@ function groupCard(g) {
     card.append(el("div", { className: "fields" },
       el("label", { className: "f" }, "kubeconfig path (empty = find automatically)", inp("text", g.kubeconfig, { className: "gkcfg" })),
       el("label", { className: "f" }, "kubectl command", inp("text", g.kubectl, { placeholder: "kubectl", className: "gkctl" }))));
-  if (g.type === "vcenter") {
+  if (g.type === "vcenter" || g.type === "nsx") {
+    const nsx = g.type === "nsx";
     card.append(el("div", { className: "fields" },
-      el("label", { className: "f" }, "vCenter SSO user (namespace checks)", inp("text", g.sso_user, { placeholder: "administrator@vsphere.local", className: "gsso" })),
-      el("label", { className: "f" }, "Trust this vCenter CA file (path)", inp("text", g.ca_file, { placeholder: "~/vcenter-ca.pem", className: "gca" }))));
+      el("label", { className: "f" }, nsx ? "NSX API user (API health checks)" : "vCenter SSO user (namespace checks)",
+        inp("text", g.sso_user, { placeholder: nsx ? "admin" : "administrator@vsphere.local", className: "gsso" })),
+      el("label", { className: "f" }, "Trust this " + (nsx ? "NSX" : "vCenter") + " CA file (path)",
+        inp("text", g.ca_file, { placeholder: nsx ? "~/nsx-ca.pem" : "~/vcenter-ca.pem", className: "gca" }))));
     card.append(el("label", { className: "chk" }, el("input", { type: "checkbox", className: "gtls", checked: yes(g.tls_verify || "yes") }),
-      "Check the vCenter certificate"));
+      "Check the " + (nsx ? "NSX Manager" : "vCenter") + " certificate"));
   }
+  if (g.type === "opsnet")
+    card.append(el("p", { className: "muted", textContent: "Log in as support for the full health check; consoleuser runs the CLI checks only." }));
   if (g.type === "vcfmgmt") {
     card.append(el("label", { className: "chk" }, el("input", { type: "checkbox", className: "gworkers", checked: yes(g.ssh_workers || "no") }),
       "Also log in to the worker nodes (same login as the control planes)"));

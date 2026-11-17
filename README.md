@@ -137,7 +137,8 @@ still asked), `--list` prints every check and the exact command behind it.
 | `[esxi]` | ESXi hosts | `root` | version, hardware, services, NTP, storage, networking, vSAN, NSX agent |
 | `[vcenter]` | vCenter Server | `root` | works with the bash shell or the default appliance shell (the script runs `shell` itself) |
 | `[nsx]` | NSX Manager | `admin` | `admin` runs NSX CLI checks; `root` adds OS-level checks |
-| `[nsxedge]` | NSX Edge | `admin` | same model as NSX Manager |
+| `[nsxedge]` | NSX Edge | `admin` | same model as NSX Manager, plus interfaces, tunnel ports, BFD sessions and datapath CPU |
+| `[opsnet]` | VCF Operations for networks platform and collector nodes | `support` | version, service status and SSH service (CLI), service health script, recent application-log errors, OS health; `consoleuser` runs the CLI checks only |
 | `[sddc]` | SDDC Manager | `vcf` | add `escalate = su` to also run the checks that need root |
 | `[k8s]` | Kubernetes control-plane nodes: VCF services runtime, Operations, Automation, Supervisor | `vmware-system-user` | finds a working `kubectl` on its own (plain, `KUBECONFIG=/etc/kubernetes/admin.conf`, with `sudo`) |
 | `[vcfmgmt]` | VCF management cluster (VCF services runtime) | `vmware-system-user` | list the control-plane IPs; workers are discovered; service endpoints are checked (see below) |
@@ -196,6 +197,23 @@ cluster and address lines of its output and never shows the password. The Superv
 list VKS / Cluster API clusters and machines, VM Service virtual machines, Supervisor services
 and errors from the Cluster API and VM operator controllers. A worker that appears both as a
 node and as a Cluster API machine gets the same placeholder in both places.
+
+### NSX health from the NSX API
+
+The NSX Manager group has a check group **NSX health from the NSX API**. Like the Supervisor
+namespace checks, it calls the NSX Manager REST API directly from your Mac (GET requests only, with
+the NSX API user and password you enter when the group is selected; default user `admin`). It
+reports:
+
+- cluster status, overall and per member;
+- open, acknowledged and suppressed **alarms**, worst first, with their summary, description and
+  recommended action;
+- transport nodes whose configuration is not in a good state, with the failure message, and
+  tunnel / connection status where the API offers it;
+- edge clusters; and backup configuration and the last backup results.
+
+These are cluster-wide, so with several managers listed they run on the first one only. The NSX
+certificate is verified; set a CA file or turn the check off on the Settings tab if needed.
 
 ### Supervisor namespaces (from vCenter)
 

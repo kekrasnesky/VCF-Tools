@@ -937,6 +937,120 @@ class SettingsModel(unittest.TestCase):
                 del os.environ["VCFDIAG_FAKE_KEYCHAIN"]
 
 
+FAKE_NSX = {
+    "/api/v1/cluster/status": {
+        "mgmt_cluster_status": {"status": "STABLE"}, "control_cluster_status": {"status": "STABLE"},
+        "detailed_cluster_status": {"overall_status": "DEGRADED", "groups": [
+            {"group_type": "MANAGER", "group_status": "DEGRADED", "members": [
+                {"member_fqdn": "nsx01.corp.example-widgets.com", "member_ip": "10.20.30.11", "member_status": "UP"},
+                {"member_fqdn": "nsx02.corp.example-widgets.com", "member_ip": "10.20.30.12", "member_status": "DOWN"}]}]}},
+    "/api/v1/alarms?status=OPEN,ACKNOWLEDGED,SUPPRESSED&page_size=500": {"results": [
+        {"severity": "MEDIUM", "status": "OPEN", "feature_name": "certificates", "event_type": "certificate_expiration_approaching",
+         "last_reported_time": 1763380000000, "node_display_name": "nsx01", "summary": "Certificate expires in 20 days."}],
+        "cursor": "p2"},
+    "/api/v1/alarms?status=OPEN,ACKNOWLEDGED,SUPPRESSED&page_size=500&cursor=p2": {"results": [
+        {"severity": "CRITICAL", "status": "OPEN", "feature_name": "manager_health", "event_type": "manager_cpu_usage_very_high",
+         "last_reported_time": 1763390000000, "node_display_name": "nsx02", "description": "CPU above 95%.",
+         "recommended_action": "Check the node."}]},
+    "/api/v1/transport-nodes?page_size=500": {"results": [
+        {"id": "tn1", "display_name": "esx01.corp.example-widgets.com", "node_deployment_info": {"resource_type": "HostNode"}},
+        {"id": "tn2", "display_name": "edge01", "node_deployment_info": {"resource_type": "EdgeNode"}}]},
+    "/api/v1/transport-nodes/state?page_size=500": {"results": [
+        {"transport_node_id": "tn1", "state": "success"},
+        {"transport_node_id": "tn2", "state": "failed", "failure_message": "Host config failed: MTU mismatch",
+         "node_deployment_state": {"state": "NODE_READY"}}]},
+    "/api/v1/edge-clusters?page_size=200": {"results": [{"display_name": "WIDGETS-EC01", "members": [{}, {}],
+                                                         "deployment_type": "VIRTUAL_MACHINE"}]},
+    "/api/v1/cluster/backups/config": {"backup_enabled": False},
+    "/api/v1/cluster/backups/history": {"cluster_backup_statuses": [
+        {"start_time": 1763300000000, "success": False, "error_message": "SFTP server unreachable"}]},
+}
+
+
+def fake_nsx():
+    import base64 as b64
+    import http.server
+    import json as _json
+    import threading
+    seen = []
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            seen.append((self.command, self.path))
+            ok = self.headers.get("Authorization") == "Basic " + b64.b64encode(b"admin:Nsx-Pass1!").decode()
+            code, body = (200, FAKE_NSX[self.path]) if ok and self.path in FAKE_NSX else ((401, {}) if not ok else (404, {}))
+            data = _json.dumps(body).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, "http://127.0.0.1:%d" % srv.server_address[1], seen
+
+
+class NsxAndOpsNet(unittest.TestCase):
+    def setUp(self):
+        self.srv, self.base, self.seen = fake_nsx()
+
+    def tearDown(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+
+    def test_nsx_api_checks(self):
+        api = v.NsxApi("nsx", "admin", "Nsx-Pass1!", base_url=self.base)
+        api.login()
+        self.assertIsNone(api.password)
+        cl, al, tn, ec, bk = (f(api) for f in (v.nsx_cluster, v.nsx_alarms, v.nsx_transport_nodes,
+                                                 v.nsx_edge_clusters, v.nsx_backups))
+        self.assertIn("overall: DEGRADED", cl)
+        self.assertIn("member: nsx02.corp.example-widgets.com  10.20.30.12  DOWN", cl)
+        self.assertTrue(al.startswith("2 alarm(s): CRITICAL OPEN 1, MEDIUM OPEN 1"))
+        self.assertLess(al.index("manager_cpu_usage_very_high"), al.index("certificate_expiration"))   # worst first
+        self.assertIn("recommended action: Check the node.", al)
+        self.assertIn("transport node: edge01  type=EdgeNode  state=failed", tn)
+        self.assertIn("MTU mismatch", tn)
+        self.assertIn("edge cluster: WIDGETS-EC01  members=2", ec)
+        self.assertIn("automatic backups: NOT enabled", bk)
+        self.assertIn("FAILED  SFTP server unreachable", bk)
+        self.assertTrue(all(m == "GET" for m, _ in self.seen))
+
+    def test_nsx_wrong_password_and_anonymization(self):
+        with self.assertRaises(v.VcApiError) as e:
+            v.NsxApi("nsx", "admin", "wrong", base_url=self.base).login()
+        self.assertIn("NSX API login failed", str(e.exception))
+        api = v.NsxApi("nsx", "admin", "Nsx-Pass1!", base_url=self.base)
+        api.login()
+        text = "\n".join(f(api) for f in (v.nsx_cluster, v.nsx_alarms, v.nsx_transport_nodes, v.nsx_edge_clusters))
+        sc = make()
+        group = [g for g in v.COMPONENTS["nsx"]["groups"] if g[0] == "nsx-api-health"][0]
+        for c in group[2]:
+            harvest(sc, c, text)
+        out = run(sc, text)
+        for gone in ("example-widgets", "WIDGETS", "10.20.30", "nsx02", "edge01"):
+            self.assertNotIn(gone, out)
+
+    def test_component_wiring(self):
+        self.assertTrue(v.is_api_group("nsx-api-health"))
+        self.assertFalse(v.is_api_group("nsx-cluster"))
+        op = v.COMPONENTS["opsnet"]
+        self.assertEqual(op["user"], "support")
+        self.assertEqual([g[0] for g in op["groups"]][:2], ["opsnet-cli", "opsnet-health"])
+        self.assertEqual(op["nsxcli_wrap"].format(q="'x y'", c="ssh-service status"), "ssh-service status")
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "i.ini")
+            with open(path, "w") as fh:
+                fh.write("[nsx]\nhosts = 10.1.1.1, 10.1.1.2\n[opsnet]\nhosts = 192.168.0.50\n")
+            _, sections, _ = v.load_inventory(path)
+        self.assertEqual(sections[0]["sso_user"], "admin")
+        self.assertEqual(sections[1]["user"], "support")
+
+
 class GuiApi(unittest.TestCase):
     """The browser GUI's local web API, without contacting any host."""
 
