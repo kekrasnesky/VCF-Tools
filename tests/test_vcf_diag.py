@@ -1154,7 +1154,8 @@ class AiEndpoints(unittest.TestCase):
         try:
             with self.assertRaises(v.AiError) as e:
                 v.AiClient(base + "/v1", "m", "k").chat([{"role": "user", "content": "x"}], retries=0)
-            self.assertIn("not found (HTTP 404)", str(e.exception))
+            self.assertIn("not found at", str(e.exception))
+            self.assertIn("(HTTP 404)", str(e.exception))
         finally:
             srv.shutdown()
             srv.server_close()
@@ -1270,7 +1271,7 @@ class AskSageApiHost(unittest.TestCase):
         self.assertEqual(c.roots[1][1], "https://api.capra.example.mil/server")
         self.assertEqual(len(v.AiClient("api.capra.example.mil", "m", "k", provider="asksage").roots), 1)
         self.assertEqual(len(v.AiClient("https://x.example.mil/custom/v1", "m", "k", provider="asksage").roots), 1)
-        self.assertEqual(len(v.AiClient("chat.example.mil", "m", "k").roots), 1)        # only for Ask Sage
+        self.assertFalse(any("api." in r[0] for r in v.AiClient("chat.example.mil", "m", "k").roots))  # Ask Sage only
 
     def test_falls_through_to_the_api_host(self):
         import http.server
@@ -1472,6 +1473,105 @@ class KeyHeaders(unittest.TestCase):
 def ssl_error(text):
     import ssl
     return ssl.SSLError(text)
+
+
+class ServerNameOnly(unittest.TestCase):
+    def test_v1_is_tried_when_only_a_server_name_is_given(self):
+        c = v.AiClient("api.genai.example.mil", "m", "k")
+        self.assertEqual([r[0] for r in c.roots], ["https://api.genai.example.mil/v1", "https://api.genai.example.mil"])
+        self.assertEqual(c.url, "https://api.genai.example.mil/v1/chat/completions")
+        self.assertEqual(len(v.AiClient("https://api.genai.example.mil/v1/chat/completions", "m", "k").roots), 1)
+
+    def test_falls_back_and_explains(self):
+        srv, base, seen = fake_ai("x")            # serves POST on any path, so /v1 answers first
+        try:
+            c = v.AiClient(base.rsplit("/v1", 1)[0], "m", "")
+            c.chat([{"role": "user", "content": "hello"}], retries=0)
+            self.assertTrue(seen[-1]["path"].endswith("/v1/chat/completions"))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        import http.server
+        import threading
+
+        class Nothing(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def nope(self):
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            do_GET = do_POST = nope
+
+        nothing = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Nothing)
+        threading.Thread(target=nothing.serve_forever, daemon=True).start()
+        try:
+            c = v.AiClient("http://127.0.0.1:%d" % nothing.server_address[1], "m", "")
+            with self.assertRaises(v.AiError) as e:
+                c.chat([{"role": "user", "content": "x"}], retries=0)
+            self.assertIn("/v1/chat/completions (HTTP 404) or", str(e.exception))
+            self.assertIn("usually ends in /v1", str(e.exception))
+            with self.assertRaises(v.AiError):
+                c.list_models()
+        finally:
+            nothing.shutdown()
+            nothing.server_close()
+
+
+class KeyHeaderDiscovery(unittest.TestCase):
+    def serve(self, wants):
+        import http.server
+        import json as _json
+        import threading
+        seen = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                seen.append(dict(self.headers))
+                ok = self.headers.get(wants[0]) == wants[1]
+                data = _json.dumps({"choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}]} if ok
+                                   else {"error": {"message": "Invalid API key: key expired on 2026-10-01"}}).encode()
+                self.send_response(200 if ok else 401)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv, "http://127.0.0.1:%d/v1" % srv.server_address[1], seen
+
+    def test_other_header_is_found_and_reported(self):
+        srv, base, seen = self.serve(("api-key", "k1"))
+        try:
+            c = v.AiClient(base, "m", "k1")
+            self.assertEqual(c.chat([{"role": "user", "content": "x"}], retries=0), "OK")
+            self.assertEqual(c.auth, "api-key")
+            self.assertEqual(c.note, "the key was accepted in the api-key header")
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_refusal_shows_what_the_server_said(self):
+        srv, base, seen = self.serve(("x-api-key", "something-else"))
+        try:
+            with self.assertRaises(v.AiError) as e:
+                v.AiClient(base, "m", "k1").chat([{"role": "user", "content": "x"}], retries=0)
+            msg = str(e.exception)
+            self.assertIn("Tried the key as: bearer, x-api-key, api-key, token", msg)
+            self.assertIn("key expired on 2026-10-01", msg)
+            self.assertEqual(len(seen), 4)
+            with self.assertRaises(v.AiError):     # an explicitly chosen header is not changed
+                v.AiClient(base, "m", "k1", auth_header="api-key").chat([{"role": "user", "content": "x"}], retries=0)
+            self.assertEqual(len(seen), 5)
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 class GuiApi(unittest.TestCase):

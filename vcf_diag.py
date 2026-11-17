@@ -57,7 +57,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
-VERSION = "1.11.1"
+VERSION = "1.11.2"
 
 # ----------------------------------------------------------------------------
 # Diagnostic catalog
@@ -3519,9 +3519,16 @@ class AiClient:
             alt = "api." + (host[5:] if host.startswith("chat.") else host)
             netloc = alt + (":%d" % parts.port if parts.port else "")
             self.roots.append(("%s://%s/server/openai/v1" % (parts.scheme, netloc), "%s://%s/server" % (parts.scheme, netloc)))
+        if self.provider == "openai" and parts.path == "" and not parts.query:
+            # Only a server name was given: almost every OpenAI-compatible service lives under /v1.
+            self.roots = [(self.base + "/v1", self.native), (self.base, self.native)]
+            self._use_root(0)
         self.root_i = 0
         self.model, self.key = model, key
         self.auth = "api-key" if self.provider == "azure" else (auth_header or "bearer").lower()
+        # With the default header, other common key headers are tried once if the key is refused.
+        self.auth_auto = self.provider == "openai" and self.auth == "bearer"
+        self.auth_tried = [self.auth]
         self.timeout, self.max_tokens = timeout, max_tokens
         tls = [urllib.request.HTTPSHandler(context=tls_context(verify, ca_file))] if self.base.startswith("https:") else []
         self.direct = urllib.request.build_opener(urllib.request.ProxyHandler({}), *tls)
@@ -3575,8 +3582,13 @@ class AiClient:
                     time.sleep(5 * (attempt + 1))
                     continue
                 if e.code in (401, 403):
-                    raise AiError("the AI endpoint rejected the API key (HTTP %d). Check the key, and that it "
-                                  "was created for this server" % e.code)
+                    if not native and self.key and self.auth_auto and self._next_auth():
+                        return self._request(method, url, body, native, retries, timeout)
+                    why = re.sub(r"\s+", " ", detail).strip()[:300]
+                    tried = (" Tried the key as: %s." % ", ".join(self.auth_tried)) if len(self.auth_tried) > 1 else ""
+                    raise AiError("the AI endpoint rejected the API key (HTTP %d).%s%s Check that the key is current "
+                                  "and was created for API use on this service" % (
+                                      e.code, tried, (" The server said: " + why + ".") if why else ""))
                 if e.code in (404, 405):
                     raise _NotHere(url, e.code)
                 if e.code == 400 and re.search(r"(?i)context|too long|maximum|token limit", detail):
@@ -3617,6 +3629,18 @@ class AiClient:
                 if client_cert_required(e):
                     raise AiError(CLIENT_CERT_MSG % url)
                 raise AiError("bad answer from the AI endpoint: %s" % e)
+
+    def _next_auth(self):
+        for style in ("x-api-key", "api-key", "token"):
+            if style not in self.auth_tried:
+                self.auth_tried.append(style)
+                self.auth = style
+                base_note = re.sub(r"(; )?the key was accepted in the \S+ header", "", self.note)
+                self.note = (base_note + "; " if base_note else "") + "the key was accepted in the %s header" % style
+                return True
+        self.auth = self.auth_tried[0]
+        self.note = re.sub(r"(; )?the key was accepted in the \S+ header", "", self.note)
+        return False
 
     def _proxy_applies(self, url):
         if self.opener is self.direct:
@@ -3663,9 +3687,10 @@ class AiClient:
     def chat(self, messages, retries=2):
         if self.provider != "asksage":
             try:
-                return self._chat_openai(messages, retries)
-            except _NotHere as e:
-                raise AiError("the AI endpoint was not found (HTTP %d) at %s - check the address" % (e.code, e.url))
+                return self._each_root(lambda tried: self._chat_openai(messages, retries))
+            except _Exhausted as e:
+                raise AiError("the AI endpoint was not found at %s - check the address; it usually ends in /v1 or "
+                              "/v1/chat/completions" % " or ".join(e.tried))
 
         def attempt(tried):
             if self.flavor == "openai":
@@ -3724,7 +3749,15 @@ class AiClient:
     def list_models(self):
         """Model names the endpoint offers (OpenAI /models, or Ask Sage /server/get-models)."""
         if self.provider != "asksage":
-            return self._list_models_here()
+            if len(self.roots) == 1:
+                return self._list_models_here()
+
+            def attempt_plain(tried):
+                return self._list_models_here(strict=True)
+            try:
+                return self._each_root(attempt_plain)
+            except _Exhausted as e:
+                raise AiError("no model list at %s - check the address, or type the model name" % " or ".join(e.tried))
 
         def attempt(tried):
             try:
@@ -3747,6 +3780,8 @@ class AiClient:
             except _NotHere as e:
                 errors.append(str(e))
                 missing = e
+                if strict and self.provider != "asksage":
+                    raise
             except AiError as e:
                 errors.append(str(e))
         if not names and self.provider == "asksage":
