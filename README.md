@@ -357,6 +357,21 @@ python3 vcf_diag.py --investigate "VCF Automation login fails since this morning
 5. The AI ends with `ROOT CAUSE: ...`, the evidence from the reports, and the fix steps. **Fixes
    are only shown, with a copy button; the tool never runs them.**
 
+You stay in the conversation:
+
+- **Run them yourself:** for each round of requested diagnostics you can click **I'll run them
+  myself and paste the output** (terminal: `m`). The commands are shown as one script with the
+  host above each block; run them in a terminal, paste the output into **Continue the
+  conversation** and send it.
+- **Fixes as a script:** fix steps are exact commands for the named hosts. **Copy all fixes as one
+  script** copies them in order, with the host, impact and rollback note above each block, and a
+  verification step after each fix.
+- **After a fix:** paste what happened (choose "Result of the fixes I applied") and the AI checks
+  the result or continues. You can also ask follow-up questions at any time, and the AI can ask
+  you questions when it needs something only a person knows.
+- If the AI answers with general advice instead of commands, or gives a root cause without fix
+  commands, the tool sends the answer back and asks again in the required format.
+
 What the AI sees follows the `anonymize` setting: with `anonymize = no` it sees real names; with
 anonymization on, it sees placeholders, including in your problem description, and its answers are
 translated back for you. Every investigation is saved as

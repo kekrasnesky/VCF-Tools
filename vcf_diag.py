@@ -57,7 +57,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
-VERSION = "1.10.4"
+VERSION = "1.11.0"
 
 # ----------------------------------------------------------------------------
 # Diagnostic catalog
@@ -3964,13 +3964,26 @@ Work in rounds. In every reply, either:
 2. conclude: start with a line "ROOT CAUSE: <one sentence>" (or "NO ROOT CAUSE FOUND: <why>" when
    read-only data cannot settle it), give the evidence by quoting the report lines that prove it,
    then add one vcf-plan block with the [fix] steps in the order they must be applied, each with
-   impact and rollback in note:. Also say how to verify the fix worked.
+   impact and rollback in note:, and a "Verify ..." step after each fix, or
+3. ask the administrator: when you need something only a person knows or can do (a UI setting, a
+   change window, a password policy), end with "QUESTION FOR THE ADMINISTRATOR: <question>".
+
+Fix steps must be exact, complete commands or scripts for the named hosts that the administrator
+can paste into a terminal, with real values filled in from the reports: service names, file paths,
+object names, IDs. Never write general advice such as "check the logs", "verify the configuration"
+or "restart the affected service" instead of commands. A longer fix may be a multi-line script
+(indent the continuation lines under run:). Where a fix can only be done in a web UI, give the exact
+menu path, and the equivalent CLI or API command when one exists. After each fix add a step that
+verifies it (as a [fix] step labelled "Verify ...").
+
+The administrator may also run your commands in a terminal and paste the output back, or tell you
+what happened after applying a fix. Continue from there.
 
 Rules:
 - Base conclusions on evidence in the reports, not on assumptions. Do not conclude early when one
   more targeted check would confirm or rule out the cause; do not ask again for data you have.
-- The administrator approves every round, and you have at most %d rounds. Each message from the
-  tool says which round it is. In the last round you must conclude.
+- The administrator approves every round, and you have at most %d rounds before you must
+  conclude. Each message from the tool says which round it is.
 - A [collect] step that looks as if it changes something, or that would print secrets, is refused
   by the tool; you will be told which and why. Never put sudo in a command.
 - Prefer commands that print a bounded amount of output (tail, grep, head).
@@ -4074,6 +4087,8 @@ class Investigation:
         self.collect = collect or collect_and_report
         self.messages = []
         self.final = None
+        self.path = None
+        self.anonymized = True
 
     def _trim_context(self):
         """Keep the conversation under max_context_chars by shortening the oldest tool reports."""
@@ -4100,7 +4115,7 @@ class Investigation:
 
     def run(self):
         settings, sections, _ = load_inventory(find_inventory(self.args))
-        anonymized = anonymize_enabled(self.args, settings)
+        self.anonymized = anonymize_enabled(self.args, settings)
         scrubber = make_scrubber(self.args, settings)
         learn_inventory(scrubber, sections)        # so that every inventory host has its placeholder
         scrubber.m.save()
@@ -4114,15 +4129,65 @@ class Investigation:
             first += ["", "Current diagnostic report:", "", text]
         else:
             first += ["", "No report has been collected yet. Ask for the diagnostics you need."]
-        max_rounds = self.cfg["max_rounds"]
-        first += ["", "Round 1 of %d." % max_rounds]
-        self.messages = [{"role": "system", "content": investigator_prompt(max_rounds, anonymized)},
+        first += ["", "Round 1 of %d." % self.cfg["max_rounds"]]
+        self.messages = [{"role": "system", "content": investigator_prompt(self.cfg["max_rounds"], self.anonymized)},
                          {"role": "user", "content": "\n".join(first), "_report": bool(self.start_report)}]
+        return self._loop()
+
+    def continue_with(self, text, kind="message"):
+        """The administrator answers: pasted command output, a question, or anything else.
+        The text follows the anonymize setting like everything else sent to the AI."""
+        text = scrub_texts(self.args, [text])[1][0].strip()
+        head = {"output": "Output of the commands you asked for, run by the administrator in a terminal:",
+                "fix-output": "The administrator applied fix steps and reports the result:"}.get(
+            kind, "Message from the administrator:")
+        self.messages.append({"role": "user", "content": "%s\n\n%s\n\nRound 1 of %d." % (
+            head, text or "(empty)", self.cfg["max_rounds"]), "_report": kind == "output"})
+        self.emit("you", text)
+        return self._loop()
+
+    def _format_problem(self, reply):
+        """What is wrong with a reply that does not follow the required format, or None."""
+        has_plan = bool(PLAN_FENCE.search(reply))
+        if re.search(r"(?i)QUESTION FOR THE ADMINISTRATOR\s*:", reply):
+            return None
+        if re.search(r"(?im)^\W*NO ROOT CAUSE FOUND\s*:", reply):
+            return None
+        if re.search(r"(?im)^\W*ROOT CAUSE\s*:", reply):
+            steps = parse_plan(reply)["steps"] if has_plan else []
+            if any(st["kind"] == "fix" and st["run"].strip() for st in steps):
+                return None
+            return ("You gave a root cause but no fix steps. Add a vcf-plan block with [fix] steps: exact, "
+                    "complete commands or scripts for the named hosts that the administrator can paste into a "
+                    "terminal, with impact and rollback in note:, followed by a verification command. If no change "
+                    "is needed, say so explicitly.")
+        if has_plan:
+            if parse_plan(reply)["steps"]:
+                return None
+            return "Your vcf-plan block contains no steps in the required format ([collect] or [fix] with run:)."
+        return ("Your reply does not follow the required format. Reply again, either with a vcf-plan block of "
+                "[collect] steps to get more data, or starting with 'ROOT CAUSE:' and a vcf-plan block of [fix] "
+                "steps that are exact commands, not general advice. If you need information only the administrator "
+                "has, end with 'QUESTION FOR THE ADMINISTRATOR: <question>'.")
+
+    def _ask_ai_checked(self):
+        reply = self._ask_ai()
+        for _ in range(2):
+            problem = self._format_problem(reply)
+            if not problem:
+                break
+            self.emit("status", "The AI's answer did not follow the format; asking it again ...")
+            self.messages.append({"role": "user", "content": problem})
+            reply = self._ask_ai()
+        return reply
+
+    def _loop(self):
+        max_rounds = self.cfg["max_rounds"]
         prep = None
         for rnd in range(1, max_rounds + 1):
             if self.stopped():
                 return self._finish("stopped", prep)
-            reply = self._ask_ai()
+            reply = self._ask_ai_checked()
             prep = prepare_plan(self.args, reply, require_mapping=False)
             self.emit("ai", prep["translated"])
             if not prep["collect"]:
@@ -4130,12 +4195,18 @@ class Investigation:
                     self.messages.append({"role": "user", "content": "The tool could not use your plan: %s "
                                           "Round %d of %d." % (" ".join(prep["problems"]), rnd + 1, max_rounds)})
                     continue
-                return self._finish("concluded", prep)
+                question = re.search(r"(?is)QUESTION FOR THE ADMINISTRATOR\s*:\s*(.+)$", prep["translated"])
+                return self._finish("question" if question else "concluded", prep,
+                                    question=question.group(1).strip() if question else "")
             if rnd == max_rounds:
                 break
             if self.stopped():
                 return self._finish("stopped", prep)
-            if not self.approve(prep):
+            decision = self.approve(prep)
+            decision = {True: "run", False: "stop", None: "stop"}.get(decision, decision)
+            if decision == "manual":
+                return self._finish("manual", prep)       # the administrator runs them and pastes the output
+            if decision != "run":
                 return self._finish("declined", prep)
             self.emit("status", "Running %d read-only diagnostic(s) ..." % len(prep["collect"]))
             res = self.collect(self.args, prep["settings"], prep["sections"], prep["plan"], self.ui,
@@ -4160,24 +4231,40 @@ class Investigation:
             self.messages.append({"role": "user", "content": "\n".join(msg), "_report": True})
         self.messages.append({"role": "user", "content": "The round limit is reached. Conclude now with the "
                               "evidence you have, in the conclusion format."})
-        reply = self._ask_ai()
+        reply = self._ask_ai_checked()
         prep = prepare_plan(self.args, reply, require_mapping=False)
         self.emit("ai", prep["translated"])
         return self._finish("concluded", prep)
 
-    def _finish(self, how, prep):
-        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        os.makedirs(self.args.output_dir, exist_ok=True)
-        path = os.path.join(self.args.output_dir, "vcf-investigation-%s.md" % stamp)
+    def _finish(self, how, prep, question=""):
+        if not self.path:
+            stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            os.makedirs(self.args.output_dir, exist_ok=True)
+            self.path = os.path.abspath(os.path.join(self.args.output_dir, "vcf-investigation-%s.md" % stamp))
         out = ["# VCF investigation (%s)" % how, "", "- Tool: vcf_diag %s" % VERSION,
                "- AI model: %s" % self.cfg["model"], ""]
         for m in self.messages[1:]:
-            out += ["## %s" % ("Collector" if m["role"] == "user" else "AI"), "", m["content"], ""]
-        write_private(path, "\n".join(out))
-        self.final = {"how": how, "path": os.path.abspath(path),
+            out += ["## %s" % ("Collector / administrator" if m["role"] == "user" else "AI"), "", m["content"], ""]
+        write_private(self.path, "\n".join(out))
+        self.final = {"how": how, "path": self.path, "question": question,
                       "conclusion": prep["translated"] if prep else "",
+                      "collect": prep["collect"] if prep else [],
                       "manual": prep["manual"] if prep else [], "problems": prep["problems"] if prep else []}
         return self.final
+
+
+def plan_as_script(entries, title="Steps"):
+    """Steps as one shell script to copy: each command with its hosts and notes as comments."""
+    out = ["# %s - generated by vcf_diag %s. Run each block on the host named above it." % (title, VERSION), ""]
+    for i, e in enumerate(entries, 1):
+        hosts = ", ".join(t["address"] for t in e["targets"]) or "?"
+        out.append("# %d. %s" % (i, e["label"]))
+        out.append("#    on: %s" % hosts)
+        if e.get("note"):
+            out.append("#    note: %s" % e["note"])
+        out.append(e["command"].rstrip())
+        out.append("")
+    return "\n".join(out)
 
 
 def print_plan_steps(prep, include_collect=True):
@@ -4260,25 +4347,57 @@ def cmd_investigate(args):
 
     def approve(prep):
         print_plan_steps(prep, include_collect=True)
-        return ask_yes("\nRun these %d read-only diagnostic(s) now?" % len(prep["collect"]), default=False)
+        while True:
+            a = input("\n[r] run these %d read-only diagnostic(s) for me, [m] I will run them myself and paste "
+                      "the output, [s] stop: " % len(prep["collect"])).strip().lower()[:1]
+            if a in ("r", "m", "s"):
+                return {"r": "run", "m": "manual", "s": "stop"}[a]
+            print("Please answer r, m or s.")
+
+    def read_reply():
+        print("\nType or paste your reply for the AI (command output, results, questions).")
+        print("Finish with a line containing only a dot (.). Press Return on an empty first line to end.")
+        lines = []
+        while True:
+            try:
+                ln = input()
+            except EOFError:
+                break
+            if ln.strip() == "." or (not lines and not ln.strip()):
+                break
+            lines.append(ln)
+        return "\n".join(lines).strip()
 
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, lambda *_: sys.exit(143))
+    inv = Investigation(args, make_ai_client(cfg, key), cfg, problem, ui, emit, approve, start_report=start_text)
     try:
-        result = Investigation(args, make_ai_client(cfg, key), cfg, problem, ui, emit, approve,
-                               start_report=start_text).run()
+        result = inv.run()
+        while True:
+            print("\n" + "=" * 78)
+            print({"concluded": "The AI has concluded.", "declined": "Stopped: you declined a round.",
+                   "stopped": "Investigation stopped.", "question": "The AI has a question for you:",
+                   "manual": "Run these commands yourself, then paste their output below."}[result["how"]])
+            if result["how"] == "question":
+                print(result["question"])
+            if result["how"] == "manual":
+                print("\n" + plan_as_script(result["collect"], "Read-only diagnostics requested by the AI"))
+            fixes = [e for e in result["manual"] if e["kind"] == "fix"]
+            if fixes:
+                print("\nFixes as one script (the tool never runs these):\n")
+                print(plan_as_script(fixes, "Fix steps"))
+            print("Transcript (as sent to the AI): %s" % result["path"])
+            text = read_reply()
+            if not text:
+                break
+            kind = "output" if result["how"] == "manual" else (
+                "fix-output" if any(e["kind"] == "fix" for e in result["manual"]) else "message")
+            result = inv.continue_with(text, kind)
     except AiError as e:
         die(str(e))
     except KeyboardInterrupt:
         print("\nInvestigation interrupted.")
         return 130
-    print("\n" + "=" * 78)
-    print({"concluded": "Investigation finished.", "declined": "Investigation stopped: you declined a round.",
-           "stopped": "Investigation stopped."}[result["how"]])
-    fixes = [e for e in result["manual"] if e["kind"] == "fix"]
-    if fixes:
-        print_plan_steps({"problems": [], "manual": fixes, "collect": []}, include_collect=False)
-    print("\nTranscript (as sent to the AI): %s" % result["path"])
     return 0
 
 
@@ -4515,13 +4634,37 @@ select { margin-top: 4px; padding: 8px 10px; border: 1px solid var(--line); bord
       <div class="tablewrap"><table><thead><tr><th>Host</th><th>What</th><th>Command</th></tr></thead>
         <tbody id="invApproveRows"></tbody></table></div>
       <div id="invRefused"></div>
-      <div class="actions"><button class="btn primary" id="invRun">Run these diagnostics</button>
-        <button class="btn" id="invDecline">Stop the investigation</button></div>
+      <div class="actions"><button class="btn primary" id="invRun">Run these diagnostics for me</button>
+        <button class="btn" id="invManual">I'll run them myself and paste the output</button>
+        <button class="btn" id="invDecline">Stop</button></div>
     </div>
     <div id="invFinal" hidden>
+      <div id="invQuestion" class="note warn" hidden></div>
+      <div id="invManualBox" hidden>
+        <h2>Run these commands yourself</h2>
+        <p class="muted">Run each block on the host named above it, then paste all the output below and send it.</p>
+        <pre id="invManualScript"></pre>
+        <div class="actions"><button class="btn" id="invCopyCollect">Copy the commands</button>
+          <span class="muted" id="invCopyCollectMsg"></span></div>
+      </div>
       <h2 id="invFinalTitle"></h2>
       <div id="invFixes"></div>
+      <div class="actions" id="invFixScriptRow" hidden><button class="btn" id="invCopyFixes">Copy all fixes as one script</button>
+        <span class="muted" id="invCopyFixesMsg"></span></div>
       <p class="muted" id="invPath"></p>
+      <div class="card on" id="invReplyBox">
+        <b>Continue the conversation</b>
+        <p class="muted" id="invReplyHint">Paste the output of commands you ran, tell the AI what happened after a fix,
+          or ask a follow-up question.</p>
+        <textarea id="invReply" spellcheck="false" placeholder="Paste output or type your reply"></textarea>
+        <div class="actions">
+          <select id="invReplyKind" aria-label="What you are sending">
+            <option value="output">Output of the commands the AI asked for</option>
+            <option value="fix-output">Result of the fixes I applied</option>
+            <option value="message">A message or question</option></select>
+          <button class="btn primary" id="invSend">Send to the AI</button>
+          <span class="muted" id="invSendMsg"></span></div>
+      </div>
     </div>
     <div class="actions"><button class="btn" id="invStop">Stop</button>
       <button class="btn" id="invAgain" hidden>New investigation</button></div>
@@ -5335,6 +5478,7 @@ function invEntry(e) {
   }
   if (e.kind === "warn") return el("div", { className: "note warn", textContent: e.text });
   if (e.kind === "report") return el("p", { className: "muted", textContent: "Report saved: " + e.text });
+  if (e.kind === "you") return el("div", { className: "card" }, el("b", { textContent: "You" }), el("pre", { textContent: e.text }));
   return el("p", { className: "muted", textContent: e.text });
 }
 function renderApprove(plan) {
@@ -5376,18 +5520,28 @@ async function invPoll() {
   $("#invSpin").hidden = true; $("#invStop").hidden = true; $("#invAgain").hidden = false; $("#credModal").hidden = true;
   if (inv.state === "error") { $("#invTitle").textContent = "Stopped: " + inv.error; return; }
   const f = inv.final;
-  $("#invTitle").textContent = { concluded: "Investigation finished", declined: "Investigation stopped by you",
-    stopped: "Investigation stopped" }[f.how] || "Investigation finished";
+  $("#invTitle").textContent = { concluded: "The AI has concluded", declined: "Stopped by you", stopped: "Investigation stopped",
+    question: "The AI has a question for you", manual: "Waiting for the output of the commands" }[f.how] || "Finished";
   $("#invFinal").hidden = false;
+  $("#invQuestion").hidden = f.how !== "question";
+  $("#invQuestion").textContent = f.question || "";
+  $("#invManualBox").hidden = f.how !== "manual";
+  $("#invManualScript").textContent = f.collect_script || "";
+  $("#invFixScriptRow").hidden = !f.fix_script;
+  $("#invReplyKind").value = f.how === "manual" ? "output" : (f.manual.some(e => e.kind === "fix") ? "fix-output" : "message");
+  $("#invReply").value = "";
+  if (f.how === "manual") $("#invReply").focus();
+  lastFinal = f;
   const fixes = f.manual.filter(e => e.kind === "fix");
-  $("#invFinalTitle").textContent = fixes.length ? "Fixes to apply by hand, in this order" : "No fix steps were proposed";
+  $("#invFinalTitle").textContent = fixes.length ? "Fixes to apply by hand, in this order" : "";
   const fx = $("#invFixes");
   fx.textContent = "";
   fixes.forEach((e, i) => {
     const msg = el("span", { className: "muted" });
     const card = el("div", { className: "card" },
       el("div", { className: "row" }, el("b", { textContent: (i + 1) + ". " + e.label }),
-        el("span", { className: "pill warn", textContent: "changes the system" })),
+        /^verify|^check/i.test(e.label) ? el("span", { className: "pill good", textContent: "verification" })
+          : el("span", { className: "pill warn", textContent: "changes the system" })),
       el("p", { textContent: "On: " + hostNames(e.targets) }));
     if (e.note) card.append(el("p", { textContent: e.note }));
     card.append(el("pre", { textContent: e.command }), el("div", { className: "actions" },
@@ -5396,8 +5550,22 @@ async function invPoll() {
   });
   $("#invPath").textContent = "Transcript (as sent to the AI): " + f.path;
 }
-$("#invRun").onclick = () => { $("#invApprove").hidden = true; api("answer", { approve: true }).catch(() => {}); };
-$("#invDecline").onclick = () => { $("#invApprove").hidden = true; api("answer", { approve: false }).catch(() => {}); };
+$("#invRun").onclick = () => { $("#invApprove").hidden = true; api("answer", { decision: "run" }).catch(() => {}); };
+$("#invManual").onclick = () => { $("#invApprove").hidden = true; api("answer", { decision: "manual" }).catch(() => {}); };
+$("#invDecline").onclick = () => { $("#invApprove").hidden = true; api("answer", { decision: "stop" }).catch(() => {}); };
+let lastFinal = null;
+$("#invCopyCollect").onclick = () => copyText($("#invManualScript").textContent, $("#invCopyCollectMsg"));
+$("#invCopyFixes").onclick = () => copyText(lastFinal ? lastFinal.fix_script : "", $("#invCopyFixesMsg"));
+$("#invSend").onclick = async () => {
+  try {
+    await api("inv_reply", { text: $("#invReply").value, kind: $("#invReplyKind").value });
+  } catch (e) { $("#invSendMsg").textContent = e.message; return; }
+  $("#invSendMsg").textContent = "";
+  $("#invFinal").hidden = true; $("#invSpin").hidden = false; $("#invStop").hidden = false; $("#invAgain").hidden = true;
+  $("#invTitle").textContent = "Investigating ...";
+  clearInterval(invTimer); invLogNext = 0; $("#invLog").textContent = ""; $("#invLog").hidden = true;
+  invTimer = setInterval(invPoll, 800); invPoll();
+};
 $("#invStop").onclick = () => { $("#invTitle").textContent = "Stopping ..."; api("cancel", {}).catch(() => {}); };
 $("#invAgain").onclick = () => { $("#invView").hidden = true; $("#invSetup").hidden = false; loadState(); };
 
@@ -5465,6 +5633,7 @@ class Gui:
         self.inv = None                    # state of the current or last investigation
         self.ai_key = ""                   # AI key entered in this window (memory only)
         self.inv_stop = threading.Event()
+        self.inv_obj = None                # the investigation conversation, kept so it can continue
         _log_sinks.append(lambda msg: self.lines.append(msg) if msg.strip() else None)
 
     # ---- helpers -----------------------------------------------------------
@@ -5741,12 +5910,59 @@ class Gui:
                                                          collect_plan, creds), daemon=True).start()
         return {"ok": True}
 
+    def _final_public(self, f):
+        if not f:
+            return f
+        f = dict(f)
+        fixes = [e for e in f["manual"] if e["kind"] == "fix"]
+        f["fix_script"] = plan_as_script(fixes, "Fix steps") if fixes else ""
+        f["collect_script"] = plan_as_script(f["collect"], "Read-only diagnostics requested by the AI") \
+            if f.get("collect") else ""
+        return f
+
     def _inv_emit(self, kind, text):
         with self.lock:
             self.inv["entries"].append({"kind": kind, "text": text})
 
     def _inv_approve(self, prep):
-        return bool(self.ask({"kind": "approve", "plan": plan_public(prep)}))
+        answer = self.ask({"kind": "approve", "plan": plan_public(prep)})
+        return answer if answer in ("run", "manual") else "stop"
+
+    def api_inv_reply(self, body):
+        """The administrator continues the conversation: pasted output, a result or a question."""
+        text = str(body.get("text") or "").strip()
+        if not text:
+            raise Fatal("type or paste your reply first")
+        with self.lock:
+            if self.state == "running":
+                raise Fatal("the investigation is still working")
+            if not self.inv_obj:
+                raise Fatal("there is no investigation to continue - start one first")
+            self.state = "running"
+            del self.lines[:]
+            self.prompt = None
+            self.inv.update(state="running", final=None, error="")
+            self.inv_stop.clear()
+        kind = body.get("kind") if body.get("kind") in ("output", "fix-output", "message") else "message"
+        threading.Thread(target=self._inv_continue, args=(text, kind), daemon=True).start()
+        return {"ok": True}
+
+    def _inv_continue(self, text, kind):
+        state, error, final = "finished", "", None
+        inv = self.inv_obj
+        inv.ui = CachedUI(GuiUI(self, {}))        # logins are asked for again when needed
+        try:
+            final = inv.continue_with(text, kind)
+        except (AiError, Fatal) as e:
+            state, error = "error", str(e)
+        except Exception as e:
+            state, error = "error", "unexpected error: %r" % (e,)
+        finally:
+            inv.ui.creds.clear()
+            with self.lock:
+                self.ctx, self.prompt = None, None
+                self.inv.update(state=state, error=error, final=final)
+                self.state = "idle"
 
     def _investigate(self, args, settings, sections, cfg, ai, problem, start, collect_plan, creds):
         state, error, final = "finished", "", None
@@ -5774,8 +5990,9 @@ class Gui:
                 return collect_and_report(a, st, secs, plan, u, kind=kind, title=title,
                                           on_context=lambda ctx: setattr(self, "ctx", ctx))
 
-            final = Investigation(args, ai, cfg, problem, ui, self._inv_emit, self._inv_approve,
-                                  stopped=self.inv_stop.is_set, start_report=start_text, collect=collect).run()
+            self.inv_obj = Investigation(args, ai, cfg, problem, ui, self._inv_emit, self._inv_approve,
+                                         stopped=self.inv_stop.is_set, start_report=start_text, collect=collect)
+            final = self.inv_obj.run()
         except (AiError, Fatal) as e:
             state, error = "error", str(e)
         except Exception as e:
@@ -5840,7 +6057,8 @@ class Gui:
         with self.lock:
             out = {"state": self.state, "lines": self.lines[since:], "next": len(self.lines),
                    "prompt": self.prompt, "error": self.error, "result": None,
-                   "inv": dict(self.inv, entries=list(self.inv["entries"])) if self.inv else None}
+                   "inv": dict(self.inv, entries=list(self.inv["entries"]),
+                               final=self._final_public(self.inv.get("final"))) if self.inv else None}
             r = self.result
             if self.state == "done" and r:
                 out["result"] = {k: r[k] for k in ("path", "total", "failed", "review", "targets")}
@@ -5853,7 +6071,8 @@ class Gui:
             if not self.prompt:
                 return {"ok": False}
             if self.prompt.get("kind") == "approve":
-                self.answer = bool(body.get("approve"))
+                d = body.get("decision")
+                self.answer = d if d in ("run", "manual", "stop") else ("run" if body.get("approve") else "stop")
                 self.answered.set()
                 return {"ok": True}
             self.answer = None if body.get("skip") or not body.get("password") else (
@@ -5909,6 +6128,8 @@ class Gui:
                 return self.api_plan_run(body)
             if route == "investigate":
                 return self.api_investigate(body)
+            if route == "inv_reply":
+                return self.api_inv_reply(body)
             if route == "settings":
                 return self.api_settings_set(body)
             if route == "ai_test":

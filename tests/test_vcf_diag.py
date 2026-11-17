@@ -1314,6 +1314,145 @@ class AskSageApiHost(unittest.TestCase):
             api.server_close()
 
 
+def scripted_ai(answer):
+    """Stand-in OpenAI-compatible endpoint whose reply is computed by answer(messages)."""
+    import http.server
+    import json as _json
+    import threading
+    seen = []
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            body = _json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            seen.append(body["messages"])
+            data = _json.dumps({"choices": [{"message": {"content": answer(body["messages"])},
+                                             "finish_reason": "stop"}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, "http://127.0.0.1:%d/v1" % srv.server_address[1], seen
+
+
+PLAN_COLLECT = "Need data.\n```vcf-plan\n[collect] target=10.9.0.11\nlabel: kubelet log\nrun: journalctl -u kubelet -n 20\n```"
+PLAN_FIX = ("ROOT CAUSE: expired kubelet certificate on 10.9.0.11.\nEvidence: x509 expired.\n```vcf-plan\n"
+            "[fix] target=10.9.0.11\nlabel: Renew kubelet certificate\nrun: kubeadm certs renew all &&\n"
+            "  systemctl restart kubelet\nnote: node restarts kubelet\n[fix] target=10.9.0.11\n"
+            "label: Verify kubelet\nrun: systemctl is-active kubelet\n```")
+
+
+class Conversation(unittest.TestCase):
+    def setUp(self):
+        import argparse
+        self.dir = tempfile.TemporaryDirectory()
+        d = self.dir.name
+        self.inv = os.path.join(d, "inventory.ini")
+        with open(self.inv, "w") as fh:
+            fh.write("[settings]\nanonymize = no\n[vcfmgmt:mgmt]\ncontrol_planes = 10.9.0.11\n[ai]\nbase_url = x\nmodel = m\n")
+        self.args = argparse.Namespace(inventory=self.inv, private_dir=os.path.join(d, "p"),
+                                       output_dir=os.path.join(d, "o"), no_anonymize=False, max_lines=None)
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def investigation(self, base, approve):
+        cfg = v.ai_settings(v.load_inventory(self.inv)[0])
+        cfg["base_url"] = base
+        events = []
+        inv = v.Investigation(self.args, v.make_ai_client(cfg, ""), cfg, "kubelet keeps failing", None,
+                              lambda k, t_: events.append((k, t_)), approve,
+                              collect=lambda *a, **k: {"path": "/x", "report": "x509: certificate has expired"})
+        return inv, events
+
+    def test_general_advice_is_sent_back(self):
+        def answer(msgs):
+            last = msgs[-1]["content"]
+            if "does not follow the required format" in last:
+                return PLAN_FIX
+            return "You should check the kubelet logs and verify the certificates, then restart the service."
+        srv, base, seen = scripted_ai(answer)
+        try:
+            inv, events = self.investigation(base, lambda p: "run")
+            res = inv.run()
+            self.assertEqual(res["how"], "concluded")
+            self.assertEqual(len(seen), 2)                     # one correction round trip
+            self.assertEqual([e["label"] for e in res["manual"]], ["Renew kubelet certificate", "Verify kubelet"])
+            script = v.plan_as_script([e for e in res["manual"] if e["kind"] == "fix"], "Fix steps")
+            self.assertIn("# 1. Renew kubelet certificate\n#    on: 10.9.0.11\n#    note: node restarts kubelet\n"
+                          "kubeadm certs renew all &&\nsystemctl restart kubelet", script)
+            self.assertIn("# 2. Verify kubelet", script)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_root_cause_without_fix_commands_is_sent_back(self):
+        def answer(msgs):
+            if "no fix steps" in msgs[-1]["content"]:
+                return PLAN_FIX
+            return "ROOT CAUSE: expired certificate. Renew it and restart kubelet."
+        srv, base, seen = scripted_ai(answer)
+        try:
+            res = self.investigation(base, lambda p: "run")[0].run()
+            self.assertEqual(len(seen), 2)
+            self.assertTrue(any(e["kind"] == "fix" for e in res["manual"]))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_run_it_myself_then_paste_output(self):
+        def answer(msgs):
+            last = msgs[-1]["content"]
+            if last.startswith("Output of the commands you asked for"):
+                return PLAN_FIX
+            if last.startswith("The administrator applied fix steps"):
+                return "QUESTION FOR THE ADMINISTRATOR: did the node rejoin the cluster in the UI?"
+            return PLAN_COLLECT
+        srv, base, seen = scripted_ai(answer)
+        try:
+            ran = []
+            inv, events = self.investigation(base, lambda p: "manual")
+            inv.collect = lambda *a, **k: ran.append(1)
+            res = inv.run()
+            self.assertEqual(res["how"], "manual")
+            self.assertEqual(ran, [])                         # nothing was run by the tool
+            self.assertEqual([e["command"] for e in res["collect"]], ["journalctl -u kubelet -n 20"])
+            self.assertIn("journalctl -u kubelet -n 20", v.plan_as_script(res["collect"]))
+            res = inv.continue_with("Nov 17 kubelet: x509: certificate has expired on 10.9.0.11", "output")
+            self.assertEqual(res["how"], "concluded")
+            self.assertIn("x509: certificate has expired", seen[-1][-1]["content"])
+            self.assertIn(("you", "Nov 17 kubelet: x509: certificate has expired on 10.9.0.11"), events)
+            res = inv.continue_with("Renewed, kubelet active", "fix-output")
+            self.assertEqual(res["how"], "question")
+            self.assertEqual(res["question"], "did the node rejoin the cluster in the UI?")
+            self.assertEqual(res["path"], inv.path)            # one transcript for the whole conversation
+            with open(res["path"]) as fh:
+                self.assertIn("Renewed, kubelet active", fh.read())
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_pasted_output_follows_the_anonymize_setting(self):
+        with open(self.inv, "w") as fh:
+            fh.write("[settings]\nanonymize = yes\n[vcfmgmt:mgmt]\ncontrol_planes = 10.9.0.11\n[ai]\nbase_url = x\nmodel = m\n")
+        srv, base, seen = scripted_ai(lambda msgs: "QUESTION FOR THE ADMINISTRATOR: anything else?")
+        try:
+            inv, _ = self.investigation(base, lambda p: "run")
+            inv.run()
+            inv.continue_with("error on 10.9.0.11 password=hunter2", "output")
+            sent = seen[-1][-1]["content"]
+            self.assertNotIn("10.9.0.11", sent)
+            self.assertNotIn("hunter2", sent)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+
 class GuiApi(unittest.TestCase):
     """The browser GUI's local web API, without contacting any host."""
 
