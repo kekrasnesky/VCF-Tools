@@ -57,7 +57,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
-VERSION = "1.11.3"
+VERSION = "1.11.4"
 
 # ----------------------------------------------------------------------------
 # Diagnostic catalog
@@ -1768,7 +1768,8 @@ class VcApi:
                                                   urllib.request.HTTPSHandler(context=ctx))
 
     def _call(self, method, path, headers=None):
-        req = urllib.request.Request(self.base + path, method=method, headers=dict(headers or {}))
+        req = urllib.request.Request(self.base + path, method=method,
+                                     headers=dict({"User-Agent": "vcf_diag/%s" % VERSION}, **(headers or {})))
         if self.token:
             req.add_header("vmware-api-session-id", self.token)
         if getattr(self, "basic", None):
@@ -3546,7 +3547,9 @@ class AiClient:
 
     # ---- transport ---------------------------------------------------------
     def _headers(self, native=False):
-        h = {"Content-Type": "application/json", "Accept": "application/json"}
+        h = {"Content-Type": "application/json", "Accept": "application/json",
+             # some gateways refuse the default "Python-urllib" client name
+             "User-Agent": "vcf_diag/%s" % VERSION}
         if self.key:
             if native:
                 h["x-access-tokens"] = self.key

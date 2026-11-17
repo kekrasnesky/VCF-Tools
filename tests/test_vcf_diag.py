@@ -1618,6 +1618,9 @@ class GenAiLikeKeys(unittest.TestCase):
     def chat(self, key):
         return v.AiClient(self.url, "m", key).chat([{"role": "user", "content": "x"}], retries=0)
 
+    def test_client_name_is_not_python_urllib(self):
+        self.assertEqual(v.AiClient(self.url, "m", "k")._headers()["User-Agent"], "vcf_diag/%s" % v.VERSION)
+
     def test_pasted_key_is_cleaned(self):
         self.assertEqual(self.chat("  Bearer STARK_good123\n"), "OK")
         self.assertEqual(self.chat('"STARK_good123"'), "OK")
