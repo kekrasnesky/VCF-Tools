@@ -3632,7 +3632,7 @@ class AiClient:
                     if tried and i > 0:
                         raise AiError("%s. Also tried: %s" % (e, ", ".join(tried)))
                     raise
-                tried.append("%s (%s)" % (self.base, str(e).split(":")[0]))
+                tried.append("%s (%s)" % (self.base, "name not found" if "look up" in str(e) else "no connection"))
         self._use_root(0)
         raise _Exhausted(tried)
 
