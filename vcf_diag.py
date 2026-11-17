@@ -57,7 +57,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 
 # ----------------------------------------------------------------------------
 # Diagnostic catalog
@@ -2021,6 +2021,120 @@ def load_inventory(path):
     return settings, sections, custom
 
 
+SETTINGS_FIELDS = [("anonymize", "yes"), ("max_lines", "200"), ("parallel", "4"), ("timeout", "30"),
+                   ("connect_timeout", "15"), ("strict_host_keys", "no"), ("scrub_terms", ""),
+                   ("extra_domains", ""), ("keep_literals", "9.1.1.0"), ("keep_namespaces", "")]
+AI_FIELDS = [("base_url", ""), ("model", ""), ("auth_header", "bearer"), ("max_rounds", "10"), ("max_tokens", ""),
+             ("timeout", "600"), ("max_report_chars", "150000"), ("max_context_chars", "400000"), ("ca_file", ""),
+             ("tls_verify", "yes"), ("use_proxy", "yes"), ("key_env", "")]
+GROUP_FIELDS = ["user", "port", "sudo", "escalate", "kubeconfig", "kubectl", "ssh_workers", "sso_user", "ca_file",
+                "tls_verify", "api_base", "ssh_options"]
+STANDARD_MGMT_SERVICES = ["VCF Operations", "VCF Operations for networks", "VCF Automation", "VCF services runtime",
+                          "Fleet lifecycle", "Log management", "Salt RaaS", "Software depot", "Real-time metrics",
+                          "Real-time metrics store", "Salt master", "SDDC lifecycle", "Telemetry"]
+
+
+def _ini_parser():
+    cp = configparser.ConfigParser(interpolation=None, delimiters=("=",), comment_prefixes=("#", ";"))
+    cp.optionxform = str
+    return cp
+
+
+def read_settings_model(text):
+    """Inventory text -> the structured form the Settings tab edits (keeps empty groups)."""
+    cp = _ini_parser()
+    try:
+        cp.read_string(text)
+    except configparser.Error as e:
+        raise Fatal("the inventory file cannot be read: %s" % e)
+    model = {"settings": {k: cp.get("settings", k, fallback=d) for k, d in SETTINGS_FIELDS},
+             "ai": {k: cp.get("ai", k, fallback=d) for k, d in AI_FIELDS}, "groups": [], "commands": []}
+    endpoints = {}
+    for name in cp.sections():
+        typ, _, label = (x.strip() for x in name.partition(":"))
+        typ = typ.lower()
+        if typ == "endpoints":
+            endpoints[label] = [{"service": k, "endpoint": v} for k, v in cp[name].items()]
+        elif typ == "commands":
+            model["commands"] += [{"type": label, "label": k, "command": v} for k, v in cp[name].items()]
+        elif typ in COMPONENTS:
+            sec = cp[name]
+            g = {"type": typ, "label": label,
+                 "hosts": list(dict.fromkeys(split_list(sec.get("hosts", "") + " " + sec.get("control_planes", "")))),
+                 "endpoints": []}
+            for k in GROUP_FIELDS:
+                g[k] = sec.get(k, "")
+            model["groups"].append(g)
+    for g in model["groups"]:
+        if g["type"] == "vcfmgmt":
+            g["endpoints"] = endpoints.pop(g["label"], [])
+    return model
+
+
+def _clean(v):
+    return re.sub(r"[\r\n]+", " ", str(v if v is not None else "")).strip()
+
+
+def render_settings_model(model):
+    """The structured form -> inventory text. Only values that are set are written."""
+    out = ["# vcf_diag settings, written by the Settings tab of the window.",
+           "# Contains real host names: keep it on this computer. You do not need to edit it by hand.", ""]
+
+    def block(header, pairs):
+        pairs = [(k, _clean(v)) for k, v in pairs if _clean(v) != ""]
+        out.append("[%s]" % header)
+        out.extend("%s = %s" % (k, v) for k, v in pairs)
+        out.append("")
+
+    st = model.get("settings") or {}
+    block("settings", [(k, st.get(k, "")) for k, _ in SETTINGS_FIELDS])
+    ai = model.get("ai") or {}
+    block("ai", [(k, ai.get(k, "")) for k, _ in AI_FIELDS])
+    for g in model.get("groups") or []:
+        typ = _clean(g.get("type")).lower()
+        if typ not in COMPONENTS:
+            raise Fatal("unknown component type '%s'" % typ)
+        label = _clean(g.get("label"))
+        if label and not re.fullmatch(r"[A-Za-z0-9_.-]+", label):
+            raise Fatal("group label '%s' may only contain letters, digits, '-', '_' and '.'" % label)
+        name = typ + (":" + label if label else "")
+        hosts = [h for h in (_clean(x) for x in (g.get("hosts") or [])) if h]
+        bad = [h for h in hosts if not re.fullmatch(r"[A-Za-z0-9_.:\[\]-]+", h)]
+        if bad:
+            raise Fatal("[%s]: '%s' is not a host name or IP address" % (name, bad[0]))
+        block(name, [("control_planes" if typ == "vcfmgmt" else "hosts", ", ".join(hosts))] +
+              [(k, g.get(k, "")) for k in GROUP_FIELDS])
+        eps = [(_clean(e.get("service")), _clean(e.get("endpoint"))) for e in (g.get("endpoints") or [])]
+        eps = [(k, v) for k, v in eps if k]
+        if typ == "vcfmgmt" and eps:
+            seen = set()
+            for k, _ in eps:
+                if not re.fullmatch(r"[^=\[\]#;]+", k):
+                    raise Fatal("service name '%s' may not contain = [ ] # or ;" % k)
+                if k.lower() in seen:
+                    raise Fatal("[%s]: the service '%s' is listed twice" % (name, k))
+                seen.add(k.lower())
+            # rows without an endpoint yet are kept (written empty, ignored when collecting)
+            out.append("[endpoints%s]" % (":" + label if label else ""))
+            out.extend(("%s = %s" % (k, v)).rstrip() for k, v in eps)
+            out.append("")
+    cmds, seen_cmds = {}, set()
+    for c in model.get("commands") or []:
+        typ, lab, cm = _clean(c.get("type")).lower(), _clean(c.get("label")), _clean(c.get("command"))
+        if lab and cm:
+            if (typ, lab.lower()) in seen_cmds:
+                raise Fatal("custom command '%s' is listed twice for %s" % (lab, typ))
+            seen_cmds.add((typ, lab.lower()))
+            if typ not in COMPONENTS:
+                raise Fatal("custom command '%s': choose a component type" % lab)
+            if not re.fullmatch(r"[^=\[\]#;]+", lab):
+                raise Fatal("custom command name '%s' may not contain = [ ] # or ;" % lab)
+            cmds.setdefault(typ, []).append((lab, cm))
+    for typ, pairs in cmds.items():
+        block("commands:" + typ, pairs)
+    return "\n".join(out)
+
+
 def groups_for(sec, custom):
     """Check groups for a component type, or for an inventory section (which may add endpoints)."""
     typ = sec["type"] if isinstance(sec, dict) else sec
@@ -2635,6 +2749,9 @@ def cmd_decode(args):
 def collect_and_report(args, settings, sections, plan, ui, on_context=None, kind="health", title=""):
     """Run a plan and write the anonymized report. Shared by the terminal and the GUI.
     Returns None when the run was cancelled."""
+    args.connect_timeout = getattr(args, "connect_timeout", None) or _clamp(settings.get("connect_timeout"), 15, 3, 300)
+    args.strict_host_keys = getattr(args, "strict_host_keys", False) or \
+        (settings.get("strict_host_keys") or "no").strip().lower() in ("yes", "true", "1", "on")
     ctx = Context(args)
     if on_context:
         on_context(ctx)
@@ -3188,6 +3305,44 @@ def ai_settings(settings):
     }
 
 
+KEYCHAIN_SERVICE = "vcf_diag AI key"
+
+
+def keychain_available():
+    return (sys.platform == "darwin" or bool(os.environ.get("VCFDIAG_FAKE_KEYCHAIN"))) and bool(shutil.which("security"))
+
+
+def keychain_get(account):
+    if not keychain_available() or not account:
+        return ""
+    try:
+        p = subprocess.run(["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account, "-w"],
+                           stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return p.stdout.decode("utf-8", "replace").rstrip("\n") if p.returncode == 0 else ""
+
+
+def keychain_set(account, key):
+    if not keychain_available():
+        raise Fatal("the macOS Keychain is not available on this computer")
+    p = subprocess.run(["security", "add-generic-password", "-U", "-s", KEYCHAIN_SERVICE, "-a", account, "-w", key],
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=15)
+    if p.returncode != 0:
+        raise Fatal("the Keychain refused to save the key: %s" % p.stderr.decode("utf-8", "replace").strip())
+
+
+def keychain_delete(account):
+    if keychain_available() and account:
+        subprocess.run(["security", "delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account],
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+
+
+def resolve_ai_key(cfg, typed="", session=""):
+    """Typed key, then the key entered earlier in this window, then the environment, then the Keychain."""
+    return typed or session or os.environ.get(cfg["key_env"], "") or keychain_get(cfg["base_url"])
+
+
 def make_ai_client(cfg, key):
     return AiClient(cfg["base_url"], cfg["model"], key, auth_header=cfg["auth_header"], verify=cfg["tls_verify"],
                     ca_file=cfg["ca_file"], timeout=cfg["timeout"], max_tokens=cfg["max_tokens"],
@@ -3469,7 +3624,7 @@ def cmd_investigate(args):
                 break
             lines.append(ln)
         problem = "\n".join(lines)
-    key = os.environ.get(cfg["key_env"]) or getpass.getpass("API key for %s (hidden; Return for none): "
+    key = resolve_ai_key(cfg) or getpass.getpass("API key for %s (hidden; Return for none): "
                                                              % cfg["base_url"])
     start_text = None
     start = args.start or ("latest" if latest_report(args) else "none")
@@ -3618,6 +3773,14 @@ td.mono { font-family: ui-monospace, Menlo, monospace; font-size: 13px; overflow
 .modal.small { max-width: 460px; }
 .modal h2 { margin-top: 0; }
 [hidden] { display: none !important; }
+label.chk { display: flex; gap: 8px; align-items: flex-start; margin: 10px 0 0; font-size: 14px; }
+select { margin-top: 4px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px;
+  background: var(--bg); color: var(--ink); font: inherit; max-width: 100%; }
+.eprow, .cmdrow { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; margin: 6px 0; align-items: center; }
+.cmdrow { grid-template-columns: 160px 1fr 2fr auto; }
+@media (max-width: 640px) { .eprow, .cmdrow { grid-template-columns: 1fr; } }
+.grouphead { display: flex; gap: 10px; align-items: end; flex-wrap: wrap; }
+.grouphead label.f { flex: 1; min-width: 160px; }
 .spin { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--line);
   border-top-color: var(--accent); border-radius: 50%; animation: sp 0.9s linear infinite; vertical-align: -2px; }
 @keyframes sp { to { transform: rotate(360deg); } }
@@ -3628,7 +3791,7 @@ td.mono { font-family: ui-monospace, Menlo, monospace; font-size: 13px; overflow
 <header><div class="bar">
   <div class="title">
     <h1>VCF Diagnostics</h1><span class="ver" id="ver"></span><span class="spacer"></span>
-    <button class="btn" id="editInv">Edit inventory</button>
+    <button class="btn" id="editInv">Settings</button>
     <button class="btn" id="quit">Quit</button>
   </div>
   <nav role="tablist">
@@ -3636,6 +3799,7 @@ td.mono { font-family: ui-monospace, Menlo, monospace; font-size: 13px; overflow
     <button role="tab" data-tab="investigate" aria-selected="false">Investigate with AI</button>
     <button role="tab" data-tab="reply" aria-selected="false">Analyst reply</button>
     <button role="tab" data-tab="scrub" aria-selected="false">Anonymize text</button>
+    <button role="tab" data-tab="settings" aria-selected="false">Settings</button>
   </nav>
 </div></header>
 
@@ -3644,10 +3808,10 @@ td.mono { font-family: ui-monospace, Menlo, monospace; font-size: 13px; overflow
 
 <section id="tab-collect">
   <div id="problem" class="note bad" hidden></div>
-  <div id="plainMode" class="note warn" hidden>Anonymization is off (<code>anonymize = no</code> in the
-    inventory): reports keep real host names and addresses. Only secrets are redacted.</div>
+  <div id="plainMode" class="note warn" hidden>Anonymization is off (Settings, Reports and privacy): reports keep
+    real host names and addresses. Only secrets are redacted.</div>
   <div id="empty" class="note warn" hidden>
-    The inventory has no hosts yet. Click <b>Edit inventory</b> and list your hosts under the matching sections.
+    No systems are set up yet. On the <b>Settings</b> tab, click <b>Add group</b>, enter the hosts and save.
   </div>
   <div id="setup">
     <p class="muted">Tick the groups to check, enter the SSH login for each, then run. Only read-only
@@ -3714,8 +3878,8 @@ td.mono { font-family: ui-monospace, Menlo, monospace; font-size: 13px; overflow
 </section>
 
 <section id="tab-investigate" hidden>
-  <div id="aiMissing" class="note warn" hidden>No AI is configured. Click <b>Edit inventory</b> and fill in the
-    <code>[ai]</code> section: <code>base_url</code> (an OpenAI-compatible endpoint) and <code>model</code>.</div>
+  <div id="aiMissing" class="note warn" hidden>No AI is set up yet. On the <b>Settings</b> tab, fill in the
+    endpoint URL and model name under <b>AI for investigations</b>, then click <b>Save settings</b>.</div>
   <div id="invSetup">
     <p class="muted">Describe the problem. The AI reads the diagnostics, asks for the read-only checks it needs
       (you approve every round), and ends with the root cause and the fix steps. Fixes are only shown, never run.
@@ -3763,6 +3927,103 @@ td.mono { font-family: ui-monospace, Menlo, monospace; font-size: 13px; overflow
     <div class="actions"><button class="btn" id="invStop">Stop</button>
       <button class="btn" id="invAgain" hidden>New investigation</button></div>
   </div>
+</section>
+
+<section id="tab-settings" hidden>
+  <p class="muted">Everything the tool needs is set here. Changes take effect when you click <b>Save settings</b>.
+    Passwords for the hosts are never stored: you type them when you run.</p>
+  <div id="setErr" class="note bad" hidden></div>
+  <div class="actions" style="margin-top:0">
+    <button class="btn primary setSave">Save settings</button>
+    <button class="btn" id="setReload">Discard changes</button>
+    <span class="muted setMsg"></span></div>
+
+  <h2>Systems to check</h2>
+  <p class="muted">One entry per group of systems. The group name (type and label) is used in placeholders such as
+    <code>esxi-mgmt-01</code>; changing it later gives those hosts new placeholders.</p>
+  <div id="setGroups"></div>
+  <div class="actions">
+    <select id="setNewType" aria-label="Type of the new group"></select>
+    <button class="btn" id="setAddGroup">Add group</button></div>
+
+  <h2>AI for investigations</h2>
+  <div class="card">
+    <p class="muted">Any OpenAI-compatible chat endpoint: most internal AI gateways, Azure OpenAI, vLLM, Ollama,
+      LM Studio and others.</p>
+    <div class="fields">
+      <label class="f">Endpoint URL<input type="text" data-ai="base_url" placeholder="https://ai.example.internal/v1"></label>
+      <label class="f">Model name<input type="text" data-ai="model" placeholder="model id as the endpoint names it"></label>
+      <label class="f">Key goes in
+        <select data-ai="auth_header"><option value="bearer">Authorization: Bearer (most endpoints)</option>
+          <option value="api-key">api-key header (Azure OpenAI style)</option></select></label>
+      <label class="f">Rounds before the AI must conclude<input type="number" min="1" max="50" data-ai="max_rounds"></label>
+    </div>
+    <div class="fields">
+      <label class="f">API key<input type="password" id="setKey" autocomplete="off"></label>
+      <div class="f" style="align-self:end"><span class="muted" id="setKeyState"></span></div>
+    </div>
+    <div class="actions">
+      <button class="btn" id="setKeySession">Use for this session</button>
+      <button class="btn" id="setKeySave">Save in the macOS Keychain</button>
+      <button class="btn" id="setKeyForget">Forget the key</button>
+      <button class="btn primary" id="setAiTest">Test connection</button>
+      <span class="muted" id="setAiMsg"></span></div>
+    <details><summary>More AI options</summary>
+      <div class="fields">
+        <label class="f">Longest report sent at once (characters)<input type="number" min="5000" data-ai="max_report_chars"></label>
+        <label class="f">Largest conversation (characters)<input type="number" min="20000" data-ai="max_context_chars"></label>
+        <label class="f">Reply length limit (tokens, empty = endpoint default)<input type="number" min="0" data-ai="max_tokens"></label>
+        <label class="f">Wait for a reply (seconds)<input type="number" min="30" data-ai="timeout"></label>
+        <label class="f">Trust this CA file (path)<input type="text" data-ai="ca_file" placeholder="~/internal-ca.pem"></label>
+      </div>
+      <label class="chk"><input type="checkbox" data-ai-bool="tls_verify"> Check the endpoint's certificate</label>
+      <label class="chk"><input type="checkbox" data-ai-bool="use_proxy"> Use this Mac's proxy settings to reach it</label>
+    </details>
+  </div>
+
+  <h2>Reports and privacy</h2>
+  <div class="card">
+    <label class="chk"><input type="checkbox" data-set-bool="anonymize"> Anonymize reports (replace host names,
+      addresses and identifiers with placeholders). Turn off when reports stay inside the organisation.</label>
+    <div class="fields">
+      <label class="f">Output lines kept per check<input type="number" min="20" data-set="max_lines"></label>
+      <label class="f">Words to hide everywhere (comma separated: company, site codes ...)<input type="text" data-set="scrub_terms"></label>
+      <label class="f">Extra DNS domains to hide<input type="text" data-set="extra_domains"></label>
+      <label class="f">Version numbers that look like IPs (keep readable)<input type="text" data-set="keep_literals"></label>
+      <label class="f">Kubernetes namespaces to keep readable<input type="text" data-set="keep_namespaces"></label>
+    </div>
+  </div>
+
+  <h2>Connections</h2>
+  <div class="card">
+    <div class="fields">
+      <label class="f">Hosts contacted at the same time<input type="number" min="1" max="16" data-set="parallel"></label>
+      <label class="f">SSH connect timeout (seconds)<input type="number" min="3" max="300" data-set="connect_timeout"></label>
+      <label class="f">Command time limit (seconds, default 30)<input type="number" min="5" max="600" data-set="timeout"></label>
+    </div>
+    <label class="chk"><input type="checkbox" data-set-bool="strict_host_keys"> Only connect to hosts whose SSH key
+      this Mac already knows (otherwise new hosts are trusted on first use)</label>
+  </div>
+
+  <h2>Your own read-only commands</h2>
+  <div class="card">
+    <p class="muted">Added as an extra check group for that type of system. Use <code>{K}</code> for kubectl.</p>
+    <div id="setCmds"></div>
+    <div class="actions"><button class="btn" id="setAddCmd">Add command</button></div>
+  </div>
+
+  <h2>Files</h2>
+  <div class="card">
+    <p class="muted" id="setPaths"></p>
+    <div class="actions">
+      <button class="btn" data-folder="output">Open the reports folder</button>
+      <button class="btn" data-folder="private">Open the private folder</button>
+      <button class="btn" id="editRaw">Edit the settings file as text (advanced)</button></div>
+  </div>
+
+  <div class="actions">
+    <button class="btn primary setSave">Save settings</button>
+    <span class="muted setMsg"></span></div>
 </section>
 
 <section id="tab-reply" hidden>
@@ -3842,7 +4103,8 @@ let sections = [], lastReport = "", logNext = 0, timer = null;
 // ---- tabs ----
 $$("nav button").forEach(b => b.onclick = () => {
   $$("nav button").forEach(x => x.setAttribute("aria-selected", x === b));
-  ["collect", "investigate", "reply", "scrub"].forEach(t => $("#tab-" + t).hidden = t !== b.dataset.tab);
+  ["collect", "investigate", "reply", "scrub", "settings"].forEach(t => $("#tab-" + t).hidden = t !== b.dataset.tab);
+  if (b.dataset.tab === "settings" && !settingsLoaded) loadSettings();
 });
 
 // ---- selection ----
@@ -4060,8 +4322,188 @@ $("#save").onclick = () => {
 };
 $("#reveal").onclick = () => api("reveal", {}).catch(e => $("#copied").textContent = e.message);
 
-// ---- inventory editor ----
-$("#editInv").onclick = async () => {
+// ---- settings ----
+let settingsLoaded = false, setModel = null, setMeta = null;
+const typeInfo = t => setMeta.types.find(x => x.type === t) || { title: t, default_user: "", host_label: "Hosts" };
+function inp(type, value, extra) {
+  const i = el("input", Object.assign({ type, value: value == null ? "" : value, autocomplete: "off", spellcheck: false }, extra || {}));
+  i.setAttribute("autocapitalize", "off");
+  return i;
+}
+function sel(options, value) {
+  const s = el("select", {});
+  for (const [v, t] of options) s.append(el("option", { value: v, textContent: t, selected: v === value }));
+  return s;
+}
+const yes = v => !/^(no|false|0|off)$/i.test(String(v || "").trim());
+function endpointRow(e) {
+  const row = el("div", { className: "eprow" }, inp("text", e.service, { placeholder: "Service, e.g. VCF Operations", className: "epsvc" }),
+    inp("text", e.endpoint, { placeholder: "FQDN, short name or IP", className: "epname" }),
+    el("button", { className: "btn", type: "button", textContent: "Remove", onclick: () => row.remove() }));
+  return row;
+}
+function groupCard(g) {
+  const info = typeInfo(g.type);
+  const card = el("div", { className: "card" });
+  card.dataset.type = g.type;
+  card._extra = { api_base: g.api_base || "", ssh_options: g.ssh_options || "" };
+  const label = inp("text", g.label, { placeholder: "optional, e.g. mgmt", className: "glabel" });
+  card.append(el("div", { className: "grouphead" },
+    el("div", {}, el("b", { textContent: info.title }), el("div", { className: "muted", textContent: "type: " + g.type })),
+    el("label", { className: "f" }, "Label", label),
+    el("button", { className: "btn", type: "button", textContent: "Remove group",
+      onclick: () => { if (confirm("Remove this group from the settings?")) card.remove(); } })));
+  const hosts = el("textarea", { className: "ghosts", value: (g.hosts || []).join("\n"), spellcheck: false,
+    placeholder: "one per line: FQDN, short name or IP" });
+  hosts.style.minHeight = "80px";
+  card.append(el("label", { className: "f" }, info.host_label + (g.type === "vcfmgmt" ? " (workers are found automatically)" : "") +
+    " - one per line", hosts));
+  const f = el("div", { className: "fields" },
+    el("label", { className: "f" }, "Default SSH user", inp("text", g.user, { placeholder: info.default_user, className: "guser" })),
+    el("label", { className: "f" }, "SSH port", inp("number", g.port, { placeholder: "22", className: "gport", min: 1, max: 65535 })),
+    el("label", { className: "f" }, "Use sudo", Object.assign(sel([["", "default for this type"], ["auto", "when available"],
+      ["yes", "always"], ["no", "never"]], g.sudo || ""), { className: "gsudo" })),
+    el("label", { className: "f" }, "After login", Object.assign(sel([["", "use the login as is"],
+      ["su", "switch to root with su (asks for the root password)"]], g.escalate || ""), { className: "gesc" })));
+  card.append(f);
+  if (g.type === "k8s" || g.type === "vcfmgmt" || g.type === "supervisor")
+    card.append(el("div", { className: "fields" },
+      el("label", { className: "f" }, "kubeconfig path (empty = find automatically)", inp("text", g.kubeconfig, { className: "gkcfg" })),
+      el("label", { className: "f" }, "kubectl command", inp("text", g.kubectl, { placeholder: "kubectl", className: "gkctl" }))));
+  if (g.type === "vcenter") {
+    card.append(el("div", { className: "fields" },
+      el("label", { className: "f" }, "vCenter SSO user (namespace checks)", inp("text", g.sso_user, { placeholder: "administrator@vsphere.local", className: "gsso" })),
+      el("label", { className: "f" }, "Trust this vCenter CA file (path)", inp("text", g.ca_file, { placeholder: "~/vcenter-ca.pem", className: "gca" }))));
+    card.append(el("label", { className: "chk" }, el("input", { type: "checkbox", className: "gtls", checked: yes(g.tls_verify || "yes") }),
+      "Check the vCenter certificate"));
+  }
+  if (g.type === "vcfmgmt") {
+    card.append(el("label", { className: "chk" }, el("input", { type: "checkbox", className: "gworkers", checked: yes(g.ssh_workers || "no") }),
+      "Also log in to the worker nodes (same login as the control planes)"));
+    const eps = el("div", { className: "geps" });
+    (g.endpoints || []).forEach(e => eps.append(endpointRow(e)));
+    card.append(el("p", { innerHTML: "<b>Management service endpoints</b>" }),
+      el("p", { className: "muted", textContent: "Each service and the name or IP it answers on. Services that share an endpoint are checked once." }),
+      eps, el("div", { className: "actions" },
+        el("button", { className: "btn", type: "button", textContent: "Add endpoint", onclick: () => eps.append(endpointRow({})) }),
+        el("button", { className: "btn", type: "button", textContent: "Add the standard VCF management services",
+          onclick: () => { const have = $$(".epsvc", eps).map(i => i.value);
+            setMeta.standard_services.filter(n => !have.includes(n)).forEach(n => eps.append(endpointRow({ service: n }))); } })));
+  }
+  return card;
+}
+function cmdRow(c) {
+  const types = setMeta.types.map(t => [t.type, t.type]);
+  const row = el("div", { className: "cmdrow" }, Object.assign(sel(types, c.type || "esxi"), { className: "ctype" }),
+    inp("text", c.label, { placeholder: "Name of the check", className: "clabel" }),
+    inp("text", c.command, { placeholder: "read-only command", className: "ccmd" }),
+    el("button", { className: "btn", type: "button", textContent: "Remove", onclick: () => row.remove() }));
+  return row;
+}
+function renderSettings() {
+  const m = setModel;
+  $$("[data-set]").forEach(i => i.value = m.settings[i.dataset.set] || "");
+  $$("[data-set-bool]").forEach(i => i.checked = yes(m.settings[i.dataset.setBool]));
+  $$("[data-ai]").forEach(i => i.value = m.ai[i.dataset.ai] || (i.tagName === "SELECT" ? "bearer" : ""));
+  $$("[data-ai-bool]").forEach(i => i.checked = yes(m.ai[i.dataset.aiBool] || "yes"));
+  const gs = $("#setGroups");
+  gs.textContent = "";
+  m.groups.forEach(g => gs.append(groupCard(g)));
+  if (!m.groups.length) gs.append(el("p", { className: "muted", textContent: "No groups yet. Add one below." }));
+  const nt = $("#setNewType");
+  nt.textContent = "";
+  setMeta.types.forEach(t => nt.append(el("option", { value: t.type, textContent: t.title })));
+  const cs = $("#setCmds");
+  cs.textContent = "";
+  m.commands.forEach(c => cs.append(cmdRow(c)));
+  $("#setKeySave").hidden = !setMeta.keychain;
+  const k = setMeta.key;
+  $("#setKeyState").textContent = keyStateText(k);
+  $("#setPaths").textContent = "Settings file: " + setMeta.paths.inventory + ". Reports: " + setMeta.paths.output +
+    ". Private folder (placeholder mapping, never share): " + setMeta.paths.private + ".";
+}
+function keyStateText(k) {
+  return k.keychain ? "A key is saved in the Keychain for this endpoint." : k.session ? "A key is set until you quit the tool." :
+    k.env ? "Using " + k.env_name + " from the environment." : "No key set (fine if the endpoint needs none).";
+}
+function collectSettings() {
+  const m = { settings: {}, ai: Object.assign({}, setModel.ai), groups: [], commands: [] };
+  $$("[data-set]").forEach(i => m.settings[i.dataset.set] = i.value.trim());
+  $$("[data-set-bool]").forEach(i => m.settings[i.dataset.setBool] = i.checked ? "yes" : "no");
+  $$("[data-ai]").forEach(i => m.ai[i.dataset.ai] = i.value.trim());
+  $$("[data-ai-bool]").forEach(i => m.ai[i.dataset.aiBool] = i.checked ? "yes" : "no");
+  for (const card of $$("#setGroups > .card")) {
+    const v = c => { const i = $(c, card); return i ? i.value.trim() : ""; };
+    const g = Object.assign({ type: card.dataset.type, label: v(".glabel"),
+      hosts: $(".ghosts", card).value.split(/[\s,]+/).map(x => x.trim()).filter(Boolean),
+      user: v(".guser"), port: v(".gport"), sudo: v(".gsudo"), escalate: v(".gesc"), kubeconfig: v(".gkcfg"),
+      kubectl: v(".gkctl"), sso_user: v(".gsso"), ca_file: v(".gca"), endpoints: [] }, card._extra);
+    if ($(".gtls", card)) g.tls_verify = $(".gtls", card).checked ? "yes" : "no";
+    if ($(".gworkers", card)) g.ssh_workers = $(".gworkers", card).checked ? "yes" : "no";
+    for (const r of $$(".eprow", card)) g.endpoints.push({ service: $(".epsvc", r).value.trim(), endpoint: $(".epname", r).value.trim() });
+    m.groups.push(g);
+  }
+  for (const r of $$("#setCmds .cmdrow"))
+    m.commands.push({ type: $(".ctype", r).value, label: $(".clabel", r).value.trim(), command: $(".ccmd", r).value.trim() });
+  return m;
+}
+async function loadSettings() {
+  $("#setErr").hidden = true;
+  try {
+    const r = await api("settings");
+    setModel = r.model; setMeta = r.meta; settingsLoaded = true;
+    renderSettings();
+  } catch (e) { $("#setErr").textContent = e.message; $("#setErr").hidden = false; }
+}
+function setMsg(t) { $$(".setMsg").forEach(x => x.textContent = t); if (t) setTimeout(() => $$(".setMsg").forEach(x => x.textContent = ""), 4000); }
+$$(".setSave").forEach(b => b.onclick = async () => {
+  $("#setErr").hidden = true;
+  try {
+    const m = collectSettings();
+    await api("settings", { model: m });
+    setModel = m;
+    setMsg("Saved.");
+    await loadSettings();
+    await loadState();
+  } catch (e) { $("#setErr").textContent = e.message; $("#setErr").hidden = false; $("#setErr").scrollIntoView({ block: "center" }); }
+});
+$("#setReload").onclick = () => loadSettings();
+$("#setAddGroup").onclick = () => {
+  const gs = $("#setGroups");
+  if (!$$(".card", gs).length) gs.textContent = "";
+  const card = groupCard({ type: $("#setNewType").value, label: "", hosts: [] });
+  gs.append(card);
+  card.scrollIntoView({ block: "center" });
+  $(".ghosts", card).focus();
+};
+$("#setAddCmd").onclick = () => $("#setCmds").append(cmdRow({}));
+const aiForm = () => collectSettings().ai;
+$("#setAiTest").onclick = async () => {
+  $("#setAiMsg").textContent = "Testing ...";
+  try {
+    const r = await api("ai_test", { ai: aiForm(), key: $("#setKey").value });
+    $("#setAiMsg").textContent = "Connected: the AI answered in " + r.seconds + " s (" + (r.reply || "empty reply").slice(0, 60) + ")." +
+      (r.used_key ? "" : " No key was sent.");
+  } catch (e) { $("#setAiMsg").textContent = e.message; }
+};
+async function keyAction(action) {
+  try {
+    const r = await api("ai_key", { action, key: $("#setKey").value, base_url: aiForm().base_url });
+    $("#setKey").value = "";
+    $("#setAiMsg").textContent = { session: "The key is used until you quit the tool.", save: "The key is saved in the Keychain for this endpoint.",
+      forget: "The key is forgotten." }[action];
+    setMeta.key = r.key;
+    $("#setKeyState").textContent = keyStateText(r.key);
+  } catch (e) { $("#setAiMsg").textContent = e.message; }
+}
+$("#setKeySession").onclick = () => keyAction("session");
+$("#setKeySave").onclick = () => keyAction("save");
+$("#setKeyForget").onclick = () => keyAction("forget");
+$$("[data-folder]").forEach(b => b.onclick = () => api("open_folder", { which: b.dataset.folder }).catch(e => setMsg(e.message)));
+$("#editInv").onclick = () => $('nav button[data-tab="settings"]').click();
+
+// ---- inventory editor (advanced: the settings file as text) ----
+$("#editRaw").onclick = async () => {
   const inv = await api("inventory");
   $("#invText").value = inv.text;
   $("#invPath").textContent = inv.path + (inv.exists ? "" : " (not created yet — this is the template)") +
@@ -4076,6 +4518,7 @@ $("#invSave").onclick = async () => {
     await api("inventory", { text: $("#invText").value });
     $("#invModal").hidden = true;
     await loadState();
+    if (settingsLoaded) await loadSettings();
   } catch (e) { $("#invErr").textContent = e.message; $("#invErr").hidden = false; }
 };
 
@@ -4175,7 +4618,7 @@ function renderInvestigateSetup(st) {
   $("#invGo").disabled = !ai.configured;
   $("#aiWho").textContent = ai.configured ? "AI: " + ai.model + " at " + ai.base_url + ", up to " + ai.max_rounds + " rounds." : "";
   $("#invLatest").textContent = ai.latest_report ? "(" + ai.latest_report + ")" : "(none yet)";
-  $("#aiKey").placeholder = ai.key_from_env ? "using " + ai.key_env + " from the environment" : "";
+  $("#aiKey").placeholder = ai.key_ready ? "a key is already set (Settings)" : "or set it once on the Settings tab";
   const box = $("#invCreds");
   if (!box.children.length || box.dataset.n !== String(sections.length)) {
     box.textContent = "";
@@ -4357,6 +4800,7 @@ class Gui:
         self.ctx = None
         self.httpd = None
         self.inv = None                    # state of the current or last investigation
+        self.ai_key = ""                   # AI key entered in this window (memory only)
         self.inv_stop = threading.Event()
         _log_sinks.append(lambda msg: self.lines.append(msg) if msg.strip() else None)
 
@@ -4401,7 +4845,7 @@ class Gui:
         try:
             settings, sections, custom = load_inventory(inv)
         except Fatal as e:
-            out["error"] = "%s (click Edit inventory to fix it)" % e
+            out["error"] = "%s (fix it on the Settings tab)" % e
             return out
         if not self.args.parallel:
             out["parallel"] = int(settings.get("parallel", 4))
@@ -4411,6 +4855,7 @@ class Gui:
         out["ai"] = {"configured": bool(cfg["base_url"] and cfg["model"]), "model": cfg["model"],
                      "base_url": cfg["base_url"], "key_env": cfg["key_env"],
                      "key_from_env": bool(os.environ.get(cfg["key_env"])), "max_rounds": cfg["max_rounds"],
+                     "key_ready": bool(self.ai_key or os.environ.get(cfg["key_env"]) or keychain_get(cfg["base_url"])),
                      "latest_report": os.path.basename(latest) if latest else None}
         out["anonymize"] = anonymize_enabled(self.args, settings)
         for s in sections:
@@ -4506,6 +4951,71 @@ class Gui:
                          daemon=True).start()
         return {"ok": True}
 
+    def api_settings_get(self):
+        path = self.inventory_path()
+        text = INVENTORY_TEMPLATE
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+        model = read_settings_model(text)
+        cfg = ai_settings({"_ai": model["ai"]})
+        types = [{"type": t, "title": c["title"], "default_user": c["user"],
+                  "host_label": c.get("host_label", "Hosts")} for t, c in COMPONENTS.items()]
+        return {"model": model, "meta": {
+            "types": types, "standard_services": STANDARD_MGMT_SERVICES, "keychain": keychain_available(),
+            "key": {"session": bool(self.ai_key), "env": bool(os.environ.get(cfg["key_env"])),
+                    "env_name": cfg["key_env"], "keychain": bool(keychain_get(cfg["base_url"]))},
+            "paths": {"inventory": os.path.abspath(path), "output": os.path.abspath(self.args.output_dir),
+                      "private": os.path.abspath(self.args.private_dir)},
+            "exists": os.path.exists(path)}}
+
+    def api_settings_set(self, body):
+        text = render_settings_model(body.get("model") or {})
+        self.api_inventory_set({"text": text})      # validates, then writes with owner-only permissions
+        return {"ok": True}
+
+    def api_ai_test(self, body):
+        cfg = ai_settings({"_ai": body.get("ai") or {}})
+        key = resolve_ai_key(cfg, str(body.get("key") or ""), self.ai_key)
+        client = make_ai_client(cfg, key)
+        client.timeout = min(client.timeout, 120)
+        t0 = time.time()
+        try:
+            reply = client.chat([{"role": "user", "content": "Reply with the single word OK."}], retries=0)
+        except AiError as e:
+            raise Fatal(str(e))
+        return {"ok": True, "seconds": round(time.time() - t0, 1), "reply": reply[:200], "used_key": bool(key)}
+
+    def api_ai_key(self, body):
+        action, key = body.get("action"), str(body.get("key") or "")
+        cfg = ai_settings({"_ai": {"base_url": body.get("base_url") or ""}})
+        if action == "forget":
+            self.ai_key = ""
+            keychain_delete(cfg["base_url"])
+            return {"ok": True, "key": self._key_state(cfg)}
+        if not key:
+            raise Fatal("enter the key first")
+        self.ai_key = key
+        if action == "save":
+            if not cfg["base_url"]:
+                raise Fatal("enter the endpoint URL first: the key is saved for that address")
+            keychain_set(cfg["base_url"], key)
+        return {"ok": True, "key": self._key_state(cfg)}
+
+    def _key_state(self, cfg):
+        return {"session": bool(self.ai_key), "env": bool(os.environ.get(cfg["key_env"])), "env_name": cfg["key_env"],
+                "keychain": bool(keychain_get(cfg["base_url"]))}
+
+    def api_open_folder(self, body):
+        path = os.path.abspath(self.args.private_dir if body.get("which") == "private" else self.args.output_dir)
+        os.makedirs(path, exist_ok=True)
+        argv = ["open", path] if sys.platform == "darwin" else ["xdg-open", path]
+        try:
+            subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            raise Fatal("could not open the folder; it is %s" % path)
+        return {"ok": True, "path": path}
+
     def api_investigate(self, body):
         """Start an AI investigation in the background."""
         with self.lock:
@@ -4517,7 +5027,9 @@ class Gui:
             cfg = ai_settings(settings)
             if not (cfg["base_url"] and cfg["model"]):
                 raise Fatal("add an [ai] section with base_url and model to the inventory first")
-            key = str(body.get("key") or "") or os.environ.get(cfg["key_env"], "")
+            key = resolve_ai_key(cfg, str(body.get("key") or ""), self.ai_key)
+            if body.get("key"):
+                self.ai_key = str(body["key"])
             problem = str(body.get("problem") or "").strip()
             if not problem:
                 raise Fatal("describe the problem first")
@@ -4703,6 +5215,8 @@ class Gui:
                 return self.api_inventory_get()
             if route == "report":
                 return {"text": self.result["report"] if self.result else ""}
+            if route == "settings":
+                return self.api_settings_get()
         elif method == "POST":
             if route == "inventory":
                 return self.api_inventory_set(body)
@@ -4714,6 +5228,14 @@ class Gui:
                 return self.api_plan_run(body)
             if route == "investigate":
                 return self.api_investigate(body)
+            if route == "settings":
+                return self.api_settings_set(body)
+            if route == "ai_test":
+                return self.api_ai_test(body)
+            if route == "ai_key":
+                return self.api_ai_key(body)
+            if route == "open_folder":
+                return self.api_open_folder(body)
             if route == "answer":
                 return self.api_answer(body)
             if route == "cancel":
@@ -4897,7 +5419,7 @@ def main(argv=None):
                     help="select every component, host and check without menus (passwords are still asked)")
     ap.add_argument("--dry-run", action="store_true", help="show the plan, contact nothing")
     ap.add_argument("--parallel", type=int, help="hosts contacted at the same time (default 4)")
-    ap.add_argument("--connect-timeout", type=int, default=15, help="SSH connect timeout in seconds")
+    ap.add_argument("--connect-timeout", type=int, help="SSH connect timeout in seconds (default 15)")
     ap.add_argument("--timeout-scale", type=float, help="multiply every command timeout by this factor")
     ap.add_argument("--max-lines", type=int,
                     help="output lines kept per check (default: max_lines in the inventory, else 200)")

@@ -45,7 +45,8 @@ python3 vcf_diag.py --gui
 
 A page opens in your browser:
 
-1. Click **Edit inventory** and list your hosts under the matching sections (first time only).
+1. On the **Settings** tab, click **Add group** for each kind of system, enter its hosts, and
+   click **Save settings** (first time only; see "Settings" below).
 2. Tick the groups to check and type the SSH username and password for each. Open
    **Choose hosts and checks** to narrow a group down.
 3. Click **Run diagnostics** and watch the progress. If a login is rejected you are asked again
@@ -61,6 +62,34 @@ the same placeholders.
 The page is served by the script to your own Mac only (`127.0.0.1`, behind a random one-time
 address). Nothing is uploaded anywhere. Leave the Terminal window that started it open; **Quit**
 or Ctrl-C stops it.
+
+### Settings
+
+Everything is set on the **Settings** tab of the window; you never need to edit a file. The tab
+writes `inventory.ini` for you (with owner-only permissions), and the terminal commands read the
+same file.
+
+- **Systems to check:** one card per group of systems. Pick the type, give it an optional label,
+  list the hosts one per line, and set the SSH user, port, sudo and `su` behaviour. Cards show the
+  options that type needs: kubeconfig and kubectl for Kubernetes nodes; SSO user and certificate
+  options for vCenter; for the VCF management cluster the control-plane IPs, whether to log in to
+  workers, and a table of management service endpoints with a button that adds the standard VCF
+  service names.
+- **AI for investigations:** endpoint URL, model, key header, rounds, and size and timeout limits.
+  **Test connection** checks the endpoint and key before you save. The API key can be used for the
+  current session only, or saved in the **macOS Keychain** for that endpoint (the tool hands it to
+  macOS's `security` command), and **Forget the key** removes it. It is never written to the
+  settings file.
+- **Reports and privacy:** anonymization on or off, output lines kept per check, words and domains
+  to hide, version numbers and namespaces to keep readable.
+- **Connections:** hosts at once, SSH connect timeout, command time limit, and whether to accept
+  only hosts whose SSH key is already known.
+- **Your own read-only commands:** extra checks per type of system.
+- **Files:** where settings, reports and the private mapping live, with buttons that open the
+  folders, and an advanced plain-text editor for the settings file.
+
+Host passwords are never stored anywhere: you type them each time you run. Saving from the Settings
+tab rewrites the file in a standard layout, so comments added by hand are not kept.
 
 ### Quick start (terminal)
 
@@ -286,8 +315,9 @@ base_url = https://ai.example.internal/v1
 model    = your-model-name
 ```
 
-The API key is never written to a file: set it in the environment, or type it when asked (in
-the window, in the **AI API key** field).
+In the window, fill these in on the **Settings** tab instead. The API key is never written to the
+settings file: enter it on the Settings tab (for the session, or saved in the macOS Keychain), set
+it in the environment, or type it when asked.
 
 ```bash
 export VCF_DIAG_AI_KEY='...'

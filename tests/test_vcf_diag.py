@@ -866,6 +866,77 @@ class Investigations(unittest.TestCase):
         self.assertIn("left out by the collector", text)
 
 
+class SettingsModel(unittest.TestCase):
+    def test_round_trip_and_inventory_compatibility(self):
+        model = v.read_settings_model(v.INVENTORY_TEMPLATE)
+        self.assertEqual(model["settings"]["anonymize"], "yes")
+        self.assertTrue(any(g["type"] == "vcfmgmt" for g in model["groups"]))
+        model["settings"]["anonymize"] = "no"
+        model["ai"].update(base_url="https://ai.example.internal/v1", model="m1")
+        model["groups"] = [{"type": "vcfmgmt", "label": "mgmt", "hosts": ["10.9.0.11", "10.9.0.12"], "ssh_workers": "yes",
+                            "endpoints": [{"service": "VCF Operations", "endpoint": "ops01"},
+                                          {"service": "Telemetry", "endpoint": ""}]},
+                           {"type": "vcenter", "label": "", "hosts": ["vc01.example.internal"], "sso_user": "a@vsphere.local",
+                            "tls_verify": "no"}]
+        model["commands"] = [{"type": "esxi", "label": "Advanced", "command": "esxcli system settings advanced list -d"}]
+        text = v.render_settings_model(model)
+        again = v.read_settings_model(text)
+        self.assertEqual(again["groups"][0]["endpoints"][1], {"service": "Telemetry", "endpoint": ""})  # kept, not dropped
+        self.assertEqual(v.render_settings_model(again), text)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "i.ini")
+            with open(path, "w") as fh:
+                fh.write(text)
+            settings, sections, custom = v.load_inventory(path)
+        self.assertEqual(settings["anonymize"], "no")
+        self.assertEqual(v.ai_settings(settings)["model"], "m1")
+        self.assertEqual(sections[0]["hosts"], ["10.9.0.11", "10.9.0.12"])
+        self.assertEqual(sections[0]["endpoints"], {"ops01": ["VCF Operations"]})   # empty row ignored
+        self.assertFalse(sections[1]["tls_verify"])
+        self.assertIn("esxi", custom)
+
+    def test_bad_input_is_refused_with_a_message(self):
+        base = {"settings": {}, "ai": {}, "commands": []}
+        for groups, msg in (([{"type": "esxi", "label": "bad label!", "hosts": []}], "may only contain"),
+                            ([{"type": "esxi", "label": "", "hosts": ["host one"]}], "not a host name"),
+                            ([{"type": "nope", "label": "", "hosts": []}], "unknown component type"),
+                            ([{"type": "vcfmgmt", "label": "", "hosts": [], "endpoints": [
+                                {"service": "A", "endpoint": "x"}, {"service": "a", "endpoint": "y"}]}], "listed twice")):
+            with self.assertRaises(v.Fatal) as e:
+                v.render_settings_model(dict(base, groups=groups))
+            self.assertIn(msg, str(e.exception))
+
+    def test_keychain_through_the_security_command(self):
+        import stat
+        with tempfile.TemporaryDirectory() as d:
+            store = os.path.join(d, "kc")
+            script = os.path.join(d, "security")
+            with open(script, "w") as fh:
+                fh.write("#!/bin/sh\ncmd=$1; shift; a=; w=\nwhile [ $# -gt 0 ]; do case $1 in -a) a=$2; shift;; "
+                         "-w) if [ $# -ge 2 ]; then w=$2; shift; fi;; esac; shift; done\n"
+                         "case $cmd in find-generic-password) grep -F \"$a|\" %s 2>/dev/null | cut -d'|' -f2 | grep . || exit 44;;\n"
+                         "add-generic-password) printf '%%s|%%s\\n' \"$a\" \"$w\" > %s;;\n"
+                         "delete-generic-password) : > %s;; esac\n" % (store, store, store))
+            os.chmod(script, stat.S_IRWXU)
+            old_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = d + os.pathsep + old_path
+            os.environ["VCFDIAG_FAKE_KEYCHAIN"] = "1"
+            try:
+                self.assertTrue(v.keychain_available())
+                self.assertEqual(v.keychain_get("https://ai/v1"), "")
+                v.keychain_set("https://ai/v1", "sk-123")
+                self.assertEqual(v.keychain_get("https://ai/v1"), "sk-123")
+                cfg = v.ai_settings({"_ai": {"base_url": "https://ai/v1"}})
+                self.assertEqual(v.resolve_ai_key(cfg), "sk-123")
+                self.assertEqual(v.resolve_ai_key(cfg, session="sk-session"), "sk-session")
+                self.assertEqual(v.resolve_ai_key(cfg, typed="sk-typed", session="sk-session"), "sk-typed")
+                v.keychain_delete("https://ai/v1")
+                self.assertEqual(v.keychain_get("https://ai/v1"), "")
+            finally:
+                os.environ["PATH"] = old_path
+                del os.environ["VCFDIAG_FAKE_KEYCHAIN"]
+
+
 class GuiApi(unittest.TestCase):
     """The browser GUI's local web API, without contacting any host."""
 
@@ -972,6 +1043,35 @@ class GuiApi(unittest.TestCase):
         code, out = self.call("api/investigate", {"problem": "  "})
         self.assertEqual((code, out["error"]), (400, "describe the problem first"))
         self.assertEqual(self.call("api/status?since=0")[1]["state"], "idle")
+
+    def test_settings_api_and_ai_test(self):
+        code, r = self.call("api/settings")
+        self.assertEqual(code, 200)
+        self.assertFalse(r["meta"]["exists"])
+        self.assertIn("vcfmgmt", [t["type"] for t in r["meta"]["types"]])
+        model = r["model"]
+        model["groups"] = [{"type": "esxi", "label": "mgmt", "hosts": ["esx01.corp.example-widgets.com"]}]
+        srv, base, seen = fake_ai("esxi-mgmt-01")
+        try:
+            model["ai"].update(base_url=base, model="m")
+            code, out = self.call("api/ai_test", {"ai": model["ai"], "key": "sk-1"})
+            self.assertEqual(code, 200)
+            self.assertTrue(out["used_key"])
+            self.assertEqual(seen[-1]["auth"], "Bearer sk-1")
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        self.assertEqual(self.call("api/settings", {"model": model})[0], 200)
+        self.assertEqual(os.stat(self.inv).st_mode & 0o777, 0o600)
+        code, st = self.call("api/state")
+        self.assertEqual([s["name"] for s in st["sections"]], ["esxi:mgmt"])
+        self.assertTrue(st["ai"]["configured"])
+        model["groups"][0]["label"] = "bad label"
+        code, out = self.call("api/settings", {"model": model})
+        self.assertEqual(code, 400)
+        self.assertIn("may only contain", out["error"])
+        code, out = self.call("api/ai_key", {"action": "session", "key": "sk-2", "base_url": base})
+        self.assertTrue(out["key"]["session"])
 
     def test_anonymize_and_translate_back(self):
         self.call("api/inventory", {"text": "[esxi]\nhosts = esx01.corp.example-widgets.com\n"})
