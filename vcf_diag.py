@@ -57,7 +57,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
-VERSION = "1.10.0"
+VERSION = "1.10.1"
 
 # ----------------------------------------------------------------------------
 # Diagnostic catalog
@@ -3502,10 +3502,10 @@ class AiClient:
         self.model, self.key = model, key
         self.auth = "api-key" if self.provider == "azure" else (auth_header or "bearer").lower()
         self.timeout, self.max_tokens = timeout, max_tokens
-        handlers = [] if use_proxy else [urllib.request.ProxyHandler({})]
-        if self.base.startswith("https:"):
-            handlers.append(urllib.request.HTTPSHandler(context=tls_context(verify, ca_file)))
-        self.opener = urllib.request.build_opener(*handlers)
+        tls = [urllib.request.HTTPSHandler(context=tls_context(verify, ca_file))] if self.base.startswith("https:") else []
+        self.direct = urllib.request.build_opener(urllib.request.ProxyHandler({}), *tls)
+        self.opener = urllib.request.build_opener(*tls) if use_proxy else self.direct
+        self.note = ""          # set when the tool had to go around the proxy
 
     # ---- transport ---------------------------------------------------------
     def _headers(self, native=False):
@@ -3536,6 +3536,9 @@ class AiClient:
                                   % (url, text[:200]))
             except urllib.error.HTTPError as e:
                 detail = e.read().decode("utf-8", "replace")[:500]
+                if e.code in (407, 502, 503, 504) and self._proxy_applies(url) and \
+                        self._go_direct("the proxy answered HTTP %d" % e.code):
+                    return self._request(method, url, body, native, retries, timeout)
                 if e.code in (429, 500, 502, 503, 504) and attempt < retries:
                     time.sleep(5 * (attempt + 1))
                     continue
@@ -3552,6 +3555,8 @@ class AiClient:
                                   "pick one. Detail: %s" % (self.model, detail))
                 raise AiError("the AI endpoint returned HTTP %d: %s" % (e.code, detail))
             except urllib.error.URLError as e:
+                if "tunnel connection failed" in str(e.reason).lower() and self._go_direct(str(e.reason)):
+                    return self._request(method, url, body, native, retries, timeout)
                 if isinstance(e.reason, ssl.SSLCertVerificationError):
                     raise AiError("the AI server's certificate is not trusted (%s). Give its CA file under More "
                                   "AI options, or turn off the certificate check" % e.reason.verify_message)
@@ -3561,9 +3566,28 @@ class AiClient:
                 if attempt < retries:
                     time.sleep(5 * (attempt + 1))
                     continue
+                if self.note:
+                    raise AiError("cannot reach the AI endpoint at %s. This Mac's proxy refused it (%s), and a direct "
+                                  "connection failed too (%s). Check that this Mac can reach the AI server (network, "
+                                  "VPN), or ask for the proxy to allow it" % (url, self.proxy_why, e.reason))
                 raise AiError("cannot reach the AI endpoint at %s: %s" % (url, e.reason))
             except (OSError, ValueError) as e:
                 raise AiError("bad answer from the AI endpoint: %s" % e)
+
+    def _proxy_applies(self, url):
+        if self.opener is self.direct:
+            return False
+        parts = urllib.parse.urlsplit(url)
+        return bool(urllib.request.getproxies().get(parts.scheme)) and not urllib.request.proxy_bypass(parts.hostname or "")
+
+    def _go_direct(self, why):
+        """The Mac's proxy cannot (or may not) reach this server: use a direct connection from now on."""
+        if self.opener is self.direct:
+            return False
+        self.opener = self.direct
+        self.proxy_why = why
+        self.note = "the proxy refused (%s), so the tool connected directly" % why
+        return True
 
     # ---- chat --------------------------------------------------------------
     def chat(self, messages, retries=2):
@@ -4890,7 +4914,8 @@ $("#setAiTest").onclick = async () => {
   try {
     const r = await api("ai_test", { ai: aiForm(), key: $("#setKey").value });
     $("#setAiMsg").textContent = "Connected through the " + r.flavor + ": the AI answered in " + r.seconds + " s (" +
-      (r.reply || "empty reply").slice(0, 60) + ")." + (r.used_key ? "" : " No key was sent.") + " Click Save settings to keep it.";
+      (r.reply || "empty reply").slice(0, 60) + ")." + (r.used_key ? "" : " No key was sent.") +
+      (r.note ? " Note: " + r.note + "; you can untick the proxy option under More AI options." : "") + " Click Save settings to keep it.";
   } catch (e) { $("#setAiMsg").textContent = e.message; }
 };
 async function keyAction(action) {
@@ -5394,6 +5419,7 @@ class Gui:
         except AiError as e:
             raise Fatal(str(e))
         return {"ok": True, "seconds": round(time.time() - t0, 1), "reply": reply[:200], "used_key": bool(key),
+                "note": client.note,
                 "url": client.url if client.flavor == "openai" else client.native + "/query",
                 "flavor": "OpenAI-compatible API" if client.flavor == "openai" else "native Ask Sage API"}
 

@@ -1160,6 +1160,50 @@ class AiEndpoints(unittest.TestCase):
             srv.server_close()
 
 
+class ProxyFallback(unittest.TestCase):
+    def test_refusing_proxy_is_bypassed(self):
+        """A proxy that answers CONNECT with 503 (like a corporate proxy that cannot reach an
+        internal server): the client must retry directly and say so."""
+        import http.server
+        import socketserver
+        import threading
+
+        class Proxy(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_CONNECT(self):
+                self.send_response(503, "Service Unavailable")
+                self.end_headers()
+
+            do_POST = do_GET = do_CONNECT
+
+        proxy = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Proxy)
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        srv, base, seen = fake_asksage(openai_compatible=True)
+        saved = {k: os.environ.get(k) for k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "no_proxy", "NO_PROXY")}
+        try:
+            for k in saved:
+                os.environ.pop(k, None)
+            os.environ["http_proxy"] = os.environ["HTTP_PROXY"] = "http://127.0.0.1:%d" % proxy.server_address[1]
+            c = v.AiClient(base, "gpt-4o", "sk-sage", provider="asksage")
+            self.assertEqual(c.chat([{"role": "user", "content": "x"}], retries=0), "OK")
+            self.assertIn("proxy refused", c.note)
+            c2 = v.AiClient(base, "gpt-4o", "sk-sage", provider="asksage", use_proxy=False)
+            self.assertEqual(c2.chat([{"role": "user", "content": "x"}], retries=0), "OK")
+            self.assertEqual(c2.note, "")
+        finally:
+            for k, val in saved.items():
+                if val is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = val
+            srv.shutdown()
+            srv.server_close()
+            proxy.shutdown()
+            proxy.server_close()
+
+
 class GuiApi(unittest.TestCase):
     """The browser GUI's local web API, without contacting any host."""
 

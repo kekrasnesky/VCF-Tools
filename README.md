@@ -383,6 +383,10 @@ does not offer it, Ask Sage's own API (`/server/query`, with the key in the `x-a
 header). The test tells you which one answered. If your server uses a different address for the
 API, enter the full URL ending in `/v1` instead of the server name.
 
+If your Mac uses a web proxy that cannot reach the AI server (the error says "Tunnel connection
+failed: 503"), the tool retries without the proxy automatically and says so in the test result.
+To skip the proxy from the start, untick **Use this Mac's proxy settings** under **More AI options**.
+
 Certificates your Mac trusts, such as organisation or DoD root certificates installed by your IT
 department, are trusted automatically for the AI, vCenter and NSX connections. If the test still
 says the certificate is not trusted, give the CA file under **More AI options**.
