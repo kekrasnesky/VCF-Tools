@@ -1051,6 +1051,115 @@ class NsxAndOpsNet(unittest.TestCase):
         self.assertEqual(sections[1]["user"], "support")
 
 
+def fake_asksage(openai_compatible):
+    """Stand-in Ask Sage server: native API always, OpenAI-compatible API optionally."""
+    import http.server
+    import json as _json
+    import threading
+    seen = []
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def send(self, code, obj):
+            data = _json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def handle_any(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            body = _json.loads(self.rfile.read(n)) if n else None
+            seen.append((self.command, self.path, dict(self.headers), body))
+            if self.path.startswith("/server/openai/v1"):
+                if not openai_compatible:
+                    return self.send(404, {"error": "not found"})
+                if self.headers.get("Authorization") != "Bearer sk-sage":
+                    return self.send(401, {})
+                if self.path.endswith("/models"):
+                    return self.send(200, {"data": [{"id": "gpt-4o"}, {"id": "claude-3-5-sonnet"}]})
+                return self.send(200, {"choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}]})
+            if not self.path.startswith("/server/"):
+                return self.send(404, {"error": "not found"})
+            if self.headers.get("x-access-tokens") != "sk-sage":
+                return self.send(401, {})
+            if self.path == "/server/get-models":
+                return self.send(200, {"response": ["gpt-4o-gov", "aws-bedrock-claude-35-sonnet-gov"], "status": 200})
+            if self.path == "/server/query":
+                return self.send(200, {"message": "OK from native", "response": "OK", "status": 200})
+            self.send(404, {})
+
+        do_GET = do_POST = handle_any
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, "http://127.0.0.1:%d" % srv.server_address[1], seen
+
+
+class AiEndpoints(unittest.TestCase):
+    def test_addresses_people_type(self):
+        n = v.normalize_ai_url
+        self.assertEqual(n("capra1.flankspeed.us.local.mil", "asksage"),
+                         "https://capra1.flankspeed.us.local.mil/server/openai/v1")
+        self.assertEqual(n("https://capra1.example.mil/", "asksage"), "https://capra1.example.mil/server/openai/v1")
+        self.assertEqual(n("ai.example.internal/v1/chat/completions"), "https://ai.example.internal/v1")
+        self.assertEqual(n("http://10.1.1.5:8000/v1"), "http://10.1.1.5:8000/v1")
+        self.assertEqual(n("https://x.openai.azure.com/openai/deployments/d?api-version=2024-06-01", "azure"),
+                         "https://x.openai.azure.com/openai/deployments/d?api-version=2024-06-01")
+        for bad in ("ftp://x", "https://", "::"):
+            with self.assertRaises(v.AiError):
+                n(bad)
+        self.assertEqual(v.AiClient("capra1.example.mil", "m", "k", provider="asksage").url,
+                         "https://capra1.example.mil/server/openai/v1/chat/completions")
+
+    def test_asksage_native_only(self):
+        srv, base, seen = fake_asksage(openai_compatible=False)
+        try:
+            host = base.replace("http://", "http://")
+            c = v.AiClient(host, "gpt-4o-gov", "sk-sage", provider="asksage")
+            self.assertEqual(c.list_models(), ["aws-bedrock-claude-35-sonnet-gov", "gpt-4o-gov"])
+            reply = c.chat([{"role": "system", "content": "SYSTEM RULES"}, {"role": "user", "content": "the problem"}],
+                           retries=0)
+            self.assertEqual(reply, "OK from native")
+            self.assertEqual(c.flavor, "native")              # remembered for the rest of the investigation
+            q = [x for x in seen if x[1] == "/server/query"][-1]
+            self.assertEqual({k.lower(): v_ for k, v_ in q[2].items()}.get("x-access-tokens"), "sk-sage")
+            self.assertEqual(q[3]["model"], "gpt-4o-gov")
+            self.assertIn("SYSTEM RULES", q[3]["message"])
+            self.assertIn("the problem", q[3]["message"])
+            with self.assertRaises(v.AiError) as e:
+                v.AiClient(host, "m", "wrong", provider="asksage").chat([{"role": "user", "content": "x"}], retries=0)
+            self.assertIn("rejected the API key", str(e.exception))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_asksage_openai_compatible(self):
+        srv, base, seen = fake_asksage(openai_compatible=True)
+        try:
+            c = v.AiClient(base, "gpt-4o", "sk-sage", provider="asksage")
+            self.assertEqual(c.list_models(), ["claude-3-5-sonnet", "gpt-4o"])
+            self.assertEqual(c.chat([{"role": "user", "content": "x"}], retries=0), "OK")
+            self.assertEqual(c.flavor, "openai")
+            self.assertFalse(any(p == "/server/query" for _, p, _, _ in seen))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_plain_openai_404_is_explained(self):
+        srv, base, seen = fake_asksage(openai_compatible=False)
+        try:
+            with self.assertRaises(v.AiError) as e:
+                v.AiClient(base + "/v1", "m", "k").chat([{"role": "user", "content": "x"}], retries=0)
+            self.assertIn("not found (HTTP 404)", str(e.exception))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+
 class GuiApi(unittest.TestCase):
     """The browser GUI's local web API, without contacting any host."""
 
@@ -1186,6 +1295,24 @@ class GuiApi(unittest.TestCase):
         self.assertIn("may only contain", out["error"])
         code, out = self.call("api/ai_key", {"action": "session", "key": "sk-2", "base_url": base})
         self.assertTrue(out["key"]["session"])
+
+    def test_ai_models_and_bad_address_in_the_window(self):
+        srv, base, seen = fake_asksage(openai_compatible=False)
+        try:
+            code, out = self.call("api/ai_models", {"ai": {"provider": "asksage", "base_url": base}, "key": "sk-sage"})
+            self.assertEqual(code, 200)
+            self.assertIn("gpt-4o-gov", out["models"])
+            code, out = self.call("api/ai_test", {"ai": {"provider": "asksage", "base_url": base, "model": "gpt-4o-gov"},
+                                                  "key": "sk-sage"})
+            self.assertEqual((code, out["flavor"]), (200, "native Ask Sage API"))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        code, out = self.call("api/ai_test", {"ai": {"base_url": "ftp://nope", "model": "m"}})
+        self.assertEqual(code, 400)
+        self.assertIn("not a valid endpoint address", out["error"])
+        code, out = self.call("api/ai_test", {"ai": {"base_url": "capra1.example.mil", "provider": "asksage"}})
+        self.assertIn("choose a model first", out["error"])
 
     def test_anonymize_and_translate_back(self):
         self.call("api/inventory", {"text": "[esxi]\nhosts = esx01.corp.example-widgets.com\n"})

@@ -57,7 +57,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
-VERSION = "1.9.0"
+VERSION = "1.10.0"
 
 # ----------------------------------------------------------------------------
 # Diagnostic catalog
@@ -637,6 +637,7 @@ hosts =
 [ai]
 # base_url    = https://ai.example.internal/v1     (the tool adds /chat/completions)
 # model       = your-model-name
+# provider    = openai                 openai, asksage (CAPRA and other Ask Sage servers) or azure
 # auth_header = bearer                 or api-key (Azure OpenAI style)
 # ca_file     = ~/internal-ca.pem      trust an internal CA; tls_verify = no skips the check
 # use_proxy   = yes                    use the system proxy settings to reach it
@@ -1758,12 +1759,10 @@ class VcApi:
         self.user, self.password = user, password
         self.timeout = timeout
         self.token = None
-        if verify:
-            ctx = ssl.create_default_context(cafile=ca_file) if ca_file else ssl.create_default_context()
-        else:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
+        try:
+            ctx = tls_context(verify, ca_file)
+        except AiError as e:
+            raise VcApiError(str(e))
         # vCenter is reached directly, never through a proxy from the environment.
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
                                                   urllib.request.HTTPSHandler(context=ctx))
@@ -2218,7 +2217,7 @@ def load_inventory(path):
 SETTINGS_FIELDS = [("anonymize", "yes"), ("max_lines", "200"), ("parallel", "4"), ("timeout", "30"),
                    ("connect_timeout", "15"), ("strict_host_keys", "no"), ("scrub_terms", ""),
                    ("extra_domains", ""), ("keep_literals", "9.1.1.0"), ("keep_namespaces", "")]
-AI_FIELDS = [("base_url", ""), ("model", ""), ("auth_header", "bearer"), ("max_rounds", "10"), ("max_tokens", ""),
+AI_FIELDS = [("provider", "openai"), ("base_url", ""), ("model", ""), ("auth_header", "bearer"), ("max_rounds", "10"), ("max_tokens", ""),
              ("timeout", "600"), ("max_report_chars", "150000"), ("max_context_chars", "400000"), ("ca_file", ""),
              ("tls_verify", "yes"), ("use_proxy", "yes"), ("key_env", "")]
 GROUP_FIELDS = ["user", "port", "sudo", "escalate", "kubeconfig", "kubectl", "ssh_workers", "sso_user", "ca_file",
@@ -3254,7 +3253,7 @@ def _clamp(value, default, lo, hi):
         return default
 
 
-def prepare_plan(args, text):
+def prepare_plan(args, text, require_mapping=True):
     """Translate an analyst reply and sort its steps into: read-only diagnostics the tool
     may run, and everything else, which is only shown for the person to apply by hand."""
     inv = find_inventory(args)
@@ -3266,7 +3265,7 @@ def prepare_plan(args, text):
     # exists, so that a reply written against those placeholders still finds its hosts.
     mapping = Mapping(os.path.join(args.private_dir, "mapping.json"))
     dec = Decoder(mapping)
-    if not plain and not dec.rev:
+    if require_mapping and not plain and not dec.rev:
         die("no mapping found in %s - run a collection first" % args.private_dir)
     known, by_addr = {}, {}
     for s in sections:
@@ -3412,71 +3411,180 @@ def strip_think(text):
     return THINK_RX.sub("", text or "").strip()
 
 
+_MAC_TRUST = {}
+
+
+def mac_trusted_pem():
+    """Certificates this Mac trusts (system roots, System and login keychains), as PEM text.
+    Python does not use the macOS trust store by itself, so certificates an organisation
+    installed (for example DoD roots) would otherwise be unknown to it."""
+    if "pem" in _MAC_TRUST:
+        return _MAC_TRUST["pem"]
+    pem = ""
+    if sys.platform == "darwin" and shutil.which("security"):
+        for args in (["/System/Library/Keychains/SystemRootCertificates.keychain"],
+                     ["/Library/Keychains/System.keychain"], []):
+            try:
+                p = subprocess.run(["security", "find-certificate", "-a", "-p"] + args, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30)
+                pem += p.stdout.decode("ascii", "ignore")
+            except (OSError, subprocess.SubprocessError):
+                pass
+    _MAC_TRUST["pem"] = pem
+    return pem
+
+
+def tls_context(verify=True, ca_file=None):
+    """TLS settings shared by the AI, vCenter and NSX clients."""
+    ctx = ssl.create_default_context()
+    if not verify:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+    pem = mac_trusted_pem()
+    if pem:
+        try:
+            ctx.load_verify_locations(cadata=pem)
+        except (ssl.SSLError, ValueError):
+            pass
+    if ca_file:
+        try:
+            ctx.load_verify_locations(cafile=ca_file)
+        except (OSError, ssl.SSLError) as e:
+            raise AiError("cannot use the CA file %s: %s" % (ca_file, e))
+    return ctx
+
+
+AI_PROVIDERS = {
+    "openai": "OpenAI-compatible endpoint (most AI gateways, vLLM, Ollama, LM Studio)",
+    "asksage": "Ask Sage (including CAPRA and other government Ask Sage servers)",
+    "azure": "Azure OpenAI",
+}
+
+
+def normalize_ai_url(base_url, provider="openai"):
+    """Turn what a person types (a host name, a URL with or without a path) into the API base URL."""
+    u = (base_url or "").strip().rstrip("/")
+    if not u:
+        return ""
+    if "://" not in u:
+        u = "https://" + u
+    parts = urllib.parse.urlsplit(u)
+    host = parts.hostname or ""
+    if parts.scheme not in ("http", "https") or not host or host in ("http", "https") or \
+            not re.fullmatch(r"[A-Za-z0-9._-]+|[0-9A-Fa-f:.]+", host):
+        raise AiError("'%s' is not a valid endpoint address. Enter a host name such as ai.example.mil, "
+                      "or a URL such as https://ai.example.mil/v1" % base_url)
+    path = parts.path.rstrip("/")
+    for suffix in ("/chat/completions", "/models"):
+        if path.endswith(suffix):
+            path = path[:-len(suffix)]
+    if provider == "asksage" and path in ("", "/server", "/server/openai"):
+        path = "/server/openai/v1"
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, path, parts.query, ""))
+
+
 class AiClient:
-    """Minimal client for an OpenAI-compatible /chat/completions endpoint (stdlib only).
-    The API key is held in memory only and sent in one header."""
+    """Minimal chat client (stdlib only) for OpenAI-compatible endpoints, Azure OpenAI and
+    Ask Sage. For Ask Sage the OpenAI-compatible API is tried first and the native Ask Sage
+    API is used when that is not offered. The API key is held in memory only."""
 
     def __init__(self, base_url, model, key, auth_header="bearer", verify=True, ca_file=None,
-                 timeout=600, max_tokens=None, use_proxy=True):
-        if not base_url or not model:
-            raise AiError("the [ai] section of the inventory needs base_url and model")
-        self.url = base_url.rstrip("/")
-        if not self.url.endswith("/chat/completions"):
-            self.url += "/chat/completions"
-        self.model, self.key, self.auth = model, key, auth_header.lower()
+                 timeout=600, max_tokens=None, use_proxy=True, provider="openai"):
+        self.provider = provider if provider in AI_PROVIDERS else "openai"
+        self.base = normalize_ai_url(base_url, self.provider)
+        if not self.base:
+            raise AiError("enter the AI endpoint address on the Settings tab")
+        self.url = self.base + "/chat/completions"
+        parts = urllib.parse.urlsplit(self.base)
+        self.native = "%s://%s/server" % (parts.scheme, parts.netloc)     # Ask Sage native API
+        self.flavor = "native" if (self.provider == "asksage" and not parts.path.endswith("/v1")) else "openai"
+        self.model, self.key = model, key
+        self.auth = "api-key" if self.provider == "azure" else (auth_header or "bearer").lower()
         self.timeout, self.max_tokens = timeout, max_tokens
         handlers = [] if use_proxy else [urllib.request.ProxyHandler({})]
-        if self.url.startswith("https:"):
-            if verify:
-                ctx = ssl.create_default_context(cafile=ca_file) if ca_file else ssl.create_default_context()
-            else:
-                ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-            handlers.append(urllib.request.HTTPSHandler(context=ctx))
+        if self.base.startswith("https:"):
+            handlers.append(urllib.request.HTTPSHandler(context=tls_context(verify, ca_file)))
         self.opener = urllib.request.build_opener(*handlers)
 
-    def chat(self, messages, retries=2):
-        body = {"model": self.model, "messages": messages}
-        if self.max_tokens:
-            body["max_tokens"] = self.max_tokens
-        data = json.dumps(body).encode("utf-8")
-        headers = {"Content-Type": "application/json"}
+    # ---- transport ---------------------------------------------------------
+    def _headers(self, native=False):
+        h = {"Content-Type": "application/json", "Accept": "application/json"}
         if self.key:
-            if self.auth == "api-key":
-                headers["api-key"] = self.key
+            if native:
+                h["x-access-tokens"] = self.key
+            elif self.auth == "api-key":
+                h["api-key"] = self.key
             else:
-                headers["Authorization"] = "Bearer " + self.key
+                h["Authorization"] = "Bearer " + self.key
+        return h
+
+    def _request(self, method, url, body=None, native=False, retries=0, timeout=None):
+        data = json.dumps(body).encode("utf-8") if body is not None else None
         for attempt in range(retries + 1):
-            req = urllib.request.Request(self.url, data=data, method="POST", headers=headers)
             try:
-                with self.opener.open(req, timeout=self.timeout) as r:
-                    reply = json.loads(r.read().decode("utf-8", "replace"))
-                break
+                req = urllib.request.Request(url, data=data, method=method, headers=self._headers(native))
+            except ValueError:
+                raise AiError("'%s' is not a valid endpoint address" % url)
+            try:
+                with self.opener.open(req, timeout=timeout or self.timeout) as r:
+                    text = r.read().decode("utf-8", "replace")
+                try:
+                    return json.loads(text)
+                except ValueError:
+                    raise AiError("the endpoint at %s did not answer with JSON (is the address right?): %s"
+                                  % (url, text[:200]))
             except urllib.error.HTTPError as e:
                 detail = e.read().decode("utf-8", "replace")[:500]
                 if e.code in (429, 500, 502, 503, 504) and attempt < retries:
                     time.sleep(5 * (attempt + 1))
                     continue
                 if e.code in (401, 403):
-                    raise AiError("the AI endpoint rejected the API key (HTTP %d)" % e.code)
-                if e.code == 404:
-                    raise AiError("the AI endpoint was not found (HTTP 404) at %s - check base_url and model"
-                                  % self.url)
-                if e.code == 400 and re.search(r"(?i)context|token|too long|maximum", detail):
-                    raise AiError("the AI rejected the request as too long (HTTP 400). Lower max_report_chars "
-                                  "and max_context_chars in the [ai] section. Detail: %s" % detail)
+                    raise AiError("the AI endpoint rejected the API key (HTTP %d). Check the key, and that it "
+                                  "was created for this server" % e.code)
+                if e.code in (404, 405):
+                    raise _NotHere(url, e.code)
+                if e.code == 400 and re.search(r"(?i)context|too long|maximum|token limit", detail):
+                    raise AiError("the AI rejected the request as too long (HTTP 400). Lower the report and "
+                                  "conversation sizes under More AI options. Detail: %s" % detail)
+                if e.code == 400 and re.search(r"(?i)model", detail):
+                    raise AiError("the AI does not accept the model name '%s' (HTTP 400). Use Find models to "
+                                  "pick one. Detail: %s" % (self.model, detail))
                 raise AiError("the AI endpoint returned HTTP %d: %s" % (e.code, detail))
             except urllib.error.URLError as e:
                 if isinstance(e.reason, ssl.SSLCertVerificationError):
-                    raise AiError("the AI endpoint's certificate is not trusted (%s). Set ca_file in the [ai] "
-                                  "section, or tls_verify = no" % e.reason.verify_message)
+                    raise AiError("the AI server's certificate is not trusted (%s). Give its CA file under More "
+                                  "AI options, or turn off the certificate check" % e.reason.verify_message)
+                if "WRONG_VERSION_NUMBER" in str(e.reason):
+                    raise AiError("the server at %s does not speak HTTPS on that port; if it really is plain HTTP, "
+                                  "write http:// in front of the address" % url)
                 if attempt < retries:
                     time.sleep(5 * (attempt + 1))
                     continue
-                raise AiError("cannot reach the AI endpoint: %s" % e.reason)
+                raise AiError("cannot reach the AI endpoint at %s: %s" % (url, e.reason))
             except (OSError, ValueError) as e:
                 raise AiError("bad answer from the AI endpoint: %s" % e)
+
+    # ---- chat --------------------------------------------------------------
+    def chat(self, messages, retries=2):
+        if self.flavor == "openai":
+            try:
+                return self._chat_openai(messages, retries)
+            except _NotHere as e:
+                if self.provider != "asksage":
+                    raise AiError("the AI endpoint was not found (HTTP %d) at %s - check the address" % (e.code, e.url))
+                self.flavor = "native"           # this Ask Sage server has no OpenAI-compatible API
+        try:
+            return self._chat_native(messages, retries)
+        except _NotHere as e:
+            raise AiError("no Ask Sage API answered at %s or %s (HTTP %d) - check the server address"
+                          % (self.url, self.native + "/query", e.code))
+
+    def _chat_openai(self, messages, retries):
+        body = {"model": self.model, "messages": messages}
+        if self.max_tokens:
+            body["max_tokens"] = self.max_tokens
+        reply = self._request("POST", self.url, body, retries=retries)
         try:
             choice = reply["choices"][0]
             content = choice["message"].get("content") or ""
@@ -3488,6 +3596,56 @@ class AiClient:
             content += "\n\n[The AI's reply was cut off at its output limit.]"
         return strip_think(content)
 
+    def _chat_native(self, messages, retries):
+        """Ask Sage /server/query: the conversation is sent as one message text."""
+        system = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
+        turns = []
+        for m in messages:
+            if m["role"] != "system":
+                turns.append("%s:\n%s" % ("ADMINISTRATOR AND COLLECTOR" if m["role"] == "user" else "YOU (EARLIER REPLY)",
+                                          m["content"]))
+        text = (system + "\n\n" if system else "") + "CONVERSATION SO FAR:\n\n" + "\n\n".join(turns) + \
+            "\n\nWrite your next reply now."
+        body = {"message": text, "model": self.model, "temperature": 0}
+        reply = self._request("POST", self.native + "/query", body, native=True, retries=retries)
+        for k in ("message", "answer", "text", "response"):
+            v = reply.get(k) if isinstance(reply, dict) else None
+            if isinstance(v, str) and v.strip() and v.strip().upper() != "OK":
+                return strip_think(v)
+        raise AiError("unexpected answer from Ask Sage: %s" % json.dumps(reply)[:300])
+
+    # ---- models ------------------------------------------------------------
+    def list_models(self):
+        """Model names the endpoint offers (OpenAI /models, or Ask Sage /server/get-models)."""
+        names, errors = [], []
+        if self.flavor == "openai" or self.provider != "asksage":
+            try:
+                r = self._request("GET", self.base + "/models", timeout=60)
+                data = r.get("data") if isinstance(r, dict) else r
+                names = [m.get("id") if isinstance(m, dict) else m for m in (data or [])]
+            except (_NotHere, AiError) as e:
+                errors.append(str(e))
+        if not names and self.provider == "asksage":
+            try:
+                r = self._request("POST", self.native + "/get-models", {}, native=True, timeout=60)
+                data = r.get("response") or r.get("models") or r.get("data") if isinstance(r, dict) else r
+                if isinstance(data, dict):
+                    data = data.get("models") or data.get("data") or list(data)
+                names = [m.get("id") or m.get("name") if isinstance(m, dict) else m for m in (data or [])]
+            except (_NotHere, AiError) as e:
+                errors.append(str(e))
+        names = sorted({str(n) for n in names if n})
+        if not names:
+            raise AiError("the endpoint did not return a model list" + (": " + errors[-1] if errors else "") +
+                          ". Type the model name your AI provider gives you")
+        return names
+
+
+class _NotHere(Exception):
+    def __init__(self, url, code):
+        Exception.__init__(self, "HTTP %d at %s" % (code, url))
+        self.url, self.code = url, code
+
 
 def ai_settings(settings):
     ai = settings.get("_ai") or {}
@@ -3495,6 +3653,7 @@ def ai_settings(settings):
         "base_url": (ai.get("base_url") or "").strip(),
         "model": (ai.get("model") or "").strip(),
         "auth_header": (ai.get("auth_header") or "bearer").strip(),
+        "provider": (ai.get("provider") or "openai").strip().lower(),
         "tls_verify": (ai.get("tls_verify") or "yes").strip().lower() not in ("no", "false", "0", "off"),
         "ca_file": os.path.expanduser((ai.get("ca_file") or "").strip()) or None,
         "use_proxy": (ai.get("use_proxy") or "yes").strip().lower() not in ("no", "false", "0", "off"),
@@ -3548,7 +3707,7 @@ def resolve_ai_key(cfg, typed="", session=""):
 def make_ai_client(cfg, key):
     return AiClient(cfg["base_url"], cfg["model"], key, auth_header=cfg["auth_header"], verify=cfg["tls_verify"],
                     ca_file=cfg["ca_file"], timeout=cfg["timeout"], max_tokens=cfg["max_tokens"],
-                    use_proxy=cfg["use_proxy"])
+                    use_proxy=cfg["use_proxy"], provider=cfg["provider"])
 
 
 def investigator_prompt(max_rounds, anonymized):
@@ -3726,7 +3885,7 @@ class Investigation:
             if self.stopped():
                 return self._finish("stopped", prep)
             reply = self._ask_ai()
-            prep = prepare_plan(self.args, reply)
+            prep = prepare_plan(self.args, reply, require_mapping=False)
             self.emit("ai", prep["translated"])
             if not prep["collect"]:
                 if prep["problems"] and not prep["manual"] and rnd < max_rounds:
@@ -3764,7 +3923,7 @@ class Investigation:
         self.messages.append({"role": "user", "content": "The round limit is reached. Conclude now with the "
                               "evidence you have, in the conclusion format."})
         reply = self._ask_ai()
-        prep = prepare_plan(self.args, reply)
+        prep = prepare_plan(self.args, reply, require_mapping=False)
         self.emit("ai", prep["translated"])
         return self._finish("concluded", prep)
 
@@ -4153,11 +4312,21 @@ select { margin-top: 4px; padding: 8px 10px; border: 1px solid var(--line); bord
     <p class="muted">Any OpenAI-compatible chat endpoint: most internal AI gateways, Azure OpenAI, vLLM, Ollama,
       LM Studio and others.</p>
     <div class="fields">
-      <label class="f">Endpoint URL<input type="text" data-ai="base_url" placeholder="https://ai.example.internal/v1"></label>
-      <label class="f">Model name<input type="text" data-ai="model" placeholder="model id as the endpoint names it"></label>
-      <label class="f">Key goes in
-        <select data-ai="auth_header"><option value="bearer">Authorization: Bearer (most endpoints)</option>
-          <option value="api-key">api-key header (Azure OpenAI style)</option></select></label>
+      <label class="f">AI service
+        <select data-ai="provider" id="setProvider">
+          <option value="openai">OpenAI-compatible (most AI gateways, vLLM, Ollama, LM Studio)</option>
+          <option value="asksage">Ask Sage (CAPRA and other Ask Sage servers)</option>
+          <option value="azure">Azure OpenAI</option></select></label>
+      <label class="f"><span id="setUrlLabel">Endpoint address</span>
+        <input type="text" data-ai="base_url" id="setUrl" placeholder="https://ai.example.internal/v1"></label>
+    </div>
+    <p class="muted" id="setUrlHint"></p>
+    <div class="fields">
+      <label class="f">Model
+        <input type="text" data-ai="model" id="setModel" list="setModelList" placeholder="click Find models, or type the name">
+        <datalist id="setModelList"></datalist></label>
+      <div class="f" style="align-self:end"><button class="btn" id="setFindModels" type="button">Find models</button>
+        <span class="muted" id="setModelsMsg"></span></div>
       <label class="f">Rounds before the AI must conclude<input type="number" min="1" max="50" data-ai="max_rounds"></label>
     </div>
     <div class="fields">
@@ -4177,7 +4346,12 @@ select { margin-top: 4px; padding: 8px 10px; border: 1px solid var(--line); bord
         <label class="f">Reply length limit (tokens, empty = endpoint default)<input type="number" min="0" data-ai="max_tokens"></label>
         <label class="f">Wait for a reply (seconds)<input type="number" min="30" data-ai="timeout"></label>
         <label class="f">Trust this CA file (path)<input type="text" data-ai="ca_file" placeholder="~/internal-ca.pem"></label>
+        <label class="f">Key goes in (OpenAI-compatible only)
+          <select data-ai="auth_header"><option value="bearer">Authorization: Bearer (most endpoints)</option>
+            <option value="api-key">api-key header</option></select></label>
       </div>
+      <p class="muted">Certificates this Mac trusts (for example ones your organisation installed) are trusted
+        automatically.</p>
       <label class="chk"><input type="checkbox" data-ai-bool="tls_verify"> Check the endpoint's certificate</label>
       <label class="chk"><input type="checkbox" data-ai-bool="use_proxy"> Use this Mac's proxy settings to reach it</label>
     </details>
@@ -4615,6 +4789,8 @@ function renderSettings() {
   $$("[data-set-bool]").forEach(i => i.checked = yes(m.settings[i.dataset.setBool]));
   $$("[data-ai]").forEach(i => i.value = m.ai[i.dataset.ai] || (i.tagName === "SELECT" ? "bearer" : ""));
   $$("[data-ai-bool]").forEach(i => i.checked = yes(m.ai[i.dataset.aiBool] || "yes"));
+  if (!m.ai.provider) $("#setProvider").value = "openai";
+  providerHints();
   const gs = $("#setGroups");
   gs.textContent = "";
   m.groups.forEach(g => gs.append(groupCard(g)));
@@ -4687,12 +4863,34 @@ $("#setAddGroup").onclick = () => {
 };
 $("#setAddCmd").onclick = () => $("#setCmds").append(cmdRow({}));
 const aiForm = () => collectSettings().ai;
+function providerHints() {
+  const p = $("#setProvider").value;
+  $("#setUrlLabel").textContent = p === "asksage" ? "Ask Sage server address" : p === "azure" ? "Azure OpenAI endpoint URL" : "Endpoint address";
+  $("#setUrl").placeholder = p === "asksage" ? "capra1.example.mil" : p === "azure" ?
+    "https://NAME.openai.azure.com/openai/deployments/DEPLOYMENT?api-version=2024-06-01" : "https://ai.example.internal/v1";
+  $("#setUrlHint").textContent = p === "asksage" ?
+    "Enter just the server name, the same one you use in the browser. The tool finds the right API on that server; the key is the API key you created in Ask Sage (Settings, Account, API)." :
+    p === "azure" ? "Use the deployment URL from the Azure portal; the key goes in the api-key header." :
+    "https:// is added if you leave it out. Most gateways end in /v1.";
+}
+$("#setProvider").addEventListener("change", providerHints);
+$("#setFindModels").onclick = async () => {
+  $("#setModelsMsg").textContent = "Asking the endpoint ...";
+  try {
+    const r = await api("ai_models", { ai: aiForm(), key: $("#setKey").value });
+    const dl = $("#setModelList"); dl.textContent = "";
+    r.models.forEach(m => dl.append(el("option", { value: m })));
+    if (!$("#setModel").value && r.models.length) $("#setModel").value = r.models[0];
+    $("#setModelsMsg").textContent = r.models.length + " model(s) found: click the Model field to choose.";
+    $("#setModel").focus();
+  } catch (e) { $("#setModelsMsg").textContent = e.message; }
+};
 $("#setAiTest").onclick = async () => {
   $("#setAiMsg").textContent = "Testing ...";
   try {
     const r = await api("ai_test", { ai: aiForm(), key: $("#setKey").value });
-    $("#setAiMsg").textContent = "Connected: the AI answered in " + r.seconds + " s (" + (r.reply || "empty reply").slice(0, 60) + ")." +
-      (r.used_key ? "" : " No key was sent.");
+    $("#setAiMsg").textContent = "Connected through the " + r.flavor + ": the AI answered in " + r.seconds + " s (" +
+      (r.reply || "empty reply").slice(0, 60) + ")." + (r.used_key ? "" : " No key was sent.") + " Click Save settings to keep it.";
   } catch (e) { $("#setAiMsg").textContent = e.message; }
 };
 async function keyAction(action) {
@@ -5186,14 +5384,27 @@ class Gui:
     def api_ai_test(self, body):
         cfg = ai_settings({"_ai": body.get("ai") or {}})
         key = resolve_ai_key(cfg, str(body.get("key") or ""), self.ai_key)
-        client = make_ai_client(cfg, key)
-        client.timeout = min(client.timeout, 120)
-        t0 = time.time()
         try:
+            client = make_ai_client(cfg, key)          # checks the address first
+            if not cfg["model"]:
+                raise AiError("choose a model first (Find models lists the ones this endpoint offers)")
+            client.timeout = min(client.timeout, 120)
+            t0 = time.time()
             reply = client.chat([{"role": "user", "content": "Reply with the single word OK."}], retries=0)
         except AiError as e:
             raise Fatal(str(e))
-        return {"ok": True, "seconds": round(time.time() - t0, 1), "reply": reply[:200], "used_key": bool(key)}
+        return {"ok": True, "seconds": round(time.time() - t0, 1), "reply": reply[:200], "used_key": bool(key),
+                "url": client.url if client.flavor == "openai" else client.native + "/query",
+                "flavor": "OpenAI-compatible API" if client.flavor == "openai" else "native Ask Sage API"}
+
+    def api_ai_models(self, body):
+        cfg = ai_settings({"_ai": dict(body.get("ai") or {}, model=(body.get("ai") or {}).get("model") or "-")})
+        key = resolve_ai_key(cfg, str(body.get("key") or ""), self.ai_key)
+        try:
+            client = make_ai_client(cfg, key)
+            return {"models": client.list_models(), "base": client.base}
+        except AiError as e:
+            raise Fatal(str(e))
 
     def api_ai_key(self, body):
         action, key = body.get("action"), str(body.get("key") or "")
@@ -5441,6 +5652,8 @@ class Gui:
                 return self.api_settings_set(body)
             if route == "ai_test":
                 return self.api_ai_test(body)
+            if route == "ai_models":
+                return self.api_ai_models(body)
             if route == "ai_key":
                 return self.api_ai_key(body)
             if route == "open_folder":

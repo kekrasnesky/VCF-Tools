@@ -371,6 +371,22 @@ when the conversation grows too large. If the AI answers "too long", lower those
 The quality of the investigation depends on the model. A small model may ask for unfocused
 checks or conclude too early; you see and approve every round, so you can stop it at any time.
 
+### Ask Sage and CAPRA
+
+On the Settings tab, choose **AI service: Ask Sage**, enter just the server name you use in the
+browser (for example `capra1.example.mil`; `https://` is added for you), paste the API key you
+created in Ask Sage, click **Find models**, pick one in the **Model** field, then **Test
+connection** and **Save settings**.
+
+The tool first tries Ask Sage's OpenAI-compatible API (`/server/openai/v1`) and, if the server
+does not offer it, Ask Sage's own API (`/server/query`, with the key in the `x-access-tokens`
+header). The test tells you which one answered. If your server uses a different address for the
+API, enter the full URL ending in `/v1` instead of the server name.
+
+Certificates your Mac trusts, such as organisation or DoD root certificates installed by your IT
+department, are trusted automatically for the AI, vCenter and NSX connections. If the test still
+says the certificate is not trusted, give the CA file under **More AI options**.
+
 ### Working with the reply
 
 In the window, use the **Analyst reply** tab. In the terminal, save the reply to a file and run:
