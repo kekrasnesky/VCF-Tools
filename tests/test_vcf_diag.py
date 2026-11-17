@@ -1574,6 +1574,80 @@ class KeyHeaderDiscovery(unittest.TestCase):
             srv.server_close()
 
 
+def genai_like():
+    """Answers like GenAI.mil: only 'Authorization: Bearer STARK_...' is accepted."""
+    import http.server
+    import json as _json
+    import threading
+    seen = []
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            auth = self.headers.get("Authorization") or ""
+            seen.append(auth)
+            if auth == "Bearer STARK_good123":
+                code, body = 200, {"choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}]}
+            elif auth.startswith("Bearer "):
+                code, body = 401, {"error": {"type": "unauthorized", "message": "Invalid API key."}}
+            else:
+                code, body = 401, {"error": {"type": "unauthorized", "message": "Missing authorization. Provide an API "
+                                             "key via the Authorization header: 'Authorization: Bearer STARK_...'"}}
+            data = _json.dumps(body).encode()
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, "http://127.0.0.1:%d/v1/chat/completions" % srv.server_address[1], seen
+
+
+class GenAiLikeKeys(unittest.TestCase):
+    def setUp(self):
+        self.srv, self.url, self.seen = genai_like()
+
+    def tearDown(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+
+    def chat(self, key):
+        return v.AiClient(self.url, "m", key).chat([{"role": "user", "content": "x"}], retries=0)
+
+    def test_pasted_key_is_cleaned(self):
+        self.assertEqual(self.chat("  Bearer STARK_good123\n"), "OK")
+        self.assertEqual(self.chat('"STARK_good123"'), "OK")
+
+    def test_wrong_key_reports_the_bearer_answer_and_the_prefix(self):
+        with self.assertRaises(v.AiError) as e:
+            self.chat("capra-key-0123456789")
+        msg = str(e.exception)
+        self.assertIn("Invalid API key", msg)                       # what the server said to Bearer
+        self.assertIn("expects keys that start with 'STARK_'", msg)
+        self.assertIn("20 characters", msg)
+        self.assertNotIn("capra-key-0123456789", msg)               # the key itself is never shown
+        with self.assertRaises(v.AiError) as e:
+            self.chat("STARK_expired999")
+        self.assertNotIn("expects keys that start", str(e.exception))
+
+    def test_key_shape_and_session_keys_per_endpoint(self):
+        self.assertEqual(v.key_shape("STARK_abcdef"), "starts with 'STARK_', 12 characters")
+        self.assertEqual(v.key_shape("abcdef"), "6 characters")
+        capra = v.ai_settings({"_ai": {"provider": "asksage", "base_url": "chat.capra.example.mil"}})
+        genai = v.ai_settings({"_ai": {"base_url": "https://api.genai.example.mil/v1/chat/completions"}})
+        session = {v.endpoint_id(capra): "capra-key"}
+        self.assertEqual(v.resolve_ai_key(capra, "", session), "capra-key")
+        self.assertEqual(v.key_with_source(genai, "", session), ("", "none"))   # never another service's key
+        text = v.ai_connection_check(dict(genai, base_url=self.url, use_proxy=False, model="m"), "STARK_good123",
+                                     "typed in the key field")
+        self.assertIn("[info] key: starts with 'STARK_', 13 characters, typed in the key field", text)
+        self.assertNotIn("good123", text)
+
+
 class GuiApi(unittest.TestCase):
     """The browser GUI's local web API, without contacting any host."""
 

@@ -57,7 +57,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
-VERSION = "1.11.2"
+VERSION = "1.11.3"
 
 # ----------------------------------------------------------------------------
 # Diagnostic catalog
@@ -3524,11 +3524,13 @@ class AiClient:
             self.roots = [(self.base + "/v1", self.native), (self.base, self.native)]
             self._use_root(0)
         self.root_i = 0
-        self.model, self.key = model, key
+        self.model, self.key = model, clean_key(key)
         self.auth = "api-key" if self.provider == "azure" else (auth_header or "bearer").lower()
         # With the default header, other common key headers are tried once if the key is refused.
         self.auth_auto = self.provider == "openai" and self.auth == "bearer"
         self.auth_tried = [self.auth]
+        self.first_refusal = None
+        self.refusals = []
         self.timeout, self.max_tokens = timeout, max_tokens
         tls = [urllib.request.HTTPSHandler(context=tls_context(verify, ca_file))] if self.base.startswith("https:") else []
         self.direct = urllib.request.build_opener(urllib.request.ProxyHandler({}), *tls)
@@ -3582,13 +3584,26 @@ class AiClient:
                     time.sleep(5 * (attempt + 1))
                     continue
                 if e.code in (401, 403):
-                    if not native and self.key and self.auth_auto and self._next_auth():
+                    if self.first_refusal is None:
+                        self.first_refusal = (self.auth, detail)
+                    self.refusals.append(detail)
+                    names_bearer = re.search(r"(?i)authorization:?\s*bearer", detail)
+                    if not native and self.key and self.auth_auto and not names_bearer and self._next_auth():
                         return self._request(method, url, body, native, retries, timeout)
+                    if names_bearer and self.auth != "bearer":
+                        # the server asks for Bearer: report what it said to the Bearer attempt
+                        detail = self.first_refusal[1] if self.first_refusal[0] == "bearer" else detail
+                        self.auth = "bearer"
                     why = re.sub(r"\s+", " ", detail).strip()[:300]
+                    m = re.search(r"Bearer\s+([A-Za-z]{2,10}_)", " ".join(self.refusals))
+                    prefix = ""
+                    if m and not self.key.startswith(m.group(1)):
+                        prefix = (" The server expects keys that start with '%s', but this key %s - check that you "
+                                  "pasted the key for this service." % (m.group(1), key_shape(self.key)))
                     tried = (" Tried the key as: %s." % ", ".join(self.auth_tried)) if len(self.auth_tried) > 1 else ""
-                    raise AiError("the AI endpoint rejected the API key (HTTP %d).%s%s Check that the key is current "
-                                  "and was created for API use on this service" % (
-                                      e.code, tried, (" The server said: " + why + ".") if why else ""))
+                    raise AiError("the AI endpoint rejected the API key (HTTP %d).%s%s%s Check that the key is "
+                                  "current and was created for API use on this service" % (
+                                      e.code, tried, (" The server said: " + why + ".") if why else "", prefix))
                 if e.code in (404, 405):
                     raise _NotHere(url, e.code)
                 if e.code == 400 and re.search(r"(?i)context|too long|maximum|token limit", detail):
@@ -3890,9 +3905,46 @@ def keychain_delete(account):
                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
 
 
-def resolve_ai_key(cfg, typed="", session=""):
-    """Typed key, then the key entered earlier in this window, then the environment, then the Keychain."""
-    return typed or session or os.environ.get(cfg["key_env"], "") or keychain_get(cfg["base_url"])
+def endpoint_id(cfg):
+    """One name per AI endpoint, so that a key entered for one service is never sent to another."""
+    try:
+        return normalize_ai_url(cfg.get("base_url", ""), cfg.get("provider", "openai")).lower()
+    except AiError:
+        return (cfg.get("base_url") or "").strip().lower()
+
+
+def resolve_ai_key(cfg, typed="", session=None):
+    """Typed key, then the key entered earlier in this window for this endpoint, then the environment,
+    then the Keychain entry for this endpoint."""
+    return key_with_source(cfg, typed, session)[0]
+
+
+def key_with_source(cfg, typed="", session=None):
+    if typed:
+        return typed, "typed in the key field"
+    if isinstance(session, dict) and session.get(endpoint_id(cfg)):
+        return session[endpoint_id(cfg)], "set for this session"
+    if isinstance(session, str) and session:
+        return session, "set for this session"
+    if os.environ.get(cfg["key_env"]):
+        return os.environ[cfg["key_env"]], "environment variable %s" % cfg["key_env"]
+    k = keychain_get(cfg["base_url"])
+    return (k, "macOS Keychain") if k else ("", "none")
+
+
+def clean_key(key):
+    """Remove what often sneaks into a pasted key: spaces, line breaks, quotes, a leading 'Bearer '."""
+    k = (key or "").strip().strip("'\"").strip()
+    k = re.sub(r"(?i)^bearer\s+", "", k)
+    return re.sub(r"\s+", "", k)
+
+
+def key_shape(key):
+    """A description of a key that does not reveal it."""
+    if not key:
+        return "no key"
+    m = re.match(r"([A-Za-z]{2,10}[_-])", key)
+    return "starts with '%s', %d characters" % (m.group(1), len(key)) if m else "%d characters" % len(key)
 
 
 def mac_pac_url():
@@ -3916,7 +3968,7 @@ def _mask_proxy(url):
     return re.sub(r"//[^/@]+@", "//***@", url or "")
 
 
-def ai_connection_check(cfg, key):
+def ai_connection_check(cfg, key, source=""):
     """Step-by-step connection check for the AI endpoint. Returns text a person can copy into a
     support message: no key is included."""
     lines = ["vcf_diag %s, Python %s, %s" % (VERSION, sys.version.split()[0], sys.platform)]
@@ -3937,6 +3989,7 @@ def ai_connection_check(cfg, key):
                                          "api-key" if cfg["provider"] == "azure" else cfg["auth_header"],
                                          "yes" if cfg["use_proxy"] else "no", "yes" if cfg["tls_verify"] else "no",
                                          cfg["ca_file"] or "(none)", "yes" if key else "no"))
+    step("key", None, "%s%s" % (key_shape(clean_key(key)), (", " + source) if source else ""))
     proxies = urllib.request.getproxies()
     shown = {k: _mask_proxy(v_) for k, v_ in proxies.items() if k in ("http", "https", "all")}
     step("proxy settings Python sees", None, ", ".join("%s=%s" % kv for kv in shown.items()) or "none")
@@ -5375,7 +5428,7 @@ $("#setAiTest").onclick = async () => {
 };
 async function keyAction(action) {
   try {
-    const r = await api("ai_key", { action, key: $("#setKey").value, base_url: aiForm().base_url });
+    const r = await api("ai_key", { action, key: $("#setKey").value, base_url: aiForm().base_url, provider: aiForm().provider });
     $("#setKey").value = "";
     $("#setAiMsg").textContent = { session: "The key is used until you quit the tool.", save: "The key is saved in the Keychain for this endpoint.",
       forget: "The key is forgotten." }[action];
@@ -5712,7 +5765,7 @@ class Gui:
         self.ctx = None
         self.httpd = None
         self.inv = None                    # state of the current or last investigation
-        self.ai_key = ""                   # AI key entered in this window (memory only)
+        self.ai_keys = {}                  # AI keys entered in this window, per endpoint address (memory only)
         self.inv_stop = threading.Event()
         self.inv_obj = None                # the investigation conversation, kept so it can continue
         _log_sinks.append(lambda msg: self.lines.append(msg) if msg.strip() else None)
@@ -5768,7 +5821,7 @@ class Gui:
         out["ai"] = {"configured": bool(cfg["base_url"] and cfg["model"]), "model": cfg["model"],
                      "base_url": cfg["base_url"], "key_env": cfg["key_env"],
                      "key_from_env": bool(os.environ.get(cfg["key_env"])), "max_rounds": cfg["max_rounds"],
-                     "key_ready": bool(self.ai_key or os.environ.get(cfg["key_env"]) or keychain_get(cfg["base_url"])),
+                     "key_ready": bool(resolve_ai_key(cfg, "", self.ai_keys)),
                      "latest_report": os.path.basename(latest) if latest else None}
         out["anonymize"] = anonymize_enabled(self.args, settings)
         for s in sections:
@@ -5876,7 +5929,7 @@ class Gui:
                   "host_label": c.get("host_label", "Hosts")} for t, c in COMPONENTS.items()]
         return {"model": model, "meta": {
             "types": types, "standard_services": STANDARD_MGMT_SERVICES, "keychain": keychain_available(),
-            "key": {"session": bool(self.ai_key), "env": bool(os.environ.get(cfg["key_env"])),
+            "key": {"session": bool(self.ai_keys.get(endpoint_id(cfg))), "env": bool(os.environ.get(cfg["key_env"])),
                     "env_name": cfg["key_env"], "keychain": bool(keychain_get(cfg["base_url"]))},
             "paths": {"inventory": os.path.abspath(path), "output": os.path.abspath(self.args.output_dir),
                       "private": os.path.abspath(self.args.private_dir)},
@@ -5889,7 +5942,7 @@ class Gui:
 
     def api_ai_test(self, body):
         cfg = ai_settings({"_ai": body.get("ai") or {}})
-        key = resolve_ai_key(cfg, str(body.get("key") or ""), self.ai_key)
+        key = resolve_ai_key(cfg, str(body.get("key") or ""), self.ai_keys)
         try:
             client = make_ai_client(cfg, key)          # checks the address first
             if not cfg["model"]:
@@ -5906,11 +5959,12 @@ class Gui:
 
     def api_ai_check(self, body):
         cfg = ai_settings({"_ai": body.get("ai") or {}})
-        return {"text": ai_connection_check(cfg, resolve_ai_key(cfg, str(body.get("key") or ""), self.ai_key))}
+        key, source = key_with_source(cfg, str(body.get("key") or ""), self.ai_keys)
+        return {"text": ai_connection_check(cfg, key, source)}
 
     def api_ai_models(self, body):
         cfg = ai_settings({"_ai": dict(body.get("ai") or {}, model=(body.get("ai") or {}).get("model") or "-")})
-        key = resolve_ai_key(cfg, str(body.get("key") or ""), self.ai_key)
+        key = resolve_ai_key(cfg, str(body.get("key") or ""), self.ai_keys)
         try:
             client = make_ai_client(cfg, key)
             return {"models": client.list_models(), "base": client.base}
@@ -5919,22 +5973,23 @@ class Gui:
 
     def api_ai_key(self, body):
         action, key = body.get("action"), str(body.get("key") or "")
-        cfg = ai_settings({"_ai": {"base_url": body.get("base_url") or ""}})
+        cfg = ai_settings({"_ai": {"base_url": body.get("base_url") or "", "provider": body.get("provider") or "openai"}})
         if action == "forget":
-            self.ai_key = ""
+            self.ai_keys.pop(endpoint_id(cfg), None)
             keychain_delete(cfg["base_url"])
             return {"ok": True, "key": self._key_state(cfg)}
         if not key:
             raise Fatal("enter the key first")
-        self.ai_key = key
+        self.ai_keys[endpoint_id(cfg)] = clean_key(key)
         if action == "save":
             if not cfg["base_url"]:
                 raise Fatal("enter the endpoint URL first: the key is saved for that address")
-            keychain_set(cfg["base_url"], key)
+            keychain_set(cfg["base_url"], clean_key(key))
         return {"ok": True, "key": self._key_state(cfg)}
 
     def _key_state(self, cfg):
-        return {"session": bool(self.ai_key), "env": bool(os.environ.get(cfg["key_env"])), "env_name": cfg["key_env"],
+        return {"session": bool(self.ai_keys.get(endpoint_id(cfg))), "env": bool(os.environ.get(cfg["key_env"])),
+                "env_name": cfg["key_env"],
                 "keychain": bool(keychain_get(cfg["base_url"]))}
 
     def api_open_folder(self, body):
@@ -5958,9 +6013,9 @@ class Gui:
             cfg = ai_settings(settings)
             if not (cfg["base_url"] and cfg["model"]):
                 raise Fatal("add an [ai] section with base_url and model to the inventory first")
-            key = resolve_ai_key(cfg, str(body.get("key") or ""), self.ai_key)
+            key = resolve_ai_key(cfg, str(body.get("key") or ""), self.ai_keys)
             if body.get("key"):
-                self.ai_key = str(body["key"])
+                self.ai_keys[endpoint_id(cfg)] = clean_key(str(body["key"]))
             problem = str(body.get("problem") or "").strip()
             if not problem:
                 raise Fatal("describe the problem first")
@@ -6452,7 +6507,10 @@ def dispatch(args):
         return cmd_scrub_files(args)
     if args.ai_check:
         cfg = ai_settings(load_inventory(find_inventory(args) or "inventory.ini")[0])
-        print(ai_connection_check(cfg, resolve_ai_key(cfg) or getpass.getpass("API key (hidden; Return for none): ")))
+        key, source = key_with_source(cfg)
+        if not key:
+            key, source = getpass.getpass("API key (hidden; Return for none): "), "typed at the prompt"
+        print(ai_connection_check(cfg, key, source))
         return 0
     if args.investigate is not None:
         return cmd_investigate(args)
