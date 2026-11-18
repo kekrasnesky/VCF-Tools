@@ -653,7 +653,7 @@ def main(argv=None):
 
     if args.sddc:
         found = sddc_tasks(sddc_login(args.sddc, args.sddc_user, ctx), args.days)
-        if not problems and found:
+        if apis and not problems and found:
             print("  NSX looks consistent now: if these tasks ran before the fix, retry them.")
 
     if apis and not problems:
