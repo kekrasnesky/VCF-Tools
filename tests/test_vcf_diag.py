@@ -1946,6 +1946,57 @@ class NodeAndPodHealth(unittest.TestCase):
         self.assertTrue(v.is_cluster_group("k8s-health"))        # runs once per cluster
 
 
+class NsxLogicalPorts(unittest.TestCase):
+    def test_ports_are_explained_by_what_is_behind_them(self):
+        FAKE_NSX.update({
+            "/api/v1/logical-ports?attachment_type=VIF&page_size=1000": {"results": [
+                {"id": "p1", "display_name": "widgets-auto01.vmx@552418466", "logical_switch_id": "ls1",
+                 "attachment": {"attachment_type": "VIF", "id": "att-gone"}, "_create_time": 1759000000000},
+                {"id": "p2", "display_name": "widgets-db02.vmx@1", "logical_switch_id": "ls1",
+                 "attachment": {"attachment_type": "VIF", "id": "att-off"}},
+                {"id": "p3", "display_name": "widgets-web03.vmx@2", "logical_switch_id": "ls1",
+                 "attachment": {"attachment_type": "VIF", "id": "att-down"}},
+                {"id": "p4", "display_name": "widgets-app04.vmx@3", "logical_switch_id": "ls1",
+                 "attachment": {"attachment_type": "VIF", "id": "att-up"}}]},
+            "/api/v1/fabric/vifs?page_size=1000": {"results": [
+                {"lport_attachment_id": "att-off", "owner_vm_id": "vm-off", "host_id": "h1"},
+                {"lport_attachment_id": "att-down", "owner_vm_id": "vm-down", "host_id": "h2"},
+                {"lport_attachment_id": "att-up", "owner_vm_id": "vm-up", "host_id": "h2"}]},
+            "/api/v1/fabric/virtual-machines?page_size=1000": {"results": [
+                {"external_id": "vm-off", "display_name": "widgets-db02", "power_state": "VM_STOPPED"},
+                {"external_id": "vm-down", "display_name": "widgets-web03", "power_state": "VM_RUNNING"},
+                {"external_id": "vm-up", "display_name": "widgets-app04", "power_state": "VM_RUNNING"}]},
+            "/api/v1/logical-switches?page_size=1000": {"results": [{"id": "ls1", "display_name": "WIDGETS-SEG-APP"}]},
+            "/api/v1/logical-ports/p3/status": {"status": "DOWN"},
+            "/api/v1/logical-ports/p4/status": {"status": "UP"},
+        })
+        srv, base, seen = fake_nsx()
+        try:
+            api = v.NsxApi("nsx", "admin", "Nsx-Pass1!", base_url=base)
+            api.login()
+            out = v.nsx_logical_ports(api)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        self.assertTrue(out.startswith("4 VM logical port(s): 1 orphaned, 1 on powered-off VMs, 2 on running VMs "
+                                       "(2 of those checked, 1 down)."))
+        down = out.split("Down while the VM is running")[1].split("Orphaned:")[0]
+        self.assertIn("port widgets-web03.vmx@2  vm=widgets-web03  segment=WIDGETS-SEG-APP  status=DOWN", down)
+        self.assertNotIn("widgets-app04", down)
+        orphaned = out.split("Orphaned:")[1].split("On powered-off VMs")[0]
+        self.assertIn("port widgets-auto01.vmx@552418466  segment=WIDGETS-SEG-APP  created 2025-", orphaned)
+        self.assertIn("vm=widgets-db02  power=VM_STOPPED", out.split("On powered-off VMs")[1])
+        self.assertTrue(all(m == "GET" for m, _ in seen))
+        # VM names in port names are anonymized
+        sc = make(terms=[])
+        group = [g for g in v.COMPONENTS["nsx"]["groups"] if g[0] == "nsx-api-health"][0]
+        harvest(sc, [c for c in group[2] if c["api"] == "nsx_logical_ports"][0], out)
+        scrubbed = run(sc, out)
+        for gone in ("widgets-auto01", "widgets-web03", "widgets-db02"):
+            self.assertNotIn(gone, scrubbed)
+        self.assertIn(".vmx@552418466", scrubbed)
+
+
 class GuiApi(unittest.TestCase):
     """The browser GUI's local web API, without contacting any host."""
 

@@ -57,7 +57,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
-VERSION = "1.14.0"
+VERSION = "1.15.0"
 
 # ----------------------------------------------------------------------------
 # Diagnostic catalog
@@ -447,6 +447,9 @@ NSX_GROUPS = [
         apicmd("Edge clusters", "nsx_edge_clusters", "GET /api/v1/edge-clusters", harvest=[H_EDGECL]),
         apicmd("Backups", "nsx_backups", "GET /api/v1/cluster/backups/history (+ config)"),
         apicmd("Local users and password expiry", "nsx_users", "GET /api/v1/node/users (+ auth policy)"),
+        apicmd("VM logical ports: orphaned, VM off, or down while the VM runs", "nsx_logical_ports",
+               "GET /api/v1/logical-ports, /api/v1/fabric/vifs, /api/v1/fabric/virtual-machines (+ port status)",
+               max_lines=600),
     ]),
     ("os", "OS level (root shell only)", [
         cmd("Disk usage", "df -hP"),
@@ -953,6 +956,7 @@ RX_AUTHZ = re.compile(r"(?i)(authorization\s*[:=]\s*(?:bearer|basic|token)\s+)(\
 RX_KV_SECRET = re.compile(
     r"(?i)((?<![A-Za-z])[\w.-]*(?:password|passwd|pwd|secret|token|apikey|api[_-]key|access[_-]key|"
     r"private[_-]key|credential)[\w.-]*[\"']?\s*[:=]\s*)(\"[^\"\n]*\"|'[^'\n]*'|[^\s\"',;]+)")
+RX_VMX_NAME = re.compile(r"(?<![\w.-])([A-Za-z0-9][A-Za-z0-9_.-]{1,80}?)\.vmx(?:@|\b)|\bvm=([^\s,;]+)")
 RX_HASH = re.compile(r"\$(?:1|2[aby]?|5|6|y)\$[./A-Za-z0-9$]{20,}")
 RX_SSHKEY = re.compile(r"AAAA[0-9A-Za-z+/]{60,}={0,2}")
 RX_BLOB = re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{160,}={0,2}")
@@ -1093,6 +1097,11 @@ class Scrubber:
     def prescan(self, text):
         """Discover IPs, version literals and FQDNs before scrubbing, so that every
         form of a name (short, dashed IP ...) is known when the report is written."""
+        for m in RX_VMX_NAME.finditer(text):
+            name = (m.group(1) or m.group(2) or "").strip()
+            if len(name) >= 3 and not name.isdigit() and not RX_UUID.fullmatch(name) and \
+                    not name.lower().startswith(("vm-", "uuid-", "none")):
+                self.learn_term("vm", name)
         for m in RX_IPV4.finditer(text):
             if RX_VERSION_CTX.search(text[max(0, m.start() - 40):m.start()]):
                 self.version_literals.add(m.group(0))
@@ -2323,6 +2332,60 @@ def vc_accounts(api):
     return "\n".join(out)
 
 
+def nsx_logical_ports(api, status_limit=300):
+    """Explain logical ports of VMs (named <vm>.vmx@<id>) by what is behind them: no VM interface
+    (orphaned, typically after the VM was deleted or redeployed), a powered-off VM (down is
+    expected), or a running VM (down is a real problem)."""
+    ports = api.paged("/api/v1/logical-ports?attachment_type=VIF&page_size=1000", limit=50)
+    if not ports:
+        return "No VM logical ports returned."
+    vifs = {}
+    for f in api.paged("/api/v1/fabric/vifs?page_size=1000", limit=50):
+        if f.get("lport_attachment_id"):
+            vifs[f["lport_attachment_id"]] = f
+    vms = {m.get("external_id"): m for m in api.paged("/api/v1/fabric/virtual-machines?page_size=1000", limit=50)}
+    switches = {sw.get("id"): sw.get("display_name") for sw in api.paged("/api/v1/logical-switches?page_size=1000", limit=20)}
+    orphaned, off, running = [], [], []
+    for p in ports:
+        att = (p.get("attachment") or {}).get("id")
+        vif = vifs.get(att)
+        row = {"name": p.get("display_name") or p.get("id"), "id": p.get("id"),
+               "switch": switches.get(p.get("logical_switch_id"), p.get("logical_switch_id")),
+               "created": _ms(p.get("_create_time")), "host": (vif or {}).get("host_id")}
+        if not vif:
+            orphaned.append(row)
+            continue
+        vm = vms.get(vif.get("owner_vm_id")) or {}
+        row["vm"] = vm.get("display_name") or vif.get("owner_vm_id")
+        row["power"] = vm.get("power_state")
+        (off if str(vm.get("power_state", "")).upper() not in ("VM_RUNNING", "POWEREDON", "RUNNING") else running).append(row)
+    down, checked = [], 0
+    for row in running[:status_limit]:
+        st = api.get("/api/v1/logical-ports/%s/status" % urllib.parse.quote(str(row["id"]))) or {}
+        checked += 1
+        if str(st.get("status", "")).upper() != "UP":
+            row["status"] = st.get("status") or "?"
+            down.append(row)
+    out = ["%d VM logical port(s): %d orphaned, %d on powered-off VMs, %d on running VMs (%d of those checked, "
+           "%d down)." % (len(ports), len(orphaned), len(off), len(running), checked, len(down)),
+           "A port named <vm>.vmx@<number> is one network adapter of one VM.", ""]
+    out.append("Down while the VM is running (a real problem: adapter disconnected in vCenter, host transport node "
+               "not ready, or a datapath issue):")
+    out += ["  port %s  vm=%s  segment=%s  status=%s  host=%s" % (r["name"], r["vm"], r["switch"], r["status"], r["host"])
+            for r in down] or ["  none"]
+    out += ["", "Orphaned: no VM network interface is attached any more (the VM was deleted, redeployed or "
+            "re-registered; the port stays Down and raises alerts until it is removed):"]
+    out += ["  port %s  segment=%s  created %s  id=%s" % (r["name"], r["switch"], r["created"], r["id"])
+            for r in orphaned[:200]] or ["  none"]
+    if len(orphaned) > 200:
+        out.append("  ... %d more" % (len(orphaned) - 200))
+    out += ["", "On powered-off VMs (Down is expected while the VM is off):"]
+    out += ["  port %s  vm=%s  power=%s" % (r["name"], r["vm"], r["power"]) for r in off[:100]] or ["  none"]
+    if len(running) > status_limit:
+        out.append("\n(only the first %d ports of running VMs were checked for status)" % status_limit)
+    return "\n".join(out)
+
+
 def nsx_users(api):
     users = api.paged("/api/v1/node/users")
     out = ["%-12s %-20s %-18s %s" % ("user", "status", "change every (days)", "last change (days ago)")]
@@ -2385,7 +2448,7 @@ def sddc_credential_tasks(api):
 
 VCAPI_FUNCS = {"supervisors": api_supervisors, "namespaces": api_namespaces, "services": api_services,
                "nsx_cluster": nsx_cluster, "nsx_alarms": nsx_alarms, "nsx_transport_nodes": nsx_transport_nodes,
-               "nsx_edge_clusters": nsx_edge_clusters, "nsx_backups": nsx_backups, "nsx_users": nsx_users,
+               "nsx_edge_clusters": nsx_edge_clusters, "nsx_backups": nsx_backups, "nsx_users": nsx_users, "nsx_logical_ports": nsx_logical_ports,
                "vc_sts": vc_sts, "vc_tls": vc_tls, "vc_idp": vc_idp, "vc_accounts": vc_accounts,
                "sddc_credentials": sddc_credentials, "sddc_credential_tasks": sddc_credential_tasks}
 

@@ -260,6 +260,12 @@ reports:
   tunnel / connection status where the API offers it;
 - edge clusters; and backup configuration and the last backup results.
 
+- VM logical ports (named `<vm>.vmx@<number>`, one per VM network adapter) sorted by what is
+  behind them: **orphaned** ports with no VM interface left (the VM was deleted, redeployed or
+  re-registered; these stay Down and keep raising "Logical Port Operational Status is Down"
+  alerts until removed), ports of **powered-off VMs** (Down is expected), and ports that are
+  **Down while the VM runs** (a real problem).
+
 These are cluster-wide, so with several managers listed they run on the first one only. The NSX
 certificate is verified; set a CA file or turn the check off on the Settings tab if needed.
 
