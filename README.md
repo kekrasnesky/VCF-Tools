@@ -386,6 +386,24 @@ when the conversation grows too large. If the AI answers "too long", lower those
 The quality of the investigation depends on the model. A small model may ask for unfocused
 checks or conclude too early; you see and approve every round, so you can stop it at any time.
 
+### GenAI.mil and CAPRA (ready to use)
+
+The two services are built in. At the top of the **Settings** tab, under **AI for investigations**,
+or right on the **Investigate with AI** tab, choose:
+
+- **GenAI.mil** - address `https://api.genai.mil/v1/chat/completions` and model
+  `gemini-3.5-flash-lite-withtools` are filled in. Paste the API key from the GenAI.mil portal
+  (it starts with `STARK_`).
+- **CAPRA (Ask Sage)** - address `chat.capra.flankspeed.us.navy.mil` is filled in. Paste your
+  CAPRA / Ask Sage API key, click **Find models** and pick one.
+
+Each service keeps its own model and its own saved key, so you can switch between them at any
+time. On the Investigate tab, tick **Remember the key in the macOS Keychain** to enter a key only
+once. **Other AI service** keeps all the detailed options for any other endpoint.
+
+After a collection, **Investigate this with AI** on the report opens the Investigate tab ready to
+start from that report.
+
 ### Ask Sage and CAPRA
 
 On the Settings tab, choose **AI service: Ask Sage**, enter just the server name you use in the

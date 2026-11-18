@@ -57,7 +57,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
-VERSION = "1.11.5"
+VERSION = "1.12.0"
 
 # ----------------------------------------------------------------------------
 # Diagnostic catalog
@@ -2218,7 +2218,8 @@ def load_inventory(path):
 SETTINGS_FIELDS = [("anonymize", "yes"), ("max_lines", "200"), ("parallel", "4"), ("timeout", "30"),
                    ("connect_timeout", "15"), ("strict_host_keys", "no"), ("scrub_terms", ""),
                    ("extra_domains", ""), ("keep_literals", "9.1.1.0"), ("keep_namespaces", "")]
-AI_FIELDS = [("provider", "openai"), ("base_url", ""), ("model", ""), ("auth_header", "bearer"), ("max_rounds", "10"), ("max_tokens", ""),
+AI_FIELDS = [("profile", ""), ("genai_model", ""), ("capra_model", ""),
+             ("provider", "openai"), ("base_url", ""), ("model", ""), ("auth_header", "bearer"), ("max_rounds", "10"), ("max_tokens", ""),
              ("timeout", "600"), ("max_report_chars", "150000"), ("max_context_chars", "400000"), ("ca_file", ""),
              ("tls_verify", "yes"), ("use_proxy", "yes"), ("proxy", ""), ("key_env", "")]
 GROUP_FIELDS = ["user", "port", "sudo", "escalate", "kubeconfig", "kubectl", "ssh_workers", "sso_user", "ca_file",
@@ -3882,13 +3883,46 @@ class _NotHere(Exception):
         self.url, self.code = url, code
 
 
+AI_PRESETS = {
+    "genai": {"title": "GenAI.mil", "provider": "openai", "base_url": "https://api.genai.mil/v1/chat/completions",
+              "model": "gemini-3.5-flash-lite-withtools", "auth_header": "bearer",
+              "key_hint": "the API key from the GenAI.mil portal (starts with STARK_)"},
+    "capra": {"title": "CAPRA (Ask Sage)", "provider": "asksage", "base_url": "chat.capra.flankspeed.us.navy.mil",
+              "model": "", "auth_header": "bearer",
+              "key_hint": "the API key you created in CAPRA / Ask Sage (Settings, Account, API)"},
+}
+
+
+def ai_profile(ai):
+    """Which AI service the settings use: a preset ("genai", "capra") or "custom"."""
+    p = (ai.get("profile") or "").strip().lower()
+    if p in AI_PRESETS or p == "custom":
+        return p
+    url = (ai.get("base_url") or "").strip()
+    if not url:
+        return "genai"                       # a fresh installation starts with GenAI.mil
+    for name, pre in AI_PRESETS.items():
+        try:
+            if normalize_ai_url(url, pre["provider"]).lower() == normalize_ai_url(pre["base_url"], pre["provider"]).lower():
+                return name
+        except AiError:
+            pass
+    return "custom"
+
+
 def ai_settings(settings):
     ai = settings.get("_ai") or {}
+    profile = ai_profile(ai)
+    pre = AI_PRESETS.get(profile)
+    if pre:
+        model = (ai.get(profile + "_model") or "").strip() or (
+            (ai.get("model") or "").strip() if not (ai.get("profile") or "").strip() else "") or pre["model"]
     return {
-        "base_url": (ai.get("base_url") or "").strip(),
-        "model": (ai.get("model") or "").strip(),
-        "auth_header": (ai.get("auth_header") or "bearer").strip(),
-        "provider": (ai.get("provider") or "openai").strip().lower(),
+        "profile": profile,
+        "base_url": pre["base_url"] if pre else (ai.get("base_url") or "").strip(),
+        "model": model if pre else (ai.get("model") or "").strip(),
+        "auth_header": pre["auth_header"] if pre else (ai.get("auth_header") or "bearer").strip(),
+        "provider": pre["provider"] if pre else (ai.get("provider") or "openai").strip().lower(),
         "proxy": (ai.get("proxy") or "").strip(),
         "tls_verify": (ai.get("tls_verify") or "yes").strip().lower() not in ("no", "false", "0", "off"),
         "ca_file": os.path.expanduser((ai.get("ca_file") or "").strip()) or None,
@@ -4736,6 +4770,7 @@ select { margin-top: 4px; padding: 8px 10px; border: 1px solid var(--line); bord
       <button class="btn primary" id="copy">Copy report</button>
       <button class="btn" id="save">Save a copy…</button>
       <button class="btn" id="reveal">Show file</button>
+      <button class="btn" id="toInvestigate">Investigate this with AI</button>
       <span class="muted" id="copied"></span>
     </div>
     <p class="muted" id="resPath"></p>
@@ -4780,7 +4815,14 @@ select { margin-top: 4px; padding: 8px 10px; border: 1px solid var(--line); bord
         <label style="display:block"><input type="radio" name="invStart" value="none">
           only the description</label>
       </fieldset>
-      <label class="f">AI API key <input type="password" id="aiKey" autocomplete="off"></label>
+      <div class="f">
+        <span class="muted" style="font-size:13px">AI service</span>
+        <div class="row" role="radiogroup" aria-label="AI service" id="invProfiles"></div>
+        <label class="f" style="margin-top:8px">API key <input type="password" id="aiKey" autocomplete="off"></label>
+        <label class="chk" id="aiRememberRow"><input type="checkbox" id="aiRemember"> Remember the key in the macOS
+          Keychain</label>
+        <span class="muted" id="aiKeyState"></span>
+      </div>
     </div>
     <details id="invLogins"><summary>Logins for the hosts the AI may ask about</summary>
       <p class="muted">Fill in the groups you expect to be involved. If the AI asks about another group, you are
@@ -4845,16 +4887,15 @@ select { margin-top: 4px; padding: 8px 10px; border: 1px solid var(--line); bord
     <button class="btn" id="setReload">Discard changes</button>
     <span class="muted setMsg"></span></div>
 
-  <h2>Systems to check</h2>
-  <p class="muted">One entry per group of systems. The group name (type and label) is used in placeholders such as
-    <code>esxi-mgmt-01</code>; changing it later gives those hosts new placeholders.</p>
-  <div id="setGroups"></div>
-  <div class="actions">
-    <select id="setNewType" aria-label="Type of the new group"></select>
-    <button class="btn" id="setAddGroup">Add group</button></div>
-
   <h2>AI for investigations</h2>
-  <div class="card">
+  <div class="card on">
+    <div class="row" role="radiogroup" aria-label="AI service" id="setProfiles">
+      <label class="chk" style="margin:0"><input type="radio" name="setProfile" value="genai"> <b>GenAI.mil</b></label>
+      <label class="chk" style="margin:0"><input type="radio" name="setProfile" value="capra"> <b>CAPRA (Ask Sage)</b></label>
+      <label class="chk" style="margin:0"><input type="radio" name="setProfile" value="custom"> Other AI service</label>
+    </div>
+    <p class="muted" id="setPresetInfo"></p>
+    <div id="setCustomAi">
     <p class="muted">Any OpenAI-compatible chat endpoint: most internal AI gateways, Azure OpenAI, vLLM, Ollama,
       LM Studio and others.</p>
     <div class="fields">
@@ -4867,6 +4908,7 @@ select { margin-top: 4px; padding: 8px 10px; border: 1px solid var(--line); bord
         <input type="text" data-ai="base_url" id="setUrl" placeholder="https://ai.example.internal/v1"></label>
     </div>
     <p class="muted" id="setUrlHint"></p>
+    </div>
     <div class="fields">
       <label class="f">Model
         <input type="text" data-ai="model" id="setModel" list="setModelList" placeholder="click Find models, or type the name">
@@ -4913,6 +4955,14 @@ select { margin-top: 4px; padding: 8px 10px; border: 1px solid var(--line); bord
         (ignored when a proxy is entered above)</label>
     </details>
   </div>
+
+  <h2>Systems to check</h2>
+  <p class="muted">One entry per group of systems. The group name (type and label) is used in placeholders such as
+    <code>esxi-mgmt-01</code>; changing it later gives those hosts new placeholders.</p>
+  <div id="setGroups"></div>
+  <div class="actions">
+    <select id="setNewType" aria-label="Type of the new group"></select>
+    <button class="btn" id="setAddGroup">Add group</button></div>
 
   <h2>Reports and privacy</h2>
   <div class="card">
@@ -5256,6 +5306,13 @@ $("#save").onclick = () => {
   URL.revokeObjectURL(a.href);
 };
 $("#reveal").onclick = () => api("reveal", {}).catch(e => $("#copied").textContent = e.message);
+$("#toInvestigate").onclick = async () => {
+  await loadState();
+  $('nav button[data-tab="investigate"]').click();
+  $("#invView").hidden = true; $("#invSetup").hidden = false;
+  const latest = $('input[name="invStart"][value="latest"]'); if (latest) latest.checked = true;
+  $("#invProblem").focus();
+};
 
 // ---- settings ----
 let settingsLoaded = false, setModel = null, setMeta = null;
@@ -5348,6 +5405,9 @@ function renderSettings() {
   $$("[data-ai-bool]").forEach(i => i.checked = yes(m.ai[i.dataset.aiBool] || "yes"));
   if (!m.ai.provider) $("#setProvider").value = "openai";
   providerHints();
+  const prof = setMeta.profile || "genai";
+  $$('input[name="setProfile"]').forEach(r => r.checked = r.value === prof);
+  showProfile(); $("#setModel").dataset.profile = prof;
   const gs = $("#setGroups");
   gs.textContent = "";
   m.groups.forEach(g => gs.append(groupCard(g)));
@@ -5373,6 +5433,9 @@ function collectSettings() {
   $$("[data-set]").forEach(i => m.settings[i.dataset.set] = i.value.trim());
   $$("[data-set-bool]").forEach(i => m.settings[i.dataset.setBool] = i.checked ? "yes" : "no");
   $$("[data-ai]").forEach(i => m.ai[i.dataset.ai] = i.value.trim());
+  const prof = currentProfile();
+  m.ai.profile = prof;
+  if (PRESETS[prof]) { m.ai[prof + "_model"] = $("#setModel").value.trim(); m.ai.model = setModel.ai.model || ""; }
   $$("[data-ai-bool]").forEach(i => m.ai[i.dataset.aiBool] = i.checked ? "yes" : "no");
   for (const card of $$("#setGroups > .card")) {
     const v = c => { const i = $(c, card); return i ? i.value.trim() : ""; };
@@ -5420,6 +5483,27 @@ $("#setAddGroup").onclick = () => {
 };
 $("#setAddCmd").onclick = () => $("#setCmds").append(cmdRow({}));
 const aiForm = () => collectSettings().ai;
+const PRESETS = {
+  genai: { title: "GenAI.mil", url: "https://api.genai.mil/v1/chat/completions", model: "gemini-3.5-flash-lite-withtools",
+    key: "Paste the API key from the GenAI.mil portal (it starts with STARK_)." },
+  capra: { title: "CAPRA (Ask Sage)", url: "chat.capra.flankspeed.us.navy.mil", model: "",
+    key: "Paste the API key you created in CAPRA / Ask Sage, then click Find models and pick one." } };
+function currentProfile() { const r = $('input[name="setProfile"]:checked'); return r ? r.value : "genai"; }
+function showProfile() {
+  const p = currentProfile(), pre = PRESETS[p];
+  $("#setCustomAi").hidden = !!pre;
+  $("#setPresetInfo").textContent = pre ? "Address: " + pre.url + " (filled in for you). " + pre.key : "";
+  const model = pre ? (setModel.ai[p + "_model"] || pre.model) : (setModel.ai.model || "");
+  $("#setModel").value = model;
+  $("#setModelList").textContent = "";
+  $("#setAiMsg").textContent = ""; $("#setModelsMsg").textContent = "";
+}
+$$('input[name="setProfile"]').forEach(r => r.addEventListener("change", () => {
+  // keep what was typed for the profile being left
+  const was = $("#setModel").dataset.profile;
+  if (was) { if (PRESETS[was]) setModel.ai[was + "_model"] = $("#setModel").value.trim(); else setModel.ai.model = $("#setModel").value.trim(); }
+  showProfile(); $("#setModel").dataset.profile = currentProfile();
+}));
 function providerHints() {
   const p = $("#setProvider").value;
   $("#setUrlLabel").textContent = p === "asksage" ? "Ask Sage server address" : p === "azure" ? "Azure OpenAI endpoint URL" : "Endpoint address";
@@ -5596,7 +5680,22 @@ function renderInvestigateSetup(st) {
   $("#invGo").disabled = !ai.configured;
   $("#aiWho").textContent = ai.configured ? "AI: " + ai.model + " at " + ai.base_url + ", up to " + ai.max_rounds + " rounds." : "";
   $("#invLatest").textContent = ai.latest_report ? "(" + ai.latest_report + ")" : "(none yet)";
-  $("#aiKey").placeholder = ai.key_ready ? "a key is already set (Settings)" : "or set it once on the Settings tab";
+  $("#aiKey").placeholder = ai.key_ready ? "a key is already saved for this service" : "paste the API key";
+  $("#aiKeyState").textContent = ai.key_ready ? "A key is saved for " + (ai.profile === "custom" ? "this service" :
+    (ai.presets.find(x => x.id === ai.profile) || {}).title) + "; leave the field empty to use it." :
+    (ai.presets.find(x => x.id === ai.profile) || {}).key_hint ? "Use " + ai.presets.find(x => x.id === ai.profile).key_hint + "." : "";
+  $("#aiRememberRow").hidden = !ai.keychain;
+  const pr = $("#invProfiles");
+  pr.textContent = "";
+  const opts = (ai.presets || []).map(x => [x.id, x.title]).concat([["custom", "Other" + (ai.custom_name ? " (" + ai.custom_name + ")" : "")]]);
+  for (const [id, title] of opts) {
+    const r = el("input", { type: "radio", name: "invProfile", value: id, checked: id === ai.profile });
+    r.onchange = async () => {
+      try { await api("ai_profile", { profile: id }); } catch (e) { $("#invMsg").textContent = e.message; }
+      loadState();
+    };
+    pr.append(el("label", { className: "chk", style: "margin:0 12px 0 0" }, r, " " + title));
+  }
   const box = $("#invCreds");
   if (!box.children.length || box.dataset.n !== String(sections.length)) {
     box.textContent = "";
@@ -5613,7 +5712,7 @@ function invCreds() {
 }
 $("#invGo").onclick = async () => {
   const start = $('input[name="invStart"]:checked').value;
-  const req = { problem: $("#invProblem").value, start, key: $("#aiKey").value, creds: invCreds(),
+  const req = { problem: $("#invProblem").value, start, key: $("#aiKey").value, remember: $("#aiRemember").checked, creds: invCreds(),
     options: { parallel: +$("#optParallel").value, max_lines: +$("#optLines").value, strict: $("#optStrict").checked } };
   if (start === "collect") {
     req.collect = {};
@@ -5857,6 +5956,9 @@ class Gui:
         cfg = ai_settings(settings)
         latest = latest_report(self.args)
         out["ai"] = {"configured": bool(cfg["base_url"] and cfg["model"]), "model": cfg["model"],
+                     "profile": cfg["profile"], "keychain": keychain_available(),
+                     "presets": [{"id": k, "title": v_["title"], "key_hint": v_["key_hint"]} for k, v_ in AI_PRESETS.items()],
+                     "custom_name": (settings.get("_ai") or {}).get("base_url", ""),
                      "base_url": cfg["base_url"], "key_env": cfg["key_env"],
                      "key_from_env": bool(os.environ.get(cfg["key_env"])), "max_rounds": cfg["max_rounds"],
                      "key_ready": bool(resolve_ai_key(cfg, "", self.ai_keys)),
@@ -5966,6 +6068,7 @@ class Gui:
         types = [{"type": t, "title": c["title"], "default_user": c["user"],
                   "host_label": c.get("host_label", "Hosts")} for t, c in COMPONENTS.items()]
         return {"model": model, "meta": {
+            "profile": ai_profile(model["ai"]),
             "types": types, "standard_services": STANDARD_MGMT_SERVICES, "keychain": keychain_available(),
             "key": {"session": bool(self.ai_keys.get(endpoint_id(cfg))), "env": bool(os.environ.get(cfg["key_env"])),
                     "env_name": cfg["key_env"], "keychain": bool(keychain_get(cfg["base_url"]))},
@@ -5994,6 +6097,24 @@ class Gui:
                 "note": client.note,
                 "url": client.url if client.flavor == "openai" else client.native + "/query",
                 "flavor": "OpenAI-compatible API" if client.flavor == "openai" else "native Ask Sage API"}
+
+    def api_ai_profile(self, body):
+        """Switch the AI service (and optionally remember a key) from the Investigate tab."""
+        profile = str(body.get("profile") or "")
+        if profile not in AI_PRESETS and profile != "custom":
+            raise Fatal("unknown AI service '%s'" % profile)
+        path = self.inventory_path()
+        text = INVENTORY_TEMPLATE
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+        model = read_settings_model(text)
+        model["ai"]["profile"] = profile
+        self.api_inventory_set({"text": render_settings_model(model)})
+        cfg = ai_settings({"_ai": model["ai"]})
+        if profile == "custom" and not cfg["base_url"]:
+            raise Fatal("set up the other AI service on the Settings tab first")
+        return {"ok": True, "key": self._key_state(cfg), "model": cfg["model"]}
 
     def api_ai_check(self, body):
         cfg = ai_settings({"_ai": body.get("ai") or {}})
@@ -6054,6 +6175,8 @@ class Gui:
             key = resolve_ai_key(cfg, str(body.get("key") or ""), self.ai_keys)
             if body.get("key"):
                 self.ai_keys[endpoint_id(cfg)] = clean_key(str(body["key"]))
+                if body.get("remember") and keychain_available():
+                    keychain_set(cfg["base_url"], clean_key(str(body["key"])))
             problem = str(body.get("problem") or "").strip()
             if not problem:
                 raise Fatal("describe the problem first")
@@ -6312,6 +6435,8 @@ class Gui:
                 return self.api_ai_models(body)
             if route == "ai_check":
                 return self.api_ai_check(body)
+            if route == "ai_profile":
+                return self.api_ai_profile(body)
             if route == "ai_key":
                 return self.api_ai_key(body)
             if route == "open_folder":

@@ -1707,6 +1707,33 @@ class LockedKey(unittest.TestCase):
             srv.server_close()
 
 
+class AiPresets(unittest.TestCase):
+    def test_presets_and_existing_settings(self):
+        genai = v.ai_settings({})
+        self.assertEqual((genai["profile"], genai["provider"], genai["base_url"], genai["model"]),
+                         ("genai", "openai", "https://api.genai.mil/v1/chat/completions", "gemini-3.5-flash-lite-withtools"))
+        capra = v.ai_settings({"_ai": {"profile": "capra", "capra_model": "gpt-4o-gov"}})
+        self.assertEqual((capra["provider"], capra["base_url"], capra["model"]),
+                         ("asksage", "chat.capra.flankspeed.us.navy.mil", "gpt-4o-gov"))
+        # settings written before presets existed are recognised, and their model kept
+        old = v.ai_settings({"_ai": {"base_url": "https://api.genai.mil/v1/chat/completions", "model": "gemini-x"}})
+        self.assertEqual((old["profile"], old["model"]), ("genai", "gemini-x"))
+        old = v.ai_settings({"_ai": {"provider": "asksage", "base_url": "https://chat.capra.flankspeed.us.navy.mil"}})
+        self.assertEqual(old["profile"], "capra")
+        custom = v.ai_settings({"_ai": {"base_url": "https://ai.example.internal/v1", "model": "m"}})
+        self.assertEqual((custom["profile"], custom["base_url"]), ("custom", "https://ai.example.internal/v1"))
+        # each preset keeps its own model; the custom one is untouched
+        both = {"_ai": {"profile": "genai", "genai_model": "g", "capra_model": "c", "base_url": "https://x/v1", "model": "x"}}
+        self.assertEqual(v.ai_settings(both)["model"], "g")
+        both["_ai"]["profile"] = "capra"
+        self.assertEqual(v.ai_settings(both)["model"], "c")
+        both["_ai"]["profile"] = "custom"
+        self.assertEqual((v.ai_settings(both)["model"], v.ai_settings(both)["base_url"]), ("x", "https://x/v1"))
+        # keys are kept per service: a key for one is never used for the other
+        session = {v.endpoint_id(v.ai_settings({"_ai": {"profile": "capra"}})): "capra-key"}
+        self.assertEqual(v.resolve_ai_key(v.ai_settings({}), "", session), "")
+
+
 class GuiApi(unittest.TestCase):
     """The browser GUI's local web API, without contacting any host."""
 
@@ -1802,6 +1829,10 @@ class GuiApi(unittest.TestCase):
     def test_investigate_needs_an_ai_and_a_problem(self):
         self.call("api/inventory", {"text": "[esxi]\nhosts = esx01.corp.example-widgets.com\n"})
         code, st = self.call("api/state")
+        self.assertTrue(st["ai"]["configured"])                # a fresh installation starts with GenAI.mil
+        self.assertEqual(st["ai"]["profile"], "genai")
+        self.call("api/inventory", {"text": "[esxi]\nhosts = esx01.corp.example-widgets.com\n[ai]\nprofile = custom\n"})
+        code, st = self.call("api/state")
         self.assertFalse(st["ai"]["configured"])
         code, out = self.call("api/investigate", {"problem": "x"})
         self.assertEqual(code, 400)
@@ -1860,6 +1891,22 @@ class GuiApi(unittest.TestCase):
         self.assertIn("not a valid endpoint address", out["error"])
         code, out = self.call("api/ai_test", {"ai": {"base_url": "capra1.example.mil", "provider": "asksage"}})
         self.assertIn("choose a model first", out["error"])
+
+    def test_switching_the_ai_service(self):
+        self.call("api/inventory", {"text": "[esxi]\nhosts = esx01.corp.example-widgets.com\n"})
+        code, out = self.call("api/ai_profile", {"profile": "capra"})
+        self.assertEqual(code, 200)
+        code, st = self.call("api/state")
+        self.assertEqual(st["ai"]["profile"], "capra")
+        self.assertIn("chat.capra", st["ai"]["base_url"])
+        self.assertEqual([p["id"] for p in st["ai"]["presets"]], ["genai", "capra"])
+        code, r = self.call("api/settings")
+        self.assertEqual((r["meta"]["profile"], r["model"]["ai"]["profile"]), ("capra", "capra"))
+        self.assertEqual([g["type"] for g in r["model"]["groups"]], ["esxi"])     # nothing else changed
+        code, out = self.call("api/ai_profile", {"profile": "custom"})
+        self.assertEqual(code, 400)
+        self.assertIn("set up the other AI service", out["error"])
+        self.assertEqual(self.call("api/ai_profile", {"profile": "nope"})[0], 400)
 
     def test_anonymize_and_translate_back(self):
         self.call("api/inventory", {"text": "[esxi]\nhosts = esx01.corp.example-widgets.com\n"})
