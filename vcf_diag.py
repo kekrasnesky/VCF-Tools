@@ -407,18 +407,332 @@ def post_nsx_services(out):
     return "\n".join(lines)
 
 
+# ---- generic summarizers for Linux, Kubernetes and log output ----------------
+
+# df lines of container and pod mounts: overlay roots, per-pod shm/tmpfs (secrets, tokens)
+RX_POD_MOUNT = re.compile(r"(?:^overlay\s|^shm\s|^tmpfs\s.*\s/var/lib/kubelet/pods/|"
+                          r"\s/run/containerd/|\s/var/lib/kubelet/pods/|\s/var/lib/containerd/.*/rootfs\s*$|"
+                          r"\s/run/k3s/containerd/)")
+
+
+def post_df(out):
+    """df -hP / df -iP: leave out container and pod mounts (overlay, shm, per-pod tmpfs)."""
+    lines = out.splitlines()
+    keep = [ln for ln in lines if not RX_POD_MOUNT.search(ln)]
+    n = len(lines) - len(keep)
+    if not n:
+        return out
+    return "\n".join(keep + ["(%d container/pod mounts omitted: overlay, shm and tmpfs under "
+                             "/var/lib/kubelet/pods and /run/containerd)" % n])
+
+
+RX_LOG_TS = re.compile(
+    r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?"     # ISO 8601
+    r"|(?<![\w])[IWEF]\d{4} \d{2}:\d{2}:\d{2}\.\d+"                                # klog E1118 10:00:00.123
+    r"|(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)?,? ?(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) +\d{1,2},? "
+    r"(?:\d{4} )?\d{2}:\d{2}:\d{2}(?:\.\d+)?"                                       # syslog Nov 18 10:00:00
+    r"|\b\d{10}(?:\.\d+)?\b")                                                       # epoch seconds
+RX_LOG_VOLATILE = [
+    (re.compile(r"(?i)\b(opID|op_id|operationID|reconcileID|requestID|request_id|traceID|spanID|sessionId|"
+                r"correlationId|txnId|taskId|sub)\s*[=:]\s*\"?[^\s\",}\]]+"), r"\1=*"),
+    (re.compile(r"(?i)\"(reconcileID|requestID|traceID|spanID)\"\s*:\s*\"[^\"]*\""), r'"\1":"*"'),
+    (re.compile(r"(?i)\b(pid|tid|thread|thread-id|threadId)\s*[=: ]\s*\d+"), r"\1=*"),
+    (re.compile(r"\[(?:\d+|[0-9a-fA-F]{4,})\]"), "[*]"),                            # kubelet[1234], [7f1a]
+    (re.compile(r"(?<![\w-])[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(?![\w-])"),
+     "<uuid>"),
+    (re.compile(r"\b0x[0-9a-fA-F]+\b"), "0x*"),
+    (re.compile(r"(?<![\w-])(?=[0-9a-fA-F]*\d)(?=[0-9a-fA-F]*[a-fA-F])[0-9a-fA-F]{12,}(?![\w-])"), "<hex>"),
+    (re.compile(r"(?<![\w.])\d+(?:\.\d+)?(?:ms|µs|us|ns|s)\b"), "<dur>"),
+    (re.compile(r"(?<=[\s:=@])\d{4,}(?![\w.])"), "<n>"),                            # thread / process numbers
+    (re.compile(r"[ \t]+"), " "),
+]
+
+
+def log_key(line):
+    """A log line with time stamps, ids, process and thread numbers normalized: lines that
+    differ only in those are the same message."""
+    k = RX_LOG_TS.sub("<ts>", line)
+    for rx, rep in RX_LOG_VOLATILE:
+        k = rx.sub(rep, k)
+    return k.strip()
+
+
+def _ts_of(line):
+    m = RX_LOG_TS.search(line)
+    return m.group(0).strip() if m else ""
+
+
+def dedup_lines(lines, sample_chars=400):
+    """[(count, first_ts, last_ts, sample)] for lines grouped by log_key, in order of first appearance."""
+    groups, order = {}, []
+    for ln in lines:
+        if not ln.strip():
+            continue
+        k = log_key(ln)
+        g = groups.get(k)
+        if g is None:
+            g = groups[k] = [0, _ts_of(ln), "", ln]
+            order.append(k)
+        g[0] += 1
+        g[2] = _ts_of(ln) or g[2]
+        g[3] = ln                                   # keep the latest occurrence as the sample
+    out = []
+    for k in order:
+        n, first, last, sample = groups[k]
+        sample = sample.strip()
+        if len(sample) > sample_chars:
+            sample = sample[:sample_chars] + " ...[cut]"
+        out.append((n, first, last, sample))
+    return out
+
+
+def _dedup_block(lines):
+    rows = dedup_lines(lines)
+    res = []
+    for n, first, last, sample in rows:
+        span = first if not last or first == last else "%s..%s" % (first, last)
+        res.append("%4d x  %s%s" % (n, (span + "  ") if span and n > 1 else "", sample))
+    return res, len(rows)
+
+
+def post_log_dedup(out, drop=None, noise=None, noise_label="noise"):
+    """Group repeated log lines: 'count x  first..last  latest sample line'. Time stamps, thread
+    and process numbers, operation / reconcile ids, UUIDs and hex ids are ignored when comparing.
+    Sections that start with '== name' (one per pod or file) are deduplicated separately.
+    drop: function(line) -> True for lines that are not errors at all (counted, not shown);
+    noise: function(line) -> True for low-value lines (counted, most frequent one shown)."""
+    lines = out.splitlines()
+    total = len([ln for ln in lines if ln.strip()])
+    if not total:
+        return out
+    dropped, noisy, sections, cur = [], [], [], ["", []]
+    sections.append(cur)
+    for ln in lines:
+        if ln.startswith("== "):
+            cur = [ln, []]
+            sections.append(cur)
+        elif drop and drop(ln):
+            dropped.append(ln)
+        elif noise and noise(ln):
+            noisy.append(ln)
+        else:
+            cur[1].append(ln)
+    res, distinct = [], 0
+    for head, body in sections:
+        if head:
+            res.append(head)
+        if body or not head:
+            block, n = _dedup_block(body)
+            distinct += n
+            res += block
+        elif head:
+            res.append("     (no matching lines)")
+    shown = total - len(dropped) - len(noisy) - sum(1 for h, _ in sections if h)
+    if distinct == shown and not dropped and not noisy:
+        return out                                    # nothing repeated: keep the original
+    head = ["%d line(s) -> %d distinct message(s) (count, first..last time stamp, latest example; time stamps, "
+            "ids and thread numbers ignored when grouping):" % (shown, distinct)]
+    if noisy:
+        top = dedup_lines(noisy)
+        top.sort(key=lambda r: -r[0])
+        head.append("%d %s line(s) counted but not listed; most frequent (%dx): %s" % (
+            len(noisy), noise_label, top[0][0], top[0][3]))
+    if dropped:
+        head.append("%d line(s) left out: they matched the search words but report no error" % len(dropped))
+    return "\n".join(head + [ln for ln in res if ln.strip() or ln == ""]).rstrip()
+
+
+def _is_notice(ln):
+    """A line logged at NOTICE / INFO level (the level word stands alone near the start; an
+    'SQLITE_ERROR' later in the message does not make it an error)."""
+    head = ln[:100]
+    return bool(re.search(r"\b(NOTICE|INFO|notice|info)\b", head)) and \
+        not re.search(r"(?<![\w])(ERROR|SEVERE|FATAL|CRITICAL|error|severe|fatal)\b(?![_:\]])", head)
+
+
+def post_sso_errors(out):
+    """SSO / directory log errors: deduplicated; NOTICE-level lines (vmafdd SQLite notices that
+    contain the word 'error') are counted as noise."""
+    return post_log_dedup(out, noise=_is_notice, noise_label="NOTICE/INFO-level")
+
+
+def _kubelet_not_error(ln):
+    msg = re.sub(r"^.*?\]:\s*", "", ln) if "]:" in ln[:80] else ln
+    return msg.lstrip().startswith("No ") or "No image pull failure found" in ln
+
+
+def post_kubelet_errors(out):
+    """kubelet journal errors: deduplicated; kubelet-watchdog 'No ... found' lines left out."""
+    return post_log_dedup(out, drop=_kubelet_not_error)
+
+
+def post_events(out):
+    """Warning events: one line per (namespace, reason, message), with the count, the most recent
+    age and the objects involved, most recent first."""
+    groups, order, total, other = {}, [], 0, []
+    for ln in out.splitlines():
+        cols = ln.split(None, 5)
+        if not cols or cols[0] == "NAMESPACE":
+            continue
+        if len(cols) < 6 or cols[2] not in ("Warning", "Normal", "Error"):
+            other.append(ln)
+            continue
+        ns, age, typ, reason, obj, msg = cols
+        total += 1
+        key = (ns, typ, reason, log_key(msg))
+        g = groups.get(key)
+        if g is None:
+            g = groups[key] = {"n": 0, "age": age, "objs": [], "msg": msg}
+            order.append(key)
+        g["n"] += 1
+        g["age"] = age                     # sorted by last time stamp: the later row is more recent
+        g["msg"] = msg
+        if obj not in g["objs"]:
+            g["objs"].append(obj)
+        order.remove(key)
+        order.append(key)
+    if not total:
+        return out
+    lines = ["%d event(s) -> %d distinct (namespace, reason, message), most recent first:" % (total, len(groups)),
+             "count  last seen  namespace  type  reason  objects  message"]
+    for key in reversed(order):
+        g = groups[key]
+        objs = g["objs"][:4]
+        more = " +%d more" % (len(g["objs"]) - 4) if len(g["objs"]) > 4 else ""
+        lines.append("%4dx  %s  %s  %s  %s  %s%s  %s" % (g["n"], g["age"], key[0], key[1], key[2],
+                                                        ",".join(objs), more, g["msg"]))
+    return "\n".join(lines + other)
+
+
+def post_readyz(out):
+    """/readyz?verbose: one line when every check is ok, otherwise the failing checks."""
+    checks = re.findall(r"(?m)^\[([+-])\](\S+)\s*(.*)$", out)
+    if not checks:
+        return out
+    bad = [c for c in checks if c[0] != "+"]
+    verdict = re.search(r"(?m)^readyz check (passed|failed)", out)
+    lines = ["readyz check %s (%d/%d ok)" % (verdict.group(1) if verdict else ("failed" if bad else "passed"),
+                                            len(checks) - len(bad), len(checks))]
+    lines += ["  [-]%s %s" % (c[1], c[2]) for c in bad]
+    return "\n".join(lines)
+
+
+def post_systemctl_status(out):
+    """systemctl status: leave out the containerd-shim lines of the CGroup tree (one per pod)."""
+    lines = out.splitlines()
+    keep = [ln for ln in lines if "containerd-shim" not in ln]
+    n = len(lines) - len(keep)
+    return "\n".join(keep + ["(%d containerd-shim process line(s) omitted)" % n]) if n else out
+
+
+def post_pv(out):
+    """kubectl get pv: only volumes that are not Bound (Bound ones appear under the claims)."""
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    if not lines or not lines[0].startswith("NAME"):
+        return out
+    states = ("Bound", "Available", "Released", "Failed", "Pending")
+    rows = [ln for ln in lines[1:] if any(s in ln.split() for s in states)]
+    if len(rows) != len(lines) - 1:
+        return out
+    other = [ln for ln in rows if "Bound" not in ln.split()]
+    res = ["%d persistent volume(s), %d Bound (see the claims), %d not Bound%s" % (
+        len(rows), len(rows) - len(other), len(other), ":" if other else ".")]
+    return "\n".join(res + ([lines[0]] + other if other else []))
+
+
+RX_POD_SUFFIX = re.compile(r"(?:-[a-f0-9]{8,10})?-[a-z0-9]{5}$|-\d+$")
+
+
+def post_all_pods(out):
+    """kubectl get pods -A: one line per namespace (pod states, not ready, restarts, workloads).
+    The full list is still read by the anonymizer, so every pod name is known."""
+    per, order, total = {}, [], 0
+    for ln in out.splitlines():
+        cols = ln.split()
+        if not cols or cols[0] == "NAMESPACE":
+            continue
+        if len(cols) < 5 or not re.fullmatch(r"\d+/\d+", cols[2]):
+            return out
+        total += 1
+        ns = per.get(cols[0])
+        if ns is None:
+            ns = per[cols[0]] = {"n": 0, "st": {}, "nr": 0, "rs": 0, "wl": {}}
+            order.append(cols[0])
+        ns["n"] += 1
+        ns["st"][cols[3]] = ns["st"].get(cols[3], 0) + 1
+        a, b = cols[2].split("/")
+        if a != b and cols[3] != "Completed":
+            ns["nr"] += 1
+        m = re.match(r"\d+", cols[4])
+        ns["rs"] += int(m.group(0)) if m else 0
+        wl = RX_POD_SUFFIX.sub("", cols[1]) or cols[1]
+        ns["wl"][wl] = ns["wl"].get(wl, 0) + 1
+    if not total:
+        return out
+    lines = ["%d pods in %d namespaces (per namespace: states, not ready, restarts, workloads = pod name "
+             "without the generated suffix):" % (total, len(order))]
+    for name in order:
+        ns = per[name]
+        st = ", ".join("%d %s" % (n, s) for s, n in sorted(ns["st"].items(), key=lambda kv: (kv[0] != "Running", kv[0])))
+        wl = sorted(ns["wl"].items(), key=lambda kv: (-kv[1], kv[0]))
+        wls = ", ".join("%s(%d)" % kv for kv in wl[:8]) + (" +%d more" % (len(wl) - 8) if len(wl) > 8 else "")
+        lines.append("%s: %d pods (%s)%s%s; workloads: %s" % (
+            name, ns["n"], st, ", %d not ready" % ns["nr"] if ns["nr"] else "",
+            ", restarts %d" % ns["rs"] if ns["rs"] else "", wls))
+    return "\n".join(lines)
+
+
+def post_esxi_policy(out):
+    """esxcli advanced settings for the password and lockout policy, one line per option."""
+    vals, cur, errs = [], None, {}
+    for ln in out.splitlines():
+        m = re.match(r"^==\s+(\S+)", ln)
+        if m:
+            cur = [m.group(1), None]
+            vals.append(cur)
+            continue
+        m = re.match(r"^\s*Path:\s*(\S+)", ln)
+        if m and (cur is None or cur[1] is not None or cur[0] != m.group(1)):
+            cur = [m.group(1), None]
+            vals.append(cur)
+            continue
+        m = re.match(r"^\s*(Int Value|String Value):\s*(.*?)\s*$", ln)
+        if m and cur is not None:
+            if m.group(1) == "Int Value" or (m.group(2) and cur[1] is None):
+                cur[1] = m.group(2)
+            continue
+        if cur is not None and ln.strip() and cur[1] is None and not re.match(r"^\s+\w[\w ]*:", ln):
+            errs.setdefault(cur[0], ln.strip())
+    if not vals:
+        return out
+    lines = []
+    for path, val in vals:
+        if val is not None:
+            lines.append("%s = %s" % (path, val if val != "" else "(empty)"))
+        else:
+            lines.append("%s: not available on this host%s" % (path, (" (%s)" % errs[path][:120]) if path in errs else ""))
+    return "\n".join(lines)
+
+
 H_SEARCH = ("domain", r"(?m)^\s*(?:search|domain)\s+(.+)$", r"[\s,]+")
 
 
-def linux_groups():
-    return [
+# Answers "is anything serving TLS on 443" without failing when nothing listens there.
+CERT_443 = ("c=$(echo | timeout 10 openssl s_client -connect localhost:443 2>/dev/null | openssl x509 2>/dev/null); "
+            "if [ -z \"$c\" ]; then echo 'nothing answered with a certificate on localhost:443'; "
+            "else printf '%s\\n' \"$c\" | openssl x509 -noout -subject -issuer -dates 2>&1; fi")
+
+
+def linux_groups(cert=True):
+    """cert=False for Kubernetes nodes: nothing on the node itself listens on 443."""
+    groups = [
         ("os", "OS, uptime, CPU, memory, disk", [
             cmd("OS release", "head -n 6 /etc/os-release 2>/dev/null"),
             cmd("Uptime and load", "uptime"),
             cmd("Memory", "free -m"),
-            cmd("Disk usage", "df -hP"),
-            cmd("Inode usage", "df -iP"),
-            cmd("Top processes", "top -bn1 2>/dev/null | head -n 17"),
+            cmd("Disk usage", "df -hP", post=post_df),
+            cmd("Inode usage", "df -iP", post=post_df),
+            cmd("Top processes", "top -bn1 2>/dev/null | grep -v '^%Cpu[0-9]' | head -n 17"),
         ]),
         ("services", "systemd service state", [
             cmd("System state", "systemctl is-system-running 2>&1"),
@@ -443,12 +757,10 @@ def linux_groups():
                 "for u in $(printf '%s\\n' root \"$(id -un)\" | sort -u); do echo \"== $u\";"
                 " chage -l \"$u\" 2>&1 | head -n 4; done"),
         ]),
-        ("cert", "Local HTTPS certificate", [
-            cmd("Certificate on port 443",
-                "echo | timeout 10 openssl s_client -connect localhost:443 2>/dev/null"
-                " | openssl x509 -noout -subject -issuer -dates 2>&1"),
-        ]),
     ]
+    if cert:
+        groups.append(("cert", "Local HTTPS certificate", [cmd("Certificate on port 443", CERT_443)]))
+    return groups
 
 
 # Output templates for kubectl: one line per pod (with each container's state) and per node.
@@ -463,7 +775,7 @@ NODE_COND_JSONPATH = ('{range .items[*]}{.metadata.name}{range .status.condition
 K8S_GROUPS = [
     ("k8s-cluster", "Kubernetes API and nodes", [
         kctl("API server version", "{K} version 2>&1 | head -n 6"),
-        kctl("API readiness checks", "{K} get --raw='/readyz?verbose' 2>&1 | tail -n 70"),
+        kctl("API readiness checks", "{K} get --raw='/readyz?verbose' 2>&1 | tail -n 70", post=post_readyz),
         kctl("Nodes", "{K} get nodes -o wide 2>&1", k8s="nodes"),
         kctl("Node conditions and allocation",
              "{K} describe nodes 2>&1 | grep -E '^Name:|^Taints:|^  (MemoryPressure|DiskPressure|"
@@ -477,24 +789,23 @@ K8S_GROUPS = [
              "{K} get pods -A -o wide --no-headers 2>&1 | awk '{split($3,a,\"/\");"
              " if ($4!=\"Completed\" && ($4!=\"Running\" || a[1]!=a[2])) print}'",
              k8s="nsrows", max_lines=300),
-        kctl("Pod status counts per namespace",
-             "{K} get pods -A --no-headers 2>&1 | awk '{c[$1\" \"$4]++} END{for(k in c) print k, c[k]}'"
-             " | sort", k8s="nsrows", max_lines=300),
         kctl("Pods with most restarts",
              "{K} get pods -A --no-headers 2>&1 | awk '$5+0>0' | sort -k5 -n -r | head -n 30",
              k8s="nsrows"),
-        kctl("All pods", "{K} get pods -A -o wide 2>&1", k8s="nsrows", max_lines=900),
+        # summarized per namespace; the anonymizer still learns every pod name from the full list
+        kctl("All pods (per namespace)", "{K} get pods -A -o wide 2>&1", k8s="nsrows", max_lines=300,
+             post=post_all_pods),
         kctl("Deployments, StatefulSets, DaemonSets", "{K} get deploy,sts,ds -A 2>&1",
              k8s="nsrows", max_lines=500),
     ]),
     ("k8s-storage", "Persistent storage", [
         kctl("Persistent volume claims", "{K} get pvc -A 2>&1", k8s="nsrows", max_lines=300),
-        kctl("Persistent volumes", "{K} get pv 2>&1", max_lines=300),
+        kctl("Persistent volumes not Bound", "{K} get pv 2>&1", max_lines=300, post=post_pv),
     ]),
     ("k8s-events", "Warning events", [
         kctl("Latest warning events",
              "{K} get events -A --field-selector type!=Normal --sort-by=.lastTimestamp 2>&1"
-             " | tail -n 80", k8s="nsrows"),
+             " | tail -n 150", k8s="nsrows", post=post_events),
     ]),
     ("k8s-health", "Node and pod health in depth", [
         kctl("Node conditions with reasons",
@@ -502,10 +813,6 @@ K8S_GROUPS = [
         kctl("Cordoned or tainted nodes",
              "{K} get nodes -o custom-columns='NAME:.metadata.name,UNSCHEDULABLE:.spec.unschedulable,"
              "TAINTS:.spec.taints[*].key,EFFECT:.spec.taints[*].effect' 2>&1", k8s="firstnode"),
-        kctl("Node versions (kubelet, kernel, runtime, OS) - mismatches matter",
-             "{K} get nodes -o custom-columns='NAME:.metadata.name,KUBELET:.status.nodeInfo.kubeletVersion,"
-             "KERNEL:.status.nodeInfo.kernelVersion,RUNTIME:.status.nodeInfo.containerRuntimeVersion,"
-             "OS:.status.nodeInfo.osImage' 2>&1", k8s="firstnode"),
         kctl("Pod capacity and pods per node",
              "{K} get nodes -o custom-columns='NAME:.metadata.name,MAX_PODS:.status.allocatable.pods,"
              "CPU:.status.allocatable.cpu,MEMORY:.status.allocatable.memory' --no-headers 2>&1 | while read n m c r; do "
@@ -513,13 +820,14 @@ K8S_GROUPS = [
              "--field-selector spec.nodeName=$n 2>/dev/null | wc -l)\"; done", k8s="firstnode", timeout=90),
         kctl("Control-plane component pods",
              "{K} -n kube-system get pods -l tier=control-plane -o wide 2>&1", k8s="nsrows"),
+        # the etcd image has no shell: etcdctl is run directly, the API version is a flag-free default (v3)
         kctl("etcd health and status (leader, database size)",
              "p=$({K} -n kube-system get pods -l component=etcd -o name 2>/dev/null | head -n 1); "
              "if [ -z \"$p\" ]; then echo 'no etcd pod found in kube-system'; else "
              "for c in 'endpoint health --cluster' 'endpoint status --cluster -w table'; do "
-             "{K} -n kube-system exec \"$p\" -- sh -c \"ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 "
+             "{K} -n kube-system exec \"$p\" -- etcdctl --endpoints=https://127.0.0.1:2379 "
              "--cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/server.crt "
-             "--key=/etc/kubernetes/pki/etcd/server.key $c\" 2>&1; done; fi", timeout=90),
+             "--key=/etc/kubernetes/pki/etcd/server.key $c 2>&1; done; fi", timeout=90),
         kctl("Problem containers (not ready, waiting, restarted, last termination)",
              "{K} get pods -A -o jsonpath=%s 2>&1 | awk '/ready=false|waiting=[A-Za-z]|restarts=[1-9]|"
              "phase=(Pending|Failed|Unknown)/' | head -n 150" % shlex.quote(POD_JSONPATH), k8s="nsslash", max_lines=200),
@@ -638,8 +946,8 @@ ESXI_GROUPS = [
             "$1, age, ($5 == \"\" ? \"none\" : $5) }' /etc/shadow 2>&1"),
         cmd("Password and lockout policy",
             "for o in PasswordMaxDays PasswordHistory PasswordQualityControl AccountLockFailures AccountUnlockTime; do "
-            "esxcli system settings advanced list -o /Security/$o 2>/dev/null | grep -E '^ *(Path|Int Value|String Value):'; "
-            "done"),
+            "echo \"== /Security/$o\"; esxcli system settings advanced list -o /Security/$o 2>&1; done",
+            post=post_esxi_policy),
         cmd("Failed logins / locked root", "pam_tally2 --user root 2>&1 || faillock --user root 2>&1"),
     ]),
 ]
@@ -679,7 +987,7 @@ VCENTER_GROUPS = [
         cmd("Recent SSO and directory errors (24 h)",
             "find /var/log/vmware/sso /var/log/vmware/vmdird /var/log/vmware/vmafdd -name '*.log' -mmin -1440 "
             "2>/dev/null | head -n 40 | xargs -r grep -hiE 'error|exception|expired|locked|failed|invalid credential' "
-            "2>/dev/null | tail -n 150", timeout=120, max_lines=200),
+            "2>/dev/null | tail -n 150", timeout=120, max_lines=200, post=post_sso_errors),
         cmd("Active Directory join (Integrated Windows Authentication)", "/opt/likewise/bin/domainjoin-cli query 2>&1"),
         cmd("vmdir database size", "du -sh /storage/db/vmware-vmdir 2>&1"),
         cmd("Local account password ageing",
@@ -693,9 +1001,11 @@ VCENTER_GROUPS = [
         cmd("Supervisor clusters and control-plane address",
             "/usr/lib/vmware-wcp/decryptK8Pwd.py 2>&1 | grep -iE '^ *(cluster|ip)\\b' || echo 'no Supervisor found'"),
         cmd("wcpsvc errors (last 150)",
-            "grep -iE 'error|fail|x509' /var/log/vmware/wcp/wcpsvc.log 2>&1 | tail -n 150", max_lines=200),
+            "grep -iE 'error|fail|x509' /var/log/vmware/wcp/wcpsvc.log 2>&1 | tail -n 150", max_lines=200,
+            post=post_log_dedup),
         cmd("ESX Agent Manager errors (last 60)",
-            "grep -iE ' error |exception' /var/log/vmware/eam/eam.log 2>&1 | tail -n 60", max_lines=80),
+            "grep -iE ' error |exception' /var/log/vmware/eam/eam.log 2>&1 | tail -n 60", max_lines=80,
+            post=post_log_dedup),
     ]),
     ("vc-api-namespaces", "Supervisor namespaces (vCenter API from this computer; needs a vCenter SSO login)", [
         apicmd("Supervisors", "supervisors", "GET /api/vcenter/namespace-management/clusters (+ details)",
@@ -712,7 +1022,7 @@ VCENTER_GROUPS = [
         apicmd("Appliance local accounts and password expiry", "vc_accounts", "GET /api/appliance/local-accounts (+ details)"),
     ]),
     ("vc-storage", "Appliance partitions and core dumps", [
-        cmd("Key partitions", "df -hP /storage/log /storage/db /storage/seat /storage/core 2>&1"),
+        cmd("Key partitions", "df -hP /storage/log /storage/db /storage/seat /storage/core 2>&1", post=post_df),
         cmd("Core dumps", "ls -lh /storage/core 2>&1 | tail -n 15"),
     ]),
 ] + linux_groups()
@@ -754,7 +1064,7 @@ NSX_GROUPS = [
                max_lines=600),
     ]),
     ("os", "OS level (root shell only)", [
-        cmd("Disk usage", "df -hP"),
+        cmd("Disk usage", "df -hP", post=post_df),
         cmd("Failed units", "systemctl --failed --no-pager --no-legend 2>&1 | head -n 40"),
         cmd("Password ageing", "for u in root admin audit; do echo \"== $u\";"
                                " chage -l \"$u\" 2>&1 | head -n 4; done"),
@@ -803,7 +1113,9 @@ NODE_K8S_GROUPS = [
             "for f in /var/lib/kubelet/pki/kubelet-client-current.pem /var/lib/kubelet/pki/kubelet.crt; do "
             "[ -f \"$f\" ] && echo \"$f: $(openssl x509 -enddate -noout -in \"$f\" 2>&1)\"; done; true", sudo=True),
         cmd("Control-plane certificates (kubeadm)",
-            "if command -v kubeadm >/dev/null 2>&1; then kubeadm certs check-expiration 2>&1 | head -n 40; "
+            "if [ ! -f /etc/kubernetes/pki/apiserver.crt ] && [ ! -f /etc/kubernetes/manifests/kube-apiserver.yaml ];"
+            " then echo 'not a control-plane node (no /etc/kubernetes/pki/apiserver.crt): nothing to check';"
+            " elif command -v kubeadm >/dev/null 2>&1; then kubeadm certs check-expiration 2>&1 | head -n 40; "
             "else for f in /etc/kubernetes/pki/*.crt /etc/kubernetes/pki/etcd/*.crt; do [ -f \"$f\" ] && "
             "echo \"$f: $(openssl x509 -enddate -noout -in \"$f\" 2>&1)\"; done; fi", sudo=True, timeout=60),
     ]),
@@ -811,18 +1123,18 @@ NODE_K8S_GROUPS = [
 
 MGMT_NODE_GROUPS = [
     ("node-runtime", "Kubernetes node agents (kubelet, containerd)", [
-        cmd("kubelet and containerd", "systemctl status kubelet containerd --no-pager 2>&1 | head -n 40", sudo=True),
+        cmd("kubelet and containerd", "systemctl status kubelet containerd --no-pager --lines=0 2>&1 | head -n 200",
+            sudo=True, post=post_systemctl_status, max_lines=60),
         cmd("Containers not running",
             "crictl ps -a 2>/dev/null | awk 'NR==1 || $0 !~ /Running/' | head -n 60", sudo=True),
         cmd("Recent kubelet errors",
-            "journalctl -u kubelet --since '-2h' --no-pager 2>/dev/null | grep -iE 'error|fail' | tail -n 40",
-            sudo=True),
+            "journalctl -u kubelet --since '-2h' --no-pager 2>/dev/null | grep -iE 'error|fail' | tail -n 150",
+            sudo=True, post=post_kubelet_errors, max_lines=80),
     ]),
-] + NODE_K8S_GROUPS + linux_groups()
+] + NODE_K8S_GROUPS + linux_groups(cert=False)
 
 MGMT_CLUSTER_GROUPS = K8S_GROUPS + [
     ("k8s-nodes", "Control planes and workers (worker VMs are discovered, not listed)", [
-        kctl("Nodes with roles", "{K} get nodes -o wide --show-labels=false 2>&1", k8s="nodes"),
         kctl("Pods per node",
              "{K} get pods -A -o wide --no-headers 2>&1 | awk '{n[$8]++; if ($4!=\"Running\" && $4!=\"Completed\")"
              " b[$8]++} END{for(k in n) printf \"%-50s pods %4d  not running %d\\n\", k, n[k], b[k]+0}' | sort"),
@@ -850,7 +1162,8 @@ SUPERVISOR_GROUPS = [
         kctl("Cluster API and VM operator controller errors (best effort)",
              "for p in $({K} get pods -A --no-headers 2>/dev/null | awk '$2 ~ /(capi|capv|capw|vmop|vm-operator)"
              ".*controller-manager/ {print $1\"/\"$2}'); do echo \"== ${p#*/}\"; {K} logs -n \"${p%%/*}\" \"${p#*/}\" "
-             "--all-containers --tail=300 2>/dev/null | grep -iE 'error|fail' | tail -n 30; done", timeout=90, max_lines=200),
+             "--all-containers --tail=300 2>/dev/null | grep -iE 'error|fail' | tail -n 100; done", timeout=90, max_lines=200,
+             post=post_log_dedup),
     ]),
 ]
 
@@ -1008,7 +1321,8 @@ OPSNET_GROUPS = [
         cmd("Recent errors in application logs (last 4 h)",
             "if [ -d /var/log/arkin ]; then find /var/log/arkin -name '*.log' -mmin -240 2>/dev/null | head -n 60 "
             "| xargs -r grep -hiE ' error |exception|fatal' 2>/dev/null | tail -n 150; "
-            "else echo 'no /var/log/arkin on this node'; fi", timeout=120, max_lines=200, sudo=True),
+            "else echo 'no /var/log/arkin on this node'; fi", timeout=120, max_lines=200, sudo=True,
+            post=post_log_dedup),
         cmd("Largest log directories", "du -xsh /var/log/* 2>/dev/null | sort -h | tail -n 10", sudo=True),
     ]),
 ] + linux_groups()
@@ -2317,7 +2631,10 @@ class Target:
                 self.clock_offset = ts - (t0 + t1) / 2.0
         if c.get("post") and rc == 0 and not to:
             try:
-                out = c["post"](out)
+                short = c["post"](out)
+                if short != out:
+                    res["raw"] = out      # still read by the anonymizer, never printed
+                out = short
             except Exception:  # noqa: BLE001 - a summarizer must never lose the raw output
                 pass
         res.update(rc=rc, out=out, dur=t1 - t0)
@@ -3422,8 +3739,7 @@ def mgmt_followup(ctx, item, targets, cluster_groups, cred, scrubber, progress):
     node_groups = [g for g in item["groups"] if not is_cluster_group(g[0])]
     if not sec.get("ssh_workers") or not node_groups:
         return
-    table = next((r["out"] for r in have[0].results if r["label"] == "Nodes with roles"), "") or \
-        next((r["out"] for r in have[0].results if r["label"] == "Nodes"), "")
+    table = next((r["out"] for r in have[0].results if r["label"] == "Nodes"), "")
     known = set(t.address for t in targets)
     workers = []
     for line in table.splitlines():
@@ -3467,13 +3783,17 @@ def learn_from_results(done, scrubber):
                 texts.append(t.errmsg)
             for r in t.results:
                 spec = r["spec"]
+                # a summarized result keeps its full output: names are learned from all of it
+                full = r.get("raw") or r["out"]
                 for cat, rx, split in spec["harvest"]:
-                    for m in re.finditer(rx, r["out"]):
+                    for m in re.finditer(rx, full):
                         for v in (re.split(split, m.group(1)) if split else [m.group(1)]):
                             scrubber.learn(cat, v)
                 if spec["k8s"]:
-                    scrubber.learn_k8s(spec["k8s"], r["out"], prefix=nodeprefix)
-                texts.append(r["out"])
+                    scrubber.learn_k8s(spec["k8s"], full, prefix=nodeprefix)
+                texts.append(full)
+                if full is not r["out"]:
+                    texts.append(r["out"])
     for tx in texts:
         scrubber.prescan(tx)
     scrubber.compile()

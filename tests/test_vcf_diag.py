@@ -2552,5 +2552,121 @@ class Automation(unittest.TestCase):
         self.assertEqual(certs["automation_cert_expiring_30d"], 1)
 
 
+class NoiseSummarizers(unittest.TestCase):
+    def test_df_drops_container_and_pod_mounts(self):
+        df = ("Filesystem Size Used Avail Use% Mounted on\n/dev/sda3 40G 20G 20G 50% /\n"
+              "tmpfs 3.9G 0 3.9G 0% /dev/shm\n"
+              "overlay 40G 20G 20G 50% /run/containerd/io.containerd.runtime.v2.task/k8s.io/abc/rootfs\n"
+              "shm 64M 0 64M 0% /run/containerd/io.containerd.grpc.v1.cri/sandboxes/abc/shm\n"
+              "tmpfs 170M 12K 170M 1% /var/lib/kubelet/pods/0a1b/volumes/kubernetes.io~projected/kube-api-access\n")
+        out = v.post_df(df)
+        self.assertIn("/dev/sda3", out)
+        self.assertIn("tmpfs 3.9G 0 3.9G 0% /dev/shm", out)
+        self.assertNotIn("kube-api-access", out)
+        self.assertIn("3 container/pod mounts omitted", out)
+        self.assertEqual(v.post_df("Filesystem\n/dev/sda1 1G 1G 0 100% /"), "Filesystem\n/dev/sda1 1G 1G 0 100% /")
+        self.assertIs(find("vcenter", "Disk usage")["post"], v.post_df)
+
+    def test_log_lines_are_grouped(self):
+        lines = ["2026-11-18T10:%02d:00.%03dZ NOTICE vmafdd t@%d: [SQLITE_ERROR:28] - double-quoted string "
+                 "literal: \"cdcState\"" % (i, i, 1000 + i) for i in range(50)]
+        lines += ["2026-11-18T11:00:0%dZ error wcpsvc opID=ab%dcd Guest operation failed: "
+                  "/dev/shm/secret.tmp was not found" % (i, i) for i in range(3)]
+        lines += ["2026-11-18T11:05:00Z error vmdird bind failed for user x"]
+        out = v.post_sso_errors("\n".join(lines))
+        self.assertIn("50 NOTICE/INFO-level line(s) counted but not listed", out)
+        self.assertIn("   3 x  2026-11-18T11:00:00Z..2026-11-18T11:00:02Z", out)
+        self.assertIn("bind failed", out)
+        self.assertLess(len(out.splitlines()), 8)
+        capi = "== capi-controller-manager-1\n" + "\n".join(
+            'E1118 10:00:%02d.123456       1 controller.go:329] "Reconciler error" err="connection to the workload '
+            'cluster is down" reconcileID="%08d-1111-2222-3333-444455556666"' % (i, i) for i in range(40))
+        out = v.post_log_dedup(capi)
+        self.assertIn("== capi-controller-manager-1", out)
+        self.assertIn("  40 x  ", out)
+        self.assertEqual(v.post_log_dedup("one\ntwo"), "one\ntwo")     # nothing repeated: unchanged
+
+    def test_kubelet_watchdog_no_lines_are_not_errors(self):
+        out = v.post_kubelet_errors(
+            "Nov 18 10:00:00 n1 kubelet-watchdog[12]: No image pull failure found\n"
+            "Nov 18 10:01:00 n1 kubelet-watchdog[12]: No image pull failure found\n"
+            "Nov 18 10:02:00 n1 kubelet[99]: E1118 failed to sync pod x\n")
+        self.assertIn("2 line(s) left out", out)
+        self.assertNotIn("No image pull", out)
+        self.assertIn("failed to sync pod", out)
+
+    def test_warning_events_are_aggregated(self):
+        rows = ["NAMESPACE LAST SEEN TYPE REASON OBJECT MESSAGE"]
+        rows += ["ns-a  %dm  Warning  Unhealthy  pod/fluentbit-%d  Fluentbit on this pod is unhealthy" % (50 - i, i)
+                 for i in range(40)]
+        rows += ["ns-b  1m  Warning  BackOff  pod/web-0  Back-off restarting failed container"]
+        out = v.post_events("\n".join(rows))
+        lines = out.splitlines()
+        self.assertIn("41 event(s) -> 2 distinct", lines[0])
+        self.assertTrue(lines[2].startswith("   1x  1m  ns-b"))
+        self.assertIn("  40x  11m  ns-a  Warning  Unhealthy  pod/fluentbit-0", lines[3])
+        self.assertIn("+36 more", lines[3])
+
+    def test_readyz_pv_pods_status_top(self):
+        rz = "\n".join("[+]check%d ok" % i for i in range(35)) + "\nreadyz check passed\n"
+        self.assertEqual(v.post_readyz(rz), "readyz check passed (35/35 ok)")
+        self.assertIn("[-]etcd failed", v.post_readyz(rz.replace("[+]check3 ok", "[-]etcd failed: reason withheld")))
+        pv = ("NAME CAPACITY ACCESS MODES RECLAIM POLICY STATUS CLAIM STORAGECLASS AGE\n"
+              "pvc-1 10Gi RWO Delete Bound a/b sc 3d\npvc-2 10Gi RWO Retain Released a/c sc 3d\n")
+        out = v.post_pv(pv)
+        self.assertIn("2 persistent volume(s), 1 Bound (see the claims), 1 not Bound:", out)
+        self.assertNotIn("pvc-1", out)
+        self.assertIn("pvc-2", out)
+        pods = ("NAMESPACE NAME READY STATUS RESTARTS AGE IP NODE\n"
+                "ns-a web-7f6d5c4b8f-abcde 1/1 Running 0 3d 10.0.0.1 n1\n"
+                "ns-a web-7f6d5c4b8f-fghij 0/1 Running 4 (2h ago) 3d 10.0.0.2 n1\n"
+                "ns-a db-0 1/1 Running 0 3d 10.0.0.3 n1\n")
+        out = v.post_all_pods(pods)
+        self.assertIn("ns-a: 3 pods (3 Running), 1 not ready, restarts 4; workloads: web(2), db(1)", out)
+        st = v.post_systemctl_status("CGroup: /system.slice/containerd.service\n"
+                                     " |-1 /usr/bin/containerd\n |-2 /usr/bin/containerd-shim-runc-v2 -id a\n")
+        self.assertIn("(1 containerd-shim process line(s) omitted)", st)
+        self.assertIn("grep -v '^%Cpu[0-9]'", find("vcenter", "Top processes")["cmd"])
+        self.assertIn("--lines=0", find("vcfmgmt", "kubelet and containerd")["cmd"])
+
+    def test_raw_output_is_kept_for_the_anonymizer(self):
+        t = v.Target.__new__(v.Target)
+        t.mode, t.clock_offset, t.sudo, t.sec = "sh", None, None, {"type": "k8s"}
+        t.kube = {"kubectl": "kubectl", "kubeconfig": None, "sudo": None}
+        pods = ("NAMESPACE NAME READY STATUS RESTARTS AGE IP NODE\n"
+                "widgets-ns ledger-api-7f6d5c4b8f-abcde 1/1 Running 0 3d 10.0.0.1 n1\n")
+        t.sh = lambda command, timeout, sudo=None: (0, pods, False)
+        c = find("k8s", "All pods (per namespace)")
+        r = t.run_catalog(("k8s-workloads", "x"), c)
+        self.assertEqual(r["raw"], pods)
+        self.assertNotIn("ledger-api-7f6d5c4b8f-abcde", r["out"])
+        boom = dict(c, post=lambda o: 1 / 0)
+        self.assertEqual(t.run_catalog(("k8s-workloads", "x"), boom)["out"], pods)   # never lost
+        sc = make()
+        t.results, t.identity, t.errmsg = [r], [], ""
+        v.learn_from_results([({"sec": {"prefix": "k8snode", "type": "k8s"}}, [t])], sc)
+        self.assertTrue(sc.m.lookup("k8sobj", "ledger-api-7f6d5c4b8f-abcde"))
+
+    def test_tool_caused_failures_are_fixed(self):
+        etcd = find("k8s", "etcd health and status (leader, database size)")["cmd"]
+        self.assertNotIn("sh -c", etcd)
+        self.assertIn('exec "$p" -- etcdctl --endpoints=', etcd)
+        self.assertIn("nothing answered with a certificate", find("vcenter", "Certificate on port 443")["cmd"])
+        labels = [c["label"] for _, _, cs in v.COMPONENTS["vcfmgmt"]["groups"] for c in cs]
+        self.assertNotIn("Certificate on port 443", labels)
+        self.assertNotIn("Nodes with roles", labels)
+        self.assertEqual(labels.count("Nodes"), 1)
+        self.assertIn("not a control-plane node", find("vcfmgmt", "Control-plane certificates (kubeadm)")["cmd"])
+        pol = ("== /Security/PasswordMaxDays\n   Path: /Security/PasswordMaxDays\n   Type: integer\n"
+               "   Int Value: 90\n   Default Int Value: 99999\n   String Value: \n"
+               "== /Security/PasswordQualityControl\n   Path: /Security/PasswordQualityControl\n   Type: string\n"
+               "   Int Value: 0\n   String Value: retry=3 min=disabled,disabled,disabled,7,7\n"
+               "== /Security/AccountUnlockTime\nError: Unable to find option AccountUnlockTime\n")
+        out = v.post_esxi_policy(pol)
+        self.assertIn("/Security/PasswordMaxDays = 90", out)
+        self.assertIn("/Security/PasswordQualityControl = 0", out)
+        self.assertIn("/Security/AccountUnlockTime: not available on this host (Error: Unable to find", out)
+
+
 if __name__ == "__main__":
     unittest.main()
