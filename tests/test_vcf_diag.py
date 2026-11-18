@@ -2848,5 +2848,163 @@ class ReportLayout(unittest.TestCase):
         self.assertLessEqual(len(text), len(rep) + 2000)
 
 
+
+MISSING_TZ = "1027ca04-24a8-11ef-9e70-06252099f24a"
+TZ_OVL = "3c2f6a10-9b1e-4d7a-8f00-aa11bb22cc33"
+TZ_VLAN_MP = "7d8e9f00-1111-4222-8333-444455556666"
+EP = "/policy/api/v1/infra/sites/default/enforcement-points/default"
+PATH = "/infra/sites/default/enforcement-points/default/transport-zones/"
+FAKE_HOSTCFG = {
+    "/policy/api/v1/infra/sites": {"results": [{"id": "default"}]},
+    "/policy/api/v1/infra/sites/default/enforcement-points": {"results": [{"id": "default"}]},
+    EP + "/transport-zones": {"results": [
+        {"id": TZ_OVL, "display_name": "widgets-overlay-tz", "tz_type": "OVERLAY_BACKED", "path": PATH + TZ_OVL,
+         "realization_id": TZ_OVL},
+        {"id": "widgets-vlan-tz", "display_name": "widgets-vlan-tz", "tz_type": "VLAN_BACKED",
+         "path": PATH + "widgets-vlan-tz", "realization_id": TZ_VLAN_MP}]},
+    "/api/v1/transport-zones?page_size=500": {"results": [
+        {"id": TZ_OVL, "display_name": "widgets-overlay-tz", "transport_type": "OVERLAY"},
+        {"id": TZ_VLAN_MP, "display_name": "widgets-vlan-tz", "transport_type": "VLAN"}]},
+    "/api/v1/fabric/compute-collections?page_size=500": {"results": [
+        {"external_id": "cm-1:domain-c8", "display_name": "WIDGETS-CL01"}]},
+    EP + "/transport-node-collections": {"results": [
+        {"id": "tnc-1", "compute_collection_id": "cm-1:domain-c8",
+         "transport_node_profile_id": "/infra/host-transport-node-profiles/widgets-cl01-tnp"}]},
+    EP + "/transport-node-collections/tnc-1/state": {"state": "SUCCESS"},
+    "/policy/api/v1/infra/host-transport-node-profiles": {"results": [
+        {"id": "widgets-cl01-tnp", "display_name": "widgets-cl01-tnp",
+         "path": "/infra/host-transport-node-profiles/widgets-cl01-tnp",
+         "host_switch_spec": {"host_switches": [{"host_switch_name": "widgets-vds01", "transport_zone_endpoints": [
+             {"transport_zone_id": PATH + TZ_OVL}, {"transport_zone_id": PATH + MISSING_TZ},
+             {"transport_zone_id": PATH + TZ_VLAN_MP}]}]}}]},
+    EP + "/host-transport-nodes": {"results": [
+        {"id": "h1", "display_name": "esx01.corp.example-widgets.com", "host_switch_spec": {"host_switches": [
+            {"host_switch_name": "widgets-vds01", "transport_zone_endpoints": [
+                {"transport_zone_id": PATH + MISSING_TZ}]}]}}]},
+    "/api/v1/fabric/compute-managers?page_size=100": {"results": [{"id": "cm-1", "server": "vc01.corp.example-widgets.com",
+                                                                    "origin_type": "vCenter"}]},
+    "/api/v1/fabric/compute-managers/cm-1/status": {"connection_status": "UP", "registration_status": "REGISTERED",
+                                                     "version": "9.0.0"},
+}
+
+FAKE_SDDC_TASKS = {
+    "/v1/tasks?pageSize=500&pageNumber=0": {"elements": [
+        {"id": "t-1", "name": "Sync inventory", "status": "Failed", "creationTimestamp": "2099-11-18T09:07:00Z"},
+        {"id": "t-2", "name": "Rotate passwords", "status": "Successful", "creationTimestamp": "2099-11-17T09:07:00Z"}],
+        "pageMetadata": {"totalPages": 1}},
+    "/v1/tasks/t-1": {"id": "t-1", "name": "Sync inventory", "status": "Failed", "type": "INVENTORY_SYNC",
+                      "creationTimestamp": "2099-11-18T09:07:00Z", "isRetryable": True,
+                      "resources": [{"type": "CLUSTER", "name": "WIDGETS-CL01"}],
+                      "subTasks": [{"name": "Generate inputs for Configuring Clusters for NSX", "status": "Failed",
+                                    "errors": [{"message": "Error in reading transport node Profile from transport node "
+                                                           "collection", "referenceToken": "KR17KQ",
+                                                "causes": [{"message": "No transport zone found for given path " + PATH
+                                                            + MISSING_TZ}]}]},
+                                   {"name": "Validate", "status": "Successful"}]},
+    "/v1/nsxt-clusters?pageNumber=0": {"elements": [{"id": "n-1", "vipFqdn": "nsx01.corp.example-widgets.com",
+                                                     "version": "9.0.0", "domains": [{"name": "WIDGETS-MGMT"}]}]},
+    "/v1/nsxt-clusters/n-1/transport-zones": [{"name": "widgets-overlay-tz", "id": MISSING_TZ, "transportType": "OVERLAY"}],
+    "/v1/domains?pageNumber=0": {"elements": [{"id": "d-1", "name": "WIDGETS-MGMT"}]},
+    "/v1/clusters?pageNumber=0": {"elements": [{"id": "c-1", "name": "WIDGETS-CL01", "domain": {"id": "d-1"},
+                                                "status": "ACTIVE"}]},
+    "/v1/clusters/c-1/network/network-profiles": [{"name": "widgets-np01", "isDefault": True, "nsxtHostSwitchConfigs": [
+        {"vdsName": "widgets-vds01", "transportZones": [{"name": "widgets-overlay-tz", "transportType": "OVERLAY"},
+                                                        {"name": "widgets-edge-vlan", "transportType": "VLAN"}]}]}],
+}
+
+
+class FakeApi:
+    def __init__(self, data):
+        self.data, self.seen = data, []
+
+    def get(self, path):
+        self.seen.append(path)
+        return self.data.get(path)
+
+    def paged(self, path, limit=10):
+        return (self.get(path) or {}).get("results") or []
+
+
+class TransportZoneReferences(unittest.TestCase):
+    """'Error in reading transport node Profile ... No transport zone found for given path'."""
+
+    def test_missing_and_manager_id_references_are_explained(self):
+        out = v.nsx_host_config(FakeApi(FAKE_HOSTCFG))
+        self.assertTrue(out.startswith("PROBLEM: profile widgets-cl01-tnp (used by WIDGETS-CL01 (domain-c8)) "
+                                       "references transport zone %s%s: MISSING" % (PATH, MISSING_TZ)), out)
+        self.assertIn("[MANAGER ID] this is the Manager API id of transport zone widgets-vlan-tz; its Policy path is "
+                      + PATH + "widgets-vlan-tz", out)
+        self.assertIn("-> %s%s  [OK] widgets-overlay-tz" % (PATH, TZ_OVL), out)
+        self.assertIn("cluster: WIDGETS-CL01 (domain-c8)  profile=/infra/host-transport-node-profiles/widgets-cl01-tnp"
+                      "  state=SUCCESS", out)
+        self.assertIn("PROBLEM: 1 host transport node(s) reference transport zone %s%s" % (PATH, MISSING_TZ), out)
+        self.assertEqual(v.KEY_FACTS["Transport zones, node profiles and cluster attachments"](out),
+                         [("nsx_tz_reference_problems", 3)])
+
+    def test_clean_configuration(self):
+        data = dict(FAKE_HOSTCFG)
+        data["/policy/api/v1/infra/host-transport-node-profiles"] = {"results": [
+            {"display_name": "p", "path": "/infra/host-transport-node-profiles/widgets-cl01-tnp",
+             "host_switch_spec": {"host_switches": [{"host_switch_name": "s", "transport_zone_endpoints": [
+                 {"transport_zone_id": PATH + TZ_OVL}]}]}}]}
+        data[EP + "/host-transport-nodes"] = {"results": []}
+        self.assertTrue(v.nsx_host_config(FakeApi(data)).startswith("Every transport zone reference resolves."))
+
+    def test_sddc_failed_task_and_inventory(self):
+        api = FakeApi(FAKE_SDDC_TASKS)
+        tasks, inv = v.sddc_failed_tasks(api), v.sddc_nsx_inventory(api)
+        self.assertTrue(tasks.startswith("1 failed task(s) in the last 14 days"))
+        self.assertIn("FAILED TASK: 2099-11-18T09:07:00  Sync inventory  type=INVENTORY_SYNC", tasks)
+        self.assertIn("  failed subtask: Generate inputs for Configuring Clusters for NSX", tasks)
+        self.assertIn("error: Error in reading transport node Profile from transport node collection  "
+                      "[reference token KR17KQ]", tasks)
+        self.assertIn("cause: No transport zone found for given path " + PATH + MISSING_TZ, tasks)
+        self.assertNotIn("Rotate passwords", tasks)
+        self.assertIn("transport zone known to SDDC Manager: widgets-overlay-tz  id=" + MISSING_TZ, inv)
+        self.assertIn("cluster: WIDGETS-CL01  id=c-1  workload domain: WIDGETS-MGMT  status=ACTIVE", inv)
+        self.assertIn("network profile widgets-np01 (active): host switch widgets-vds01 -> transport zones: "
+                      "widgets-overlay-tz (OVERLAY), widgets-edge-vlan (VLAN)", inv)
+        self.assertIn("transport zones: not available", v.sddc_nsx_inventory(FakeApi(
+            {k: v_ for k, v_ in FAKE_SDDC_TASKS.items() if "transport-zones" not in k})))
+
+    def test_findings_and_anonymization(self):
+        nsx = v.nsx_host_config(FakeApi(FAKE_HOSTCFG)) + "\n" + v.nsx_compute_managers(FakeApi(FAKE_HOSTCFG))
+        api = FakeApi(FAKE_SDDC_TASKS)
+        sddc = v.sddc_failed_tasks(api) + "\n" + v.sddc_nsx_inventory(api)
+        sc = make()
+        for typ, key, text in (("nsx", "nsx-api-hostconfig", nsx), ("sddc", "sddc-api-tasks", sddc)):
+            group = [g for g in v.COMPONENTS[typ]["groups"] if g[0] == key][0]
+            for c in group[2]:
+                harvest(sc, c, text)
+        problem = "Cause: No transport zone found for given path " + PATH + MISSING_TZ
+        out = run(sc, nsx + "\n" + sddc + "\n" + problem)
+        for gone in ("widgets", "WIDGETS", "example-widgets", MISSING_TZ):
+            self.assertNotIn(gone, out)
+        ph = re.search(r"Cause: No transport zone found for given path \S+/(uuid-\d+)", out).group(1)
+        self.assertGreaterEqual(out.count(ph), 4)       # same placeholder in NSX, SDDC Manager and the error text
+        self.assertIn("KR17KQ", out)
+        lab = "Transport zones, node profiles and cluster attachments"
+        t = types.SimpleNamespace(ph="nsxmgr-01", errkind=None, clock_offset=None, results=[
+            _res(("nsx-api-hostconfig", "H"), lab, v.nsx_host_config(FakeApi(FAKE_HOSTCFG)), api="nsx_host_config"),
+            _res(("sddc-api-tasks", "T"), "Failed tasks (last 14 days) with subtask errors and reference tokens",
+                 v.sddc_failed_tasks(FakeApi(FAKE_SDDC_TASKS)))])
+        rows = v.target_findings(t, v.key_facts(t))
+        self.assertEqual(rows[0][0], "high")
+        self.assertIn("references transport zone", rows[0][1])
+        self.assertTrue(any(r[0] == "med" and "Sync inventory" in r[1] and "KR17KQ" in r[1] and
+                            "No transport zone found" in r[1] for r in rows))
+
+    def test_wiring_and_only_reads(self):
+        self.assertTrue(v.is_api_group("nsx-api-hostconfig"))
+        self.assertTrue(v.is_api_group("sddc-api-tasks"))
+        self.assertFalse(v.is_api_group("sddc-logs"))
+        api = FakeApi(FAKE_HOSTCFG)
+        v.nsx_host_config(api)
+        self.assertTrue(all(p.startswith(("/policy/api/v1/", "/api/v1/")) for p in api.seen))
+        logs = find("sddc", "NSX transport zone / profile errors in SDDC Manager logs (last 3 days)")
+        self.assertIs(logs["post"], v.post_log_dedup)
+        self.assertIsNone(v.readonly_problem(logs["cmd"], "sh"))
+
+
 if __name__ == "__main__":
     unittest.main()

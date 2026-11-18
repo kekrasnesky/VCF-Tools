@@ -271,6 +271,31 @@ reports:
 These are cluster-wide, so with several managers listed they run on the first one only. The NSX
 certificate is verified; set a CA file or turn the check off on the Settings tab if needed.
 
+### Inventory sync fails: "No transport zone found for given path"
+
+An inventory sync (VCF Operations) or another SDDC Manager workflow can fail in the subtask
+*Generate inputs for Configuring Clusters for NSX* with *Error in reading transport node Profile
+from transport node collection* and a cause like *No transport zone found for given path
+/infra/sites/default/enforcement-points/default/transport-zones/&lt;id&gt;*. SDDC Manager follows
+cluster -> transport node collection -> transport node profile -> transport zone, and one of
+those transport zone references does not resolve in NSX. Three check groups follow that chain:
+
+- NSX, **Host transport configuration** (NSX API): every transport zone in Policy and in the
+  Manager API, every transport node profile with each transport zone it references marked
+  `OK`, `MISSING` (deleted), `MANAGER ID` (the Manager API id was used where the Policy path
+  has a different id), `MANAGER ONLY` (no Policy object) or `WRONG PATH`; which cluster each
+  profile is attached to and the collection state; host transport nodes with references that do
+  not resolve; and the compute managers (vCenter connection and registration).
+- SDDC Manager, **Failed tasks and the NSX inventory SDDC Manager holds** (API): failed tasks of
+  the last 14 days with failed subtasks, error, remediation, cause and reference token, plus the
+  NSX clusters, transport zones and cluster network profiles SDDC Manager has stored.
+- SDDC Manager, **service log errors** (SSH): transport zone / profile errors in the
+  domainmanager, operationsmanager and commonsvcs logs of the last three days.
+
+Each broken reference becomes a **high** finding. Transport zone UUIDs get the same placeholder
+everywhere (in NSX, SDDC Manager and the error text you give the AI), so the analyst can see
+whether the missing id is one SDDC Manager still has stored.
+
 ### Supervisor namespaces (from vCenter)
 
 The vCenter check group **Supervisor namespaces** reads the vCenter REST API directly from your

@@ -57,7 +57,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
-VERSION = "1.19.0"
+VERSION = "1.20.0"
 
 # ----------------------------------------------------------------------------
 # Diagnostic catalog
@@ -83,6 +83,21 @@ H_NAMESPACE = ("k8sns", r"(?m)^namespace: (\S+)", None)
 H_SUPERVISOR = ("vcluster", r"(?m)^supervisor: (.+?) \(", None)
 H_NSXNODE = ("host", r"(?m)(?:node|transport node|member): (\S+)", None)
 H_EDGECL = ("edgecl", r"(?m)^edge cluster: (.+?)  ", None)
+H_NSXOBJ_TZ = ("nsxobj", r"(?m)^\s*transport zone(?: \(Manager API only, no Policy object\))?: (.+?)  id=", None)
+H_NSXOBJ_TNP = ("nsxobj", r"(?m)^\s*profile: (.+?)  path=", None)
+H_CLUSTER = ("cluster", r"(?m)^\s*cluster: (.+?)(?: \([^)]*\))?  (?:id=|profile=)", None)
+H_NSXNODE_HOST = ("host", r"(?m)^\s+\S+  \[[A-Z ]+\] on \d+ host\(s\): (.+?)(?: \.\.\.)?$", r",\s*")
+# NSX ids that are names (Policy ids can be "mgmt-tz-overlay"); UUIDs are left to the UUID rule so that
+# they keep the same placeholder as in error messages ("No transport zone found for given path .../<uuid>")
+_NOT_UUID = r"(?![0-9a-fA-F]{8}-[0-9a-fA-F]{4}-)"
+H_NSXID_TZ = ("nsxobj", r"(?m)^\s*transport zone[^\n]*?  id=" + _NOT_UUID + r"([^\s/]+)", None)
+H_NSXID_TNP = ("nsxobj", r"(?m)^\s*profile: .+?  path=\S*/" + _NOT_UUID + r"([^/\s]+)\s", None)
+H_HOSTSWITCH = ("dvs", r"(?m)host switch (.+?) -> ", None)
+H_NETPROFILE = ("nsxobj", r"(?m)^\s+network profile (.+?)(?: \(active\))?: host switch", None)
+H_NETPROFILE_TZ = ("nsxobj", r"(?m)^\s+network profile .*-> transport zones: (.+)$", r" \([A-Za-z_]+\)(?:, )?")
+H_CM = ("host", r"(?m)^compute manager: (\S+)", None)
+H_WLD = ("wld", r"(?m)workload domain: (.+?)  status=", None)
+H_NSXOBJ_SDDC = ("nsxobj", r"(?m)^\s*(?:transport zone known to SDDC Manager: (.+?)  id=)", None)
 
 
 def apicmd(label, fn, shown, harvest=(), max_lines=600):
@@ -1063,6 +1078,16 @@ NSX_GROUPS = [
                "GET /api/v1/logical-ports, /api/v1/fabric/vifs, /api/v1/fabric/virtual-machines (+ port status)",
                max_lines=600),
     ]),
+    ("nsx-api-hostconfig", "Host transport configuration: transport zones, profiles, clusters (NSX API; "
+                           "explains 'No transport zone found for given path')", [
+        apicmd("Transport zones, node profiles and cluster attachments", "nsx_host_config",
+               "GET Policy transport-zones, host-transport-node-profiles, transport-node-collections (+ state), "
+               "host-transport-nodes; Manager API transport-zones, compute-collections",
+               harvest=[H_NSXOBJ_TZ, H_NSXOBJ_TNP, H_NSXID_TZ, H_NSXID_TNP, H_CLUSTER, H_NSXNODE_HOST, H_HOSTSWITCH],
+               max_lines=800),
+        apicmd("Compute managers (vCenter registration and connection)", "nsx_compute_managers",
+               "GET /api/v1/fabric/compute-managers (+ status)", harvest=[H_CM]),
+    ]),
     ("os", "OS level (root shell only)", [
         cmd("Disk usage", "df -hP", post=post_df),
         cmd("Failed units", "systemctl --failed --no-pager --no-legend 2>&1 | head -n 40"),
@@ -1104,6 +1129,21 @@ SDDC_GROUPS = [
     ("sddc-api-credentials", "Stored credentials and password rotations (SDDC Manager API; needs an SSO login)", [
         apicmd("Stored credentials and expiry", "sddc_credentials", "GET /v1/credentials", max_lines=800),
         apicmd("Recent password rotation / update tasks", "sddc_credential_tasks", "GET /v1/credentials/tasks"),
+    ]),
+    ("sddc-api-tasks", "Failed tasks and the NSX inventory SDDC Manager holds (SDDC Manager API; needs an SSO login)", [
+        apicmd("Failed tasks (last 14 days) with subtask errors and reference tokens", "sddc_failed_tasks",
+               "GET /v1/tasks (+ details)", max_lines=400),
+        apicmd("NSX clusters, transport zones and cluster network profiles known to SDDC Manager",
+               "sddc_nsx_inventory", "GET /v1/nsxt-clusters (+ transport zones), /v1/domains, /v1/clusters "
+               "(+ network profiles)", harvest=[H_CLUSTER, H_WLD, H_NSXOBJ_SDDC, H_HOSTSWITCH, H_NETPROFILE, H_NETPROFILE_TZ]),
+    ]),
+    ("sddc-logs", "SDDC Manager service log errors about NSX transport zones, profiles and inventory", [
+        cmd("NSX transport zone / profile errors in SDDC Manager logs (last 3 days)",
+            "find /var/log/vmware/vcf/domainmanager /var/log/vmware/vcf/operationsmanager "
+            "/var/log/vmware/vcf/commonsvcs -name '*.log' -mmin -4320 2>/dev/null | head -n 40 | xargs -r grep -hiE "
+            "'transport.?zone|transport.?node.?profile|transport.?node.?collection|referenceToken|reference token' "
+            "2>/dev/null | grep -iE 'error|fail|exception|not found' | tail -n 200",
+            timeout=120, max_lines=150, sudo=True, post=post_log_dedup),
     ]),
 ] + linux_groups()
 
@@ -1716,7 +1756,7 @@ RX_QUANTITY = re.compile(r"(?i)(?:\d+(?:\.\d+)?(?:ns|us|ms|s|m|h|d|w|y|ki|mi|gi|
 RX_QUAD_VERSION_TAIL = re.compile(r"-\d+(?:\.\d+)*")
 RX_DOTTED_QUAD = re.compile(r"(?<![\w.])\d{1,3}(?:\.\d{1,3}){3}(?!\.?\d)(?!\w)")
 
-OBJECT_CATS = {"edgecl": "edgecluster", "vcluster": "vcluster", "datastore": "datastore", "portgroup": "portgroup", "dvs": "dvs", "vm": "vm",
+OBJECT_CATS = {"cluster": "cluster", "nsxobj": "nsxobj", "wld": "wld", "edgecl": "edgecluster", "vcluster": "vcluster", "datastore": "datastore", "portgroup": "portgroup", "dvs": "dvs", "vm": "vm",
                "namespace": "ns", "k8sobj": "k8sobj", "lrouter": "lrouter", "term": "term"}
 
 
@@ -3219,11 +3259,280 @@ def sddc_credential_tasks(api):
     return "\n".join(out)
 
 
+POLICY_EP = "/policy/api/v1/infra/sites/%s/enforcement-points/%s"
+
+
+def _last(ref):
+    return str(ref or "").rstrip("/").rsplit("/", 1)[-1]
+
+
+def _tz_refs(host_switch_spec):
+    """[(host switch name, transport zone reference)] from a host_switch_spec (policy or manager)."""
+    out = []
+    for hs in (host_switch_spec or {}).get("host_switches") or []:
+        name = hs.get("host_switch_name") or hs.get("host_switch_id") or "?"
+        for ep in hs.get("transport_zone_endpoints") or []:
+            if ep.get("transport_zone_id"):
+                out.append((name, ep["transport_zone_id"]))
+    return out
+
+
+def nsx_host_config(api):
+    """Transport zones, transport node profiles, the clusters they are attached to (transport node
+    collections) and host transport nodes, with every transport zone reference checked. A profile
+    that points at a transport zone path NSX does not have makes SDDC Manager / VCF Operations fail
+    with 'No transport zone found for given path ...'."""
+    out, problems = [], []
+    # --- transport zones: Policy (every site and enforcement point) and the Manager API
+    eps = []
+    for site in api.paged("/policy/api/v1/infra/sites") or [{"id": "default"}]:
+        for ep in api.paged("/policy/api/v1/infra/sites/%s/enforcement-points" % urllib.parse.quote(site.get("id", ""))) \
+                or [{"id": "default"}]:
+            eps.append((site.get("id", "default"), ep.get("id", "default")))
+    if not eps:
+        eps = [("default", "default")]
+    ptz = []
+    for site, ep in eps:
+        for z in api.paged((POLICY_EP % (site, ep)) + "/transport-zones"):
+            z.setdefault("path", "/infra/sites/%s/enforcement-points/%s/transport-zones/%s" % (site, ep, z.get("id")))
+            ptz.append(z)
+    mtz = api.paged("/api/v1/transport-zones?page_size=500")
+    by_path = {z.get("path"): z for z in ptz}
+    by_pid = {z.get("id"): z for z in ptz}
+    by_alt = {}
+    for z in ptz:
+        for k in ("realization_id", "unique_id", "nsx_id"):
+            if z.get(k):
+                by_alt[z[k]] = z
+    by_mid = {z.get("id"): z for z in mtz}
+    out.append("Transport zones: %d in Policy, %d in the Manager API" % (len(ptz), len(mtz)))
+    for z in ptz:
+        out.append("  transport zone: %s  id=%s  type=%s  path=%s%s" % (
+            z.get("display_name"), z.get("id"), z.get("tz_type") or z.get("transport_type"), z.get("path"),
+            ("  realization_id=%s" % z["realization_id"]) if z.get("realization_id") and z["realization_id"] != z.get("id") else ""))
+    known_m = {z.get("realization_id") or z.get("unique_id") for z in ptz} | set(by_pid)
+    for z in mtz:
+        if z.get("id") not in known_m:
+            out.append("  transport zone (Manager API only, no Policy object): %s  id=%s  type=%s  created by %s" % (
+                z.get("display_name"), z.get("id"), z.get("transport_type"), z.get("_create_user", "?")))
+
+    def resolve(ref):
+        """(status, explanation) for a transport zone reference (policy path or manager id)."""
+        if ref in by_path:
+            return "OK", by_path[ref].get("display_name")
+        tid = _last(ref)
+        if tid in by_pid and not ref.startswith("/"):
+            return "OK", by_pid[tid].get("display_name")
+        if tid in by_pid:
+            z = by_pid[tid]
+            return "WRONG PATH", "a transport zone with this id exists at %s (%s)" % (z.get("path"), z.get("display_name"))
+        if tid in by_alt:
+            z = by_alt[tid]
+            return "MANAGER ID", ("this is the Manager API id of transport zone %s; its Policy path is %s"
+                                  % (z.get("display_name"), z.get("path")))
+        if tid in by_mid:
+            return "MANAGER ONLY", ("transport zone %s exists only in the Manager API (no Policy object), so the "
+                                    "Policy path does not resolve" % by_mid[tid].get("display_name"))
+        return "MISSING", "no transport zone with this id exists in Policy or in the Manager API (deleted?)"
+
+    # --- compute collections (vCenter clusters) for readable cluster names
+    cc = {c.get("external_id"): c for c in api.paged("/api/v1/fabric/compute-collections?page_size=500")}
+
+    def cluster_name(cid):
+        c = cc.get(cid) or {}
+        return "%s (%s)" % (c.get("display_name") or "?", _last(str(cid).split(":")[-1]) if cid else "?")
+
+    # --- transport node collections: cluster -> profile
+    tncs = []
+    for site, ep in eps:
+        for t in api.paged((POLICY_EP % (site, ep)) + "/transport-node-collections"):
+            st = api.get((POLICY_EP % (site, ep)) + "/transport-node-collections/%s/state" %
+                         urllib.parse.quote(t.get("id", ""))) or {}
+            t["_state"] = st
+            tncs.append(t)
+    used_by = {}
+    for t in tncs:
+        used_by.setdefault(t.get("transport_node_profile_id"), []).append(cluster_name(t.get("compute_collection_id")))
+
+    # --- transport node profiles and their transport zone references
+    tnps = api.paged("/policy/api/v1/infra/host-transport-node-profiles")
+    mtnps = api.paged("/api/v1/transport-node-profiles?page_size=500") if not tnps else []
+    out += ["", "Transport node profiles: %d" % (len(tnps) or len(mtnps))]
+    for p in tnps or mtnps:
+        path = p.get("path") or p.get("id")
+        users = used_by.get(path) or used_by.get(p.get("id")) or []
+        out.append("  profile: %s  path=%s  attached to: %s" % (p.get("display_name"), path, ", ".join(users) or "no cluster"))
+        refs = _tz_refs(p.get("host_switch_spec"))
+        if not refs:
+            out.append("    (no transport zone references)")
+        for hs, ref in refs:
+            status, why = resolve(ref)
+            out.append("    host switch %s -> %s  [%s] %s" % (hs, ref, status, why or ""))
+            if status != "OK":
+                problems.append("profile %s (used by %s) references transport zone %s: %s - %s" % (
+                    p.get("display_name"), ", ".join(users) or "no cluster", ref, status, why))
+
+    # --- transport node collections with their state
+    out += ["", "Transport node collections (cluster -> profile): %d" % len(tncs)]
+    for t in tncs:
+        st = t["_state"]
+        prof = t.get("transport_node_profile_id")
+        out.append("  cluster: %s  profile=%s  state=%s" % (
+            cluster_name(t.get("compute_collection_id")), prof, st.get("state") or "?"))
+        for e in (st.get("validation_errors") or [])[:5]:
+            out.append("    validation error: %s" % (e.get("error_message") or e.get("message") or e))
+        if prof and prof not in {p.get("path") for p in tnps} | {p.get("id") for p in tnps + mtnps}:
+            problems.append("cluster %s is attached to profile %s, which does not exist" % (
+                cluster_name(t.get("compute_collection_id")), prof))
+        if st.get("state") and st["state"] not in ("SUCCESS", "success"):
+            problems.append("cluster %s: transport node collection state %s" % (
+                cluster_name(t.get("compute_collection_id")), st["state"]))
+
+    # --- host transport nodes that point at transport zones that do not resolve
+    htns = []
+    for site, ep in eps:
+        htns += api.paged((POLICY_EP % (site, ep)) + "/host-transport-nodes")
+    if not htns:
+        htns = [n for n in api.paged("/api/v1/transport-nodes?page_size=500")
+                if (n.get("node_deployment_info") or {}).get("resource_type") == "HostNode"]
+    bad_hosts = {}
+    for n in htns:
+        for hs, ref in _tz_refs(n.get("host_switch_spec")):
+            if resolve(ref)[0] in ("MISSING", "MANAGER ONLY", "WRONG PATH"):
+                bad_hosts.setdefault(ref, []).append(n.get("display_name") or n.get("id"))
+    out += ["", "Host transport nodes: %d; with a transport zone reference that does not resolve: %d" % (
+        len(htns), sum(len(v_) for v_ in bad_hosts.values()))]
+    for ref, hosts in bad_hosts.items():
+        out.append("  %s  [%s] on %d host(s): %s" % (ref, resolve(ref)[0], len(hosts), ", ".join(hosts[:10]) +
+                                                     (" ..." if len(hosts) > 10 else "")))
+        problems.append("%d host transport node(s) reference transport zone %s, which does not resolve" % (len(hosts), ref))
+    head = ["PROBLEM: " + p for p in problems] or ["Every transport zone reference resolves."]
+    return "\n".join(head + [""] + out)
+
+
+def nsx_compute_managers(api):
+    cms = api.paged("/api/v1/fabric/compute-managers?page_size=100")
+    if not cms:
+        return "No compute managers registered."
+    out = []
+    for c in cms:
+        st = api.get("/api/v1/fabric/compute-managers/%s/status" % urllib.parse.quote(c.get("id", ""))) or {}
+        line = "compute manager: %s  type=%s  connection=%s  registration=%s  version=%s" % (
+            c.get("server"), c.get("origin_type"), st.get("connection_status"), st.get("registration_status"),
+            st.get("version") or "?")
+        if st.get("connection_status_details"):
+            line += "  (%s)" % st["connection_status_details"]
+        out.append(line)
+        for e in (st.get("registration_errors") or [])[:5]:
+            out.append("  registration error: %s" % (e.get("error_message") or e))
+    return "\n".join(out)
+
+
+def _sddc_list(api, path, limit=10):
+    rows, page = [], 0
+    while page < limit:
+        sep = "&" if "?" in path else "?"
+        d = api.get("%s%spageNumber=%d" % (path, sep, page))
+        if d is None:
+            return None
+        if isinstance(d, list):
+            return d
+        rows += d.get("elements") or []
+        if (d.get("pageMetadata") or {}).get("totalPages", 1) <= page + 1:
+            break
+        page += 1
+    return rows
+
+
+def _sddc_errors(errors, indent="    "):
+    out = []
+    for e in errors or []:
+        if not isinstance(e, dict):
+            out.append("%s%s" % (indent, e))
+            continue
+        out.append("%serror: %s%s" % (indent, e.get("message") or e.get("errorCode"),
+                                      ("  [reference token %s]" % e["referenceToken"]) if e.get("referenceToken") else ""))
+        if e.get("remediationMessage"):
+            out.append("%s  remediation: %s" % (indent, e["remediationMessage"]))
+        for c in e.get("causes") or e.get("nestedErrors") or []:
+            msg = c.get("message") if isinstance(c, dict) else c
+            out.append("%s  cause: %s" % (indent, msg))
+    return out
+
+
+def sddc_failed_tasks(api, days=14, limit=10):
+    """Failed SDDC Manager tasks of the last two weeks with their failed subtasks and error
+    details (message, remediation, cause, reference token)."""
+    rows = _sddc_list(api, "/v1/tasks?pageSize=500", limit=5)
+    if rows is None:
+        return "The tasks API is not available on this SDDC Manager."
+    since = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
+    failed = [r for r in rows if "fail" in str(r.get("status", "")).lower()
+              and str(r.get("creationTimestamp") or "9999")[:10] >= since]
+    failed.sort(key=lambda r: str(r.get("creationTimestamp") or ""), reverse=True)
+    if not failed:
+        return "No failed tasks in the last %d days (%d task(s) listed)." % (days, len(rows))
+    out = ["%d failed task(s) in the last %d days; newest %d with details:" % (len(failed), days, min(limit, len(failed)))]
+    for r in failed[:limit]:
+        d = api.get("/v1/tasks/%s" % urllib.parse.quote(str(r.get("id", "")))) or r
+        out += ["", "FAILED TASK: %s  %s  type=%s  retryable=%s" % (
+            str(d.get("creationTimestamp") or "")[:19], d.get("name"), d.get("type"), d.get("isRetryable"))]
+        for res in d.get("resources") or []:
+            out.append("  resource: %s %s" % (res.get("type"), res.get("name") or res.get("resourceId")))
+        out += _sddc_errors(d.get("errors"), "  ")
+        for st in d.get("subTasks") or []:
+            if "fail" in str(st.get("status", "")).lower():
+                out.append("  failed subtask: %s%s" % (st.get("name") or st.get("description"),
+                                                       (" - " + st["description"]) if st.get("description")
+                                                       and st.get("description") != st.get("name") else ""))
+                out += _sddc_errors(st.get("errors"))
+    return "\n".join(out)
+
+
+def sddc_nsx_inventory(api):
+    """NSX clusters, workload domains and clusters as SDDC Manager knows them, with the transport
+    zones and network profiles it has stored (compare with the NSX check 'Transport zones, node
+    profiles and cluster attachments')."""
+    out = []
+    nsx = _sddc_list(api, "/v1/nsxt-clusters") or []
+    out.append("NSX Manager clusters: %d" % len(nsx))
+    for n in nsx:
+        out.append("  nsx cluster: id=%s  vip=%s  version=%s  status=%s  domains=%s" % (
+            n.get("id"), " ".join(x for x in (n.get("vipFqdn"), n.get("vip")) if x) or "-", n.get("version") or "-",
+            n.get("status") or "-",
+            ", ".join(d.get("name", "?") for d in n.get("domains") or [])))
+        tzs = api.get("/v1/nsxt-clusters/%s/transport-zones" % urllib.parse.quote(str(n.get("id", ""))))
+        if tzs is None:
+            out.append("    transport zones: not available from this SDDC Manager API version")
+            continue
+        tzs = tzs.get("elements") if isinstance(tzs, dict) else tzs
+        for z in tzs or []:
+            out.append("    transport zone known to SDDC Manager: %s  id=%s  type=%s" % (
+                z.get("name") or z.get("displayName"), z.get("id"), z.get("transportType") or z.get("type")))
+    doms = {d.get("id"): d.get("name") for d in _sddc_list(api, "/v1/domains") or []}
+    clusters = _sddc_list(api, "/v1/clusters") or []
+    out += ["", "Clusters: %d" % len(clusters)]
+    for c in clusters:
+        dom = (c.get("domain") or {}).get("id")
+        out.append("  cluster: %s  id=%s  workload domain: %s  status=%s" % (
+            c.get("name"), c.get("id"), doms.get(dom, dom), c.get("status")))
+        profs = api.get("/v1/clusters/%s/network/network-profiles" % urllib.parse.quote(str(c.get("id", ""))))
+        profs = profs.get("elements") if isinstance(profs, dict) else profs
+        for p in profs or []:
+            for hs in p.get("nsxtHostSwitchConfigs") or []:
+                tz = ", ".join("%s (%s)" % (z.get("name"), z.get("transportType")) for z in hs.get("transportZones") or [])
+                out.append("    network profile %s%s: host switch %s -> transport zones: %s" % (
+                    p.get("name"), " (active)" if p.get("isDefault") else "", hs.get("vdsName"), tz or "none"))
+    return "\n".join(out)
+
+
 VCAPI_FUNCS = {"supervisors": api_supervisors, "namespaces": api_namespaces, "services": api_services,
                "nsx_cluster": nsx_cluster, "nsx_alarms": nsx_alarms, "nsx_transport_nodes": nsx_transport_nodes,
                "nsx_edge_clusters": nsx_edge_clusters, "nsx_backups": nsx_backups, "nsx_users": nsx_users, "nsx_logical_ports": nsx_logical_ports,
                "vc_sts": vc_sts, "vc_tls": vc_tls, "vc_idp": vc_idp, "vc_accounts": vc_accounts,
-               "sddc_credentials": sddc_credentials, "sddc_credential_tasks": sddc_credential_tasks}
+               "sddc_credentials": sddc_credentials, "sddc_credential_tasks": sddc_credential_tasks,
+               "nsx_host_config": nsx_host_config, "nsx_compute_managers": nsx_compute_managers,
+               "sddc_failed_tasks": sddc_failed_tasks, "sddc_nsx_inventory": sddc_nsx_inventory}
 
 
 TOOL_ERROR_NOTE = ("tool error: the API refused the request itself (HTTP 400). This points to a problem "
@@ -3846,7 +4155,7 @@ The same real value always maps to the same placeholder, in this and in later re
 | `ip-n3-h7` | an IPv4 address: `n3` = the third distinct /24 network seen, `h7` = the seventh address in it |
 | `ip6-0001`, `ip6-ll-0001` | IPv6 address / link-local IPv6 address |
 | `mac-`, `wwn-`, `uuid-`, `serial-`, `thumbprint-`, `license-`, `naa.device-`, `iqn-` | hardware and software identifiers |
-| `datastore-`, `portgroup-`, `dvs-`, `lrouter-`, `ns-`, `k8sobj-`, `dn-`, `term-` | named objects, certificate name parts, custom terms |
+| `datastore-`, `portgroup-`, `dvs-`, `lrouter-`, `ns-`, `k8sobj-`, `cluster-`, `wld-`, `nsxobj-`, `dn-`, `term-` | named objects (`cluster-` vSphere cluster, `wld-` workload domain, `nsxobj-` NSX transport zone or profile), certificate name parts, custom terms |
 | `[REDACTED...]` | a secret (password, token, key, certificate body) |
 
 An UPPERCASE placeholder means the original was written in upper case. Loopback, link-local,
@@ -4155,6 +4464,17 @@ def _fact_events(out):
     return [("warning_events_by_reason", ", ".join("%s %d" % kv for kv in sorted(by.items(), key=lambda kv: -kv[1])))]
 
 
+def _fact_sddc_tasks(out):
+    m = re.match(r"(\d+) failed task", out)
+    if not m:
+        return [("sddc_failed_tasks_14d", 0)] if out.startswith("No failed tasks") else []
+    f = [("sddc_failed_tasks_14d", int(m.group(1)))]
+    t = re.search(r"(?m)^FAILED TASK: (\S+)\s+(.+?)  type=", out)
+    if t:
+        f.append(("sddc_last_failed_task", "%s %s" % (t.group(1)[:10], t.group(2))))
+    return f
+
+
 KEY_FACTS = {
     "Automation pods not Running or not Ready": _vcfa_fact("automation_pods_not_ready", _rows),
     "Automation workloads below desired replicas": _vcfa_fact("automation_workloads_below_desired", _rows),
@@ -4180,6 +4500,11 @@ KEY_FACTS = {
     "Cluster API machines (worker VM lifecycle)": _fact_capi,
     "Machines not Running": lambda o: [("machines_not_running", len(_data_rows(o)))],
     "Latest warning events": _fact_events,
+    "Transport zones, node profiles and cluster attachments": lambda o: [
+        ("nsx_tz_reference_problems", len(re.findall(r"(?m)^PROBLEM: ", o)))],
+    "Compute managers (vCenter registration and connection)": lambda o: [
+        ("compute_managers_not_up", len(re.findall(r"connection=(?!UP\b)\S+", o)))] if "compute manager:" in o else [],
+    "Failed tasks (last 14 days) with subtask errors and reference tokens": _fact_sddc_tasks,
     "NTP associations": _fact_ntp,
     "DNS servers": lambda o: [("dns_servers", n) for n in [len(set(re.findall(
         r"(?<![\w.:])(?:\d{1,3}(?:\.\d{1,3}){3}|[0-9A-Fa-f]{0,4}(?::[0-9A-Fa-f]{0,4}){2,7})(?![\w.:])", o)))] if n],
@@ -4239,6 +4564,22 @@ def target_findings(t, facts):
                                                    "Cluster API machines (worker VM lifecycle)"):
             for sev, text in capi_problems(r["out"]):
                 res.append((sev, "cluster " + text, r["label"]))
+        if r["status"] == "ok" and r["label"] == "Transport zones, node profiles and cluster attachments":
+            for p in re.findall(r"(?m)^PROBLEM: (.+)$", r["out"]):
+                res.append(("high", "NSX " + p, r["label"]))
+        if r["status"] == "ok" and r["label"].startswith("Compute managers (vCenter registration"):
+            for m in re.finditer(r"(?m)^compute manager: (\S+).*?connection=(\S+)", r["out"]):
+                if m.group(2) != "UP":
+                    res.append(("high", "NSX compute manager %s connection %s" % m.groups(), r["label"]))
+        if r["status"] == "ok" and r["label"].startswith("Failed tasks (last 14 days)"):
+            for blk in re.split(r"(?m)^(?=FAILED TASK: )", r["out"])[1:5]:
+                head = re.match(r"FAILED TASK: (\S+)\s+(.+?)  type=", blk)
+                err = re.search(r"(?m)^\s*error: (.+)$", blk)
+                cause = re.search(r"(?m)^\s*cause: (.+)$", blk)
+                if head:
+                    res.append(("med", "failed SDDC Manager task '%s' (%s)%s%s" % (
+                        head.group(2), head.group(1)[:10], (": " + err.group(1)) if err else "",
+                        (" - cause: " + cause.group(1)) if cause else ""), r["label"]))
     if "nodes_ready" in f:
         a, b = f["nodes_ready"].split("/")
         if a != b:
