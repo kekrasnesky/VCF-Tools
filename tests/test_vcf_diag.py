@@ -213,7 +213,7 @@ class Harvest(unittest.TestCase):
               "/dev/sda2 10M 2.0M 8.0M 20% /boot/efi\ntmpfs 3.9G 11M 3.9G 1% /run\n")
         out = run(sc, events + noheader + top + df)
         self.assertNotIn("K8SOBJ", out)
-        self.assertEqual(len(sc.m.maps.get("k8sobj", {})), 4)      # the four pod names, nothing else
+        self.assertEqual(len(sc.m.maps.get("k8sobj", {})), 5)      # four pod names + pgdatabase, nothing else
         for keep in (" 10m ", " 11m ", " 2d3h ", "250m 2236Mi", "/dev/sda2 10M 2.0M", "tmpfs 3.9G 11M"):
             self.assertIn(keep, out)
         for gone in ("ledger-api", "ledger-db", "pgdatabase-0", "widgets-ns"):
@@ -2653,6 +2653,10 @@ class NoiseSummarizers(unittest.TestCase):
         t.results, t.identity, t.errmsg = [r], [], ""
         v.learn_from_results([({"sec": {"prefix": "k8snode", "type": "k8s"}}, [t])], sc)
         self.assertTrue(sc.m.lookup("k8sobj", "ledger-api-7f6d5c4b8f-abcde"))
+        self.assertTrue(sc.m.lookup("k8sobj", "ledger-api"))       # workload name shown by the summary
+        rep = run(sc, v.post_all_pods(pods))
+        self.assertNotIn("ledger", rep)
+        self.assertNotIn("widgets", rep)
 
     def test_tool_caused_failures_are_fixed(self):
         etcd = find("k8s", "etcd health and status (leader, database size)")["cmd"]

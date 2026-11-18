@@ -1831,6 +1831,11 @@ class Scrubber:
                         if re.fullmatch(r"[a-z0-9][a-z0-9.-]{2,}", name) and not name.isdigit() \
                                 and not RX_QUANTITY.fullmatch(name):
                             self.learn_term("k8sobj", name)
+                            # the workload name (pod name without its generated suffix) is shown
+                            # by the per-namespace pod summary: it must be known as well
+                            base = RX_POD_SUFFIX.sub("", name) if i == name_col else name
+                            if base != name and ("-" in base or len(base) >= 5):
+                                self.learn_term("k8sobj", base)
 
     def prescan(self, text):
         """Discover IPs, version literals and FQDNs before scrubbing, so that every
