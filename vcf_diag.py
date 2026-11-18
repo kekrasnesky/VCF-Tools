@@ -57,7 +57,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
-VERSION = "1.12.0"
+VERSION = "1.13.0"
 
 # ----------------------------------------------------------------------------
 # Diagnostic catalog
@@ -87,7 +87,7 @@ def apicmd(label, fn, shown, harvest=(), max_lines=600):
 
 def is_api_group(key):
     """Checks answered by a REST API from this computer, not over SSH."""
-    return key.startswith(("vc-api-", "nsx-api-"))
+    return key.startswith(("vc-api-", "nsx-api-", "sddc-api-"))
 
 
 def plan_needs_ssh(item):
@@ -269,6 +269,19 @@ ESXI_GROUPS = [
     ("vms", "Running VM count", [
         cmd("Running VMs (count only)", "esxcli vm process list 2>&1 | grep -c 'World ID'"),
     ]),
+    ("passwords", "Local accounts, password age and lockout", [
+        cmd("Local accounts", "esxcli system account list 2>&1"),
+        # Only user name and dates are printed from /etc/shadow, never the password hash.
+        cmd("Password age (days)",
+            "today=$(( $(date +%s) / 86400 )); awk -F: -v t=$today '$2 !~ /^[*!]/ && $2 != \"\" "
+            "{ age = ($3 == \"\" ? \"?\" : t - $3); printf \"%-20s changed %s days ago, max age %s days\\n\", "
+            "$1, age, ($5 == \"\" ? \"none\" : $5) }' /etc/shadow 2>&1"),
+        cmd("Password and lockout policy",
+            "for o in PasswordMaxDays PasswordHistory PasswordQualityControl AccountLockFailures AccountUnlockTime; do "
+            "esxcli system settings advanced list -o /Security/$o 2>/dev/null | grep -E '^ *(Path|Int Value|String Value):'; "
+            "done"),
+        cmd("Failed logins / locked root", "pam_tally2 --user root 2>&1 || faillock --user root 2>&1"),
+    ]),
 ]
 
 VCENTER_GROUPS = [
@@ -290,6 +303,29 @@ VCENTER_GROUPS = [
             " | grep -E 'Alias|Not Before|Not After|Subject:|Issuer:'; done",
             timeout=120, max_lines=300),
     ]),
+    ("vc-sso", "Embedded SSO: services, domain, Lookup Service, errors, passwords", [
+        cmd("SSO and directory services",
+            "for svc in vmdird vmware-stsd vmware-sts-idmd lookupsvc vmafdd vmcad vmware-vmon; do "
+            "printf '%-18s ' \"$svc\"; service-control --status \"$svc\" 2>&1 | tr '\\n' ' '; echo; done", timeout=120),
+        cmd("SSO domain, site and directory state",
+            "A=/usr/lib/vmware-vmafd/bin/vmafd-cli; for q in get-domain-name get-site-name get-domain-state "
+            "get-dc-name get-ls-location get-pnid; do printf '%-18s ' \"$q\"; $A $q --server-name localhost 2>&1 "
+            "| tr '\\n' ' '; echo; done", harvest=[("domain", r"(?m)^get-domain-name\s+(\S+\.\S+)", None)]),
+        cmd("Lookup Service registrations by host (all should point to this vCenter)",
+            "echo \"PNID: $(/usr/lib/vmware-vmafd/bin/vmafd-cli get-pnid --server-name localhost 2>/dev/null)\"; "
+            "PY=$(command -v python3 || command -v python); $PY /usr/lib/vmware-lookupsvc/tools/lstool.py list "
+            "--url http://localhost:7090/lookupservice/sdk --no-check-cert 2>/dev/null | grep -oE '://[^/:\"]+' "
+            "| sed 's#://##' | sort | uniq -c | sort -rn | head -n 25", timeout=120),
+        cmd("Recent SSO and directory errors (24 h)",
+            "find /var/log/vmware/sso /var/log/vmware/vmdird /var/log/vmware/vmafdd -name '*.log' -mmin -1440 "
+            "2>/dev/null | head -n 40 | xargs -r grep -hiE 'error|exception|expired|locked|failed|invalid credential' "
+            "2>/dev/null | tail -n 150", timeout=120, max_lines=200),
+        cmd("Active Directory join (Integrated Windows Authentication)", "/opt/likewise/bin/domainjoin-cli query 2>&1"),
+        cmd("vmdir database size", "du -sh /storage/db/vmware-vmdir 2>&1"),
+        cmd("Local account password ageing",
+            "for u in $(awk -F: '($3==0 || $3>=1000) && $7 !~ /nologin|false/ {print $1}' /etc/passwd); do "
+            "echo \"== $u\"; chage -l \"$u\" 2>&1 | head -n 4; done"),
+    ]),
     ("vc-supervisor", "Supervisor / Workload Management (wcp service)", [
         cmd("Workload Control Plane service", "vmon-cli -s wcp 2>&1 | head -n 12"),
         # The script also prints the Supervisor root password: only the cluster and IP lines are kept
@@ -309,6 +345,12 @@ VCENTER_GROUPS = [
         apicmd("Supervisor services", "services", "GET /api/vcenter/namespace-management/supervisor-services",
                harvest=[H_SUPERVISOR]),
     ]),
+    ("vc-api-sso", "SSO certificates, identity sources and local passwords (vCenter API; needs an SSO login)", [
+        apicmd("STS signing certificate (SSO token signing)", "vc_sts", "GET /api/vcenter/certificate-management/vcenter/signing-certificate"),
+        apicmd("Machine SSL certificate", "vc_tls", "GET /api/vcenter/certificate-management/vcenter/tls"),
+        apicmd("Identity sources", "vc_idp", "GET /api/vcenter/identity/providers"),
+        apicmd("Appliance local accounts and password expiry", "vc_accounts", "GET /api/appliance/local-accounts (+ details)"),
+    ]),
     ("vc-storage", "Appliance partitions and core dumps", [
         cmd("Key partitions", "df -hP /storage/log /storage/db /storage/seat /storage/core 2>&1"),
         cmd("Core dumps", "ls -lh /storage/core 2>&1 | tail -n 15"),
@@ -324,6 +366,8 @@ NSX_NODE_CMDS = [
     ncli("NTP servers", "get ntp-servers"),
     ncli("NTP associations", "get ntp-server associations"),
     ncli("DNS servers", "get name-servers"),
+    ncli("Password expiry: admin", "get user admin password-expiration"),
+    ncli("Password expiry: audit", "get user audit password-expiration"),
 ]
 
 NSX_GROUPS = [
@@ -343,6 +387,7 @@ NSX_GROUPS = [
                harvest=[H_NSXNODE], max_lines=800),
         apicmd("Edge clusters", "nsx_edge_clusters", "GET /api/v1/edge-clusters", harvest=[H_EDGECL]),
         apicmd("Backups", "nsx_backups", "GET /api/v1/cluster/backups/history (+ config)"),
+        apicmd("Local users and password expiry", "nsx_users", "GET /api/v1/node/users (+ auth policy)"),
     ]),
     ("os", "OS level (root shell only)", [
         cmd("Disk usage", "df -hP"),
@@ -381,6 +426,10 @@ SDDC_GROUPS = [
         cmd("Service about endpoints",
             "for s in lcm domainmanager operationsmanager commonsvcs; do echo \"== $s\";"
             " curl -s -m 8 \"http://localhost/$s/about\" 2>&1; echo; done", timeout=60),
+    ]),
+    ("sddc-api-credentials", "Stored credentials and password rotations (SDDC Manager API; needs an SSO login)", [
+        apicmd("Stored credentials and expiry", "sddc_credentials", "GET /v1/credentials", max_lines=800),
+        apicmd("Recent password rotation / update tasks", "sddc_credential_tasks", "GET /v1/credentials/tasks"),
     ]),
 ] + linux_groups()
 
@@ -1767,11 +1816,14 @@ class VcApi:
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
                                                   urllib.request.HTTPSHandler(context=ctx))
 
-    def _call(self, method, path, headers=None):
-        req = urllib.request.Request(self.base + path, method=method,
+    def _call(self, method, path, headers=None, data=None):
+        req = urllib.request.Request(self.base + path, method=method, data=data,
                                      headers=dict({"User-Agent": "vcf_diag/%s" % VERSION}, **(headers or {})))
-        if self.token:
+        if self.token and not getattr(self, "bearer", None):
             req.add_header("vmware-api-session-id", self.token)
+        if getattr(self, "bearer", None):
+            req.add_header("Authorization", "Bearer " + self.bearer)
+            req.add_header("Accept", "application/json")
         if getattr(self, "basic", None):
             req.add_header("Authorization", self.basic)
             req.add_header("Accept", "application/json")
@@ -2065,9 +2117,193 @@ def nsx_backups(api):
     return "\n".join(out)
 
 
+class SddcApi(VcApi):
+    """SDDC Manager public API: token from POST /v1/tokens, then Bearer."""
+
+    def login(self):
+        body = json.dumps({"username": self.user, "password": self.password}).encode("utf-8")
+        code, text = self._call("POST", "/v1/tokens", {"Content-Type": "application/json"}, data=body)
+        self.password = None
+        if code in (401, 403):
+            raise VcApiError("SDDC Manager login failed for %s (wrong user or password, or no permission)" % self.user)
+        if code >= 400:
+            raise VcApiError("SDDC Manager refused the login (HTTP %d): %s" % (code, text[:200]))
+        try:
+            self.bearer = json.loads(text)["accessToken"]
+        except (ValueError, KeyError, TypeError):
+            raise VcApiError("unexpected answer to the SDDC Manager login: %s" % text[:200])
+
+    def logout(self):
+        self.bearer = None
+
+
+def _cert_dates(pem):
+    """(subject CN, notAfter as datetime) for one PEM certificate, without third-party libraries."""
+    fd, path = tempfile.mkstemp(suffix=".pem")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(pem if pem.endswith("\n") else pem + "\n")
+        info = ssl._ssl._test_decode_cert(path)
+    except Exception:
+        return None, None
+    finally:
+        os.unlink(path)
+    cn = dict(x[0] for x in info.get("subject", ())).get("commonName", "?")
+    try:
+        when = datetime.datetime.strptime(info["notAfter"], "%b %d %H:%M:%S %Y %Z").replace(tzinfo=datetime.timezone.utc)
+    except (KeyError, ValueError):
+        when = None
+    return cn, when
+
+
+def _expiry_line(label, when):
+    if not when:
+        return "%s: expiry date unknown" % label
+    days = (when - datetime.datetime.now(datetime.timezone.utc)).days
+    flag = "EXPIRED" if days < 0 else "EXPIRES SOON" if days <= 30 else "ok"
+    return "%s: valid until %s (%d days) %s" % (label, when.strftime("%Y-%m-%d"), days, flag)
+
+
+def _pems(obj):
+    """Every PEM certificate found anywhere in an API answer."""
+    text = json.dumps(obj)
+    return [m.replace("\\n", "\n") for m in re.findall(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", text)]
+
+
+def vc_sts(api):
+    d = api.get("/api/vcenter/certificate-management/vcenter/signing-certificate")
+    if d is None:
+        return "This vCenter does not offer the signing-certificate API (vSphere 7.0 Update 3 or later is needed)."
+    out = ["The STS signing certificate signs every SSO token. When it expires, nobody can log in to vCenter."]
+    active = _pems((d or {}).get("active_cert_chain") or {})
+    for i, pem in enumerate(active[:1]):
+        cn, when = _cert_dates(pem)
+        out.append(_expiry_line("active signing certificate (%s)" % cn, when))
+    others = [p for p in _pems((d or {}).get("signing_cert_chains") or []) if p not in active[:1]]
+    for pem in others[:10]:
+        cn, when = _cert_dates(pem)
+        out.append(_expiry_line("  other certificate in the signing chains (%s)" % cn, when))
+    if len(out) == 1:
+        out.append("no certificate found in the answer")
+    return "\n".join(out)
+
+
+def vc_tls(api):
+    d = api.get("/api/vcenter/certificate-management/vcenter/tls") or {}
+    when = None
+    try:
+        when = datetime.datetime.strptime(str(d.get("valid_to"))[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc)
+    except ValueError:
+        pass
+    return "\n".join([_expiry_line("machine SSL certificate", when),
+                      "subject: %s" % d.get("subject_dn"), "issuer: %s" % d.get("issuer_dn")])
+
+
+def vc_idp(api):
+    d = api.get("/api/vcenter/identity/providers")
+    if d is None:
+        return "This vCenter does not offer the identity providers API."
+    rows = d if isinstance(d, list) else (d.get("providers") or d.get("items") or [])
+    if not rows:
+        return "No external identity providers configured (only the vsphere.local SSO domain, and AD sources managed in SSO)."
+    out = []
+    for r in rows:
+        out.append("provider: %s  type=%s  default=%s  domains=%s" % (
+            r.get("name") or r.get("provider"), r.get("config_tag") or r.get("type"), r.get("is_default"),
+            ",".join(r.get("domain_names") or []) or "-"))
+    return "\n".join(out)
+
+
+def vc_accounts(api):
+    names = api.get("/api/appliance/local-accounts")
+    if names is None:
+        return "This vCenter does not offer the local accounts API."
+    out = ["%-16s %-8s %-12s %-22s %s" % ("account", "enabled", "last change", "password expires", "status")]
+    for n in names or []:
+        a = api.get("/api/appliance/local-accounts/" + urllib.parse.quote(str(n))) or {}
+        exp, status = a.get("password_expires_at"), "ok"
+        if exp:
+            try:
+                when = datetime.datetime.strptime(str(exp)[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc)
+                days = (when - datetime.datetime.now(datetime.timezone.utc)).days
+                status = "EXPIRED" if days < 0 else ("EXPIRES IN %d DAYS" % days if days <= 14 else "%d days left" % days)
+            except ValueError:
+                status = "?"
+        else:
+            status = "never expires"
+        out.append("%-16s %-8s %-12s %-22s %s" % (n, a.get("enabled"), str(a.get("last_password_change") or "-")[:10],
+                                                  str(exp or "-")[:19], status))
+    pol = api.get("/api/appliance/local-accounts/global-policy")
+    if pol:
+        out.append("global policy: %s" % json.dumps(pol, sort_keys=True))
+    return "\n".join(out)
+
+
+def nsx_users(api):
+    users = api.paged("/api/v1/node/users")
+    out = ["%-12s %-20s %-18s %s" % ("user", "status", "change every (days)", "last change (days ago)")]
+    today = int(time.time() // 86400)
+    for u in users:
+        last = u.get("last_password_change")
+        ago = (today - int(last)) if isinstance(last, int) and last > 1000 else last
+        out.append("%-12s %-20s %-18s %s" % (u.get("username"), u.get("status"), u.get("password_change_frequency"), ago))
+    pol = api.get("/api/v1/node/aaa/auth-policy")
+    if pol:
+        keep = {k: v_ for k, v_ in pol.items() if not k.startswith("_")}
+        out.append("authentication and lockout policy: %s" % json.dumps(keep, sort_keys=True))
+    return "\n".join(out) if users or pol else "No user information returned."
+
+
+def _flat(obj, prefix=""):
+    if isinstance(obj, dict):
+        for k, v_ in obj.items():
+            yield from _flat(v_, "%s%s." % (prefix, k))
+    elif isinstance(obj, list):
+        for i, v_ in enumerate(obj[:5]):
+            yield from _flat(v_, "%s%d." % (prefix, i))
+    else:
+        yield prefix[:-1], obj
+
+
+def sddc_credentials(api):
+    page, rows = 0, []
+    while page < 20:
+        d = api.get("/v1/credentials?pageSize=500&pageNumber=%d" % page) or {}
+        rows += d.get("elements") or []
+        if (d.get("pageMetadata") or {}).get("totalPages", 1) <= page + 1:
+            break
+        page += 1
+    if not rows:
+        return "No stored credentials returned."
+    out = ["%d stored credential(s). Expiry and status as SDDC Manager knows them:" % len(rows)]
+    for c in rows:
+        res = c.get("resource") or {}
+        extra = ["%s=%s" % (k, v_) for k, v_ in _flat(c) if re.search(r"(?i)expir|status|lock|valid", k)]
+        out.append("- %s %s  user=%s  type=%s/%s  %s" % (
+            res.get("resourceType"), res.get("resourceName") or res.get("resourceIp"), c.get("username"),
+            c.get("credentialType"), c.get("accountType"), " ".join(extra) or ""))
+    return "\n".join(out)
+
+
+def sddc_credential_tasks(api):
+    d = api.get("/v1/credentials/tasks") or {}
+    rows = d.get("elements") or (d if isinstance(d, list) else [])
+    if not rows:
+        return "No credential tasks recorded."
+    rows = sorted(rows, key=lambda r: str(r.get("creationTimestamp") or ""), reverse=True)[:20]
+    out = ["Failed rotations or updates leave the stored password out of sync with the system (a stale password)."]
+    for r in rows:
+        out.append("%s  %s  %s  %s" % (str(r.get("creationTimestamp") or "")[:19], r.get("status"),
+                                       r.get("name") or r.get("type") or r.get("operationType"),
+                                       "; ".join(str((e or {}).get("message") or e) for e in (r.get("errors") or []))[:300]))
+    return "\n".join(out)
+
+
 VCAPI_FUNCS = {"supervisors": api_supervisors, "namespaces": api_namespaces, "services": api_services,
                "nsx_cluster": nsx_cluster, "nsx_alarms": nsx_alarms, "nsx_transport_nodes": nsx_transport_nodes,
-               "nsx_edge_clusters": nsx_edge_clusters, "nsx_backups": nsx_backups}
+               "nsx_edge_clusters": nsx_edge_clusters, "nsx_backups": nsx_backups, "nsx_users": nsx_users,
+               "vc_sts": vc_sts, "vc_tls": vc_tls, "vc_idp": vc_idp, "vc_accounts": vc_accounts,
+               "sddc_credentials": sddc_credentials, "sddc_credential_tasks": sddc_credential_tasks}
 
 
 def collect_api(t, groups):
@@ -2080,7 +2316,7 @@ def collect_api(t, groups):
                               "status": "skipped", "note": "no API login was entered", "spec": c})
         return
     sec = t.sec
-    api = (NsxApi if sec["type"] == "nsx" else VcApi)(
+    api = {"nsx": NsxApi, "sddc": SddcApi}.get(sec["type"], VcApi)(
         t.address, user, password, verify=sec.get("tls_verify", True), ca_file=sec.get("ca_file"),
         base_url=sec.get("api_base"))
     try:
@@ -2408,7 +2644,8 @@ class ConsoleUI:
 
     def sso_credentials(self, sec):
         print("\n%s for the API checks of [%s] (Return to skip)" % (
-            "NSX API login" if sec["type"] == "nsx" else "vCenter SSO login", sec["name"]))
+            "NSX API login" if sec["type"] == "nsx" else "SSO login for the SDDC Manager API" if sec["type"] == "sddc"
+            else "vCenter SSO login", sec["name"]))
         user = input("  SSO username [%s]: " % sec["sso_user"]).strip() or sec["sso_user"]
         return user, getpass.getpass("  SSO password for %s: " % user)
 
@@ -2489,7 +2726,7 @@ def run_plan(ctx, plan, scrubber, ui=None):
             for i, t in enumerate(targets):
                 host_groups[t.address] = (cluster_groups if i == 0 else []) + node_groups
 
-        if sec["type"] == "nsx" and not host_groups and len(targets) > 1:
+        if sec["type"] in ("nsx", "vcenter", "sddc") and not host_groups and len(targets) > 1:
             api_g = [g for g in item["groups"] if is_api_group(g[0])]
             if api_g:
                 rest_g = [g for g in item["groups"] if not is_api_group(g[0])]
@@ -5123,11 +5360,11 @@ function renderGroups() {
     if (s.escalate === "su")
       fields.append(el("label", { className: "f" }, "Root password for su",
         el("input", { type: "password", className: "su", autocomplete: "off" })));
-    if (s.type === "vcenter" || s.type === "nsx") {
+    if (s.type === "vcenter" || s.type === "nsx" || s.type === "sddc") {
       const su = el("input", { type: "text", className: "ssouser", value: s.sso_user, autocomplete: "off", spellcheck: false });
       su.setAttribute("autocapitalize", "off");
-      const what = s.type === "nsx" ? "NSX API" : "vCenter SSO";
-      fields.append(el("label", { className: "f" }, what + " user (" + (s.type === "nsx" ? "API health checks" : "namespace checks") + ")", su),
+      const what = s.type === "nsx" ? "NSX API" : s.type === "sddc" ? "SDDC Manager API (SSO)" : "vCenter SSO";
+      fields.append(el("label", { className: "f" }, what + " user (" + (s.type === "vcenter" ? "SSO and namespace checks" : "API checks") + ")", su),
         el("label", { className: "f" }, what + " password",
           el("input", { type: "password", className: "ssopass", autocomplete: "off" })));
     }
@@ -5179,7 +5416,7 @@ $("#run").onclick = async () => {
   for (const card of $$("#groups .card")) {
     if (!$(".sec", card).checked) continue;
     const hosts = $$(".host:checked", card).map(i => i.value), groups = $$(".grp:checked", card).map(i => i.value);
-    const isApi = g => /^(vc|nsx)-api-/.test(g);
+    const isApi = g => /^(vc|nsx|sddc)-api-/.test(g);
     const apiOnly = groups.length > 0 && groups.every(isApi);
     const need = (apiOnly ? [] : [$(".pass", card)].concat($(".su", card) ? [$(".su", card)] : []))
       .concat(groups.some(isApi) && $(".ssopass", card) ? [$(".ssopass", card)] : []);
@@ -5362,11 +5599,12 @@ function groupCard(g) {
     card.append(el("div", { className: "fields" },
       el("label", { className: "f" }, "kubeconfig path (empty = find automatically)", inp("text", g.kubeconfig, { className: "gkcfg" })),
       el("label", { className: "f" }, "kubectl command", inp("text", g.kubectl, { placeholder: "kubectl", className: "gkctl" }))));
-  if (g.type === "vcenter" || g.type === "nsx") {
-    const nsx = g.type === "nsx";
+  if (g.type === "vcenter" || g.type === "nsx" || g.type === "sddc") {
+    const nsx = g.type !== "vcenter";
     card.append(el("div", { className: "fields" },
-      el("label", { className: "f" }, nsx ? "NSX API user (API health checks)" : "vCenter SSO user (namespace checks)",
-        inp("text", g.sso_user, { placeholder: nsx ? "admin" : "administrator@vsphere.local", className: "gsso" })),
+      el("label", { className: "f" }, g.type === "nsx" ? "NSX API user (API health checks)" : g.type === "sddc" ?
+        "SDDC Manager API user (SSO, credential checks)" : "vCenter SSO user (SSO and namespace checks)",
+        inp("text", g.sso_user, { placeholder: g.type === "nsx" ? "admin" : "administrator@vsphere.local", className: "gsso" })),
       el("label", { className: "f" }, "Trust this " + (nsx ? "NSX" : "vCenter") + " CA file (path)",
         inp("text", g.ca_file, { placeholder: nsx ? "~/nsx-ca.pem" : "~/vcenter-ca.pem", className: "gca" }))));
     card.append(el("label", { className: "chk" }, el("input", { type: "checkbox", className: "gtls", checked: yes(g.tls_verify || "yes") }),

@@ -198,6 +198,35 @@ list VKS / Cluster API clusters and machines, VM Service virtual machines, Super
 and errors from the Cluster API and VM operator controllers. A worker that appears both as a
 node and as a Cluster API machine gets the same placeholder in both places.
 
+### SSO and stale passwords
+
+Expired or out-of-sync passwords and SSO certificate problems are among the most common causes of
+VCF outages. These check groups cover them:
+
+- **vCenter, Embedded SSO** (over SSH): status of the SSO and directory services (vmdir, STS,
+  identity, Lookup Service, VMware Authentication Framework, VMCA), SSO domain, site and directory
+  state, Lookup Service registrations grouped by host name (every registration should point to the
+  vCenter's own name; anything else points at a stale registration after a name change), recent
+  SSO and directory errors, the Active Directory join used by Integrated Windows Authentication,
+  vmdir database size, and password ageing of the appliance's interactive accounts.
+- **vCenter, SSO certificates, identity sources and local passwords** (vCenter API, with the SSO
+  login): the **STS signing certificate** that signs every SSO token (when it expires, nobody can
+  log in) and the other certificates in the signing chain, the machine SSL certificate, identity
+  providers, and each appliance local account with its password expiry date (EXPIRED / EXPIRES IN
+  n DAYS).
+- **ESXi, Local accounts, password age and lockout**: local accounts, days since each password was
+  changed and the maximum age (only names and dates are read, never the password hashes), the
+  password and lockout policy, and failed logins for root.
+- **NSX**: password expiry of `admin` and `audit` (CLI), and from the NSX API every local user's
+  status (for example PASSWORD_EXPIRED) with the authentication and lockout policy.
+- **SDDC Manager, Stored credentials and password rotations** (SDDC Manager API, with an SSO login
+  such as administrator@vsphere.local): every credential SDDC Manager stores with its expiry and
+  status, and recent password rotation and update tasks. A failed rotation leaves the stored
+  password out of sync with the system: a stale password.
+
+Not covered: SSO users locked out in vsphere.local and vmdir replication between linked vCenters;
+both need the SSO administrator password on the appliance itself, which the tool does not ask for.
+
 ### NSX health from the NSX API
 
 The NSX Manager group has a check group **NSX health from the NSX API**. Like the Supervisor

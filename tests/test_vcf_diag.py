@@ -1734,6 +1734,158 @@ class AiPresets(unittest.TestCase):
         self.assertEqual(v.resolve_ai_key(v.ai_settings({}), "", session), "")
 
 
+STS_PEM = """-----BEGIN CERTIFICATE-----
+MIIDETCCAfmgAwIBAgIUWoc5iTiKGCOQdkYQ1SLSQGuWGbYwDQYJKoZIhvcNAQEL
+BQAwGDEWMBQGA1UEAwwNc3Nvc2VydmVyU2lnbjAeFw0yNjExMTgxMzU5MzRaFw0y
+NjExMjgxMzU5MzRaMBgxFjAUBgNVBAMMDXNzb3NlcnZlclNpZ24wggEiMA0GCSqG
+SIb3DQEBAQUAA4IBDwAwggEKAoIBAQCgEN0eoT27yHILQksHZhSUXpA5eJGcgNbC
+DJHJ7c4h0oSTffJ5OGUpAF9itWBuvWQoDat05YvWP+ZMPratuI/7wIhM/U1jCof8
+3UhGMh8r7l0qgnU0kv84Upi68pdxPzMZL9DB01ZOeoFqUjskykG+BENqdgSzpIv4
+YGml1gzEIGb3Fircro4h2gioiphJiV3oHan7srYmBzKcuEcz83ZJCHf9q03bae7G
+2/VUWZ0ydfyA0w30+Iife1mhnjcDwAPknoUPusLYmUMV/lQooXya+HtHziPSjoRA
+CTdOD319ibkzOdTLDs6a/b9bwuk52JahmY/VYfvKHFOW5XW9qSudAgMBAAGjUzBR
+MB0GA1UdDgQWBBRNV/dWYUsAEO7zSQTV/cXyoU9KzTAfBgNVHSMEGDAWgBRNV/dW
+YUsAEO7zSQTV/cXyoU9KzTAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUA
+A4IBAQA4EqIuh2jitwsGa6rQq/JtSOD7HcWGXMYggK5Ax6OSjYrlBsKcT+dq4S4R
+v4mS2jP4jNO688xBwt1E+WoHaKWTwPVjalT67Fx9mBtgVQixjnp8Hrp3KvE1gYs9
+2ch+eulRUT0qBwwr4xKoVancGCFWOynK9REXfzh74Qy76+o4peRhPRRTxZXDEZGW
+FpC3VairIq83hQALYiH2WsvAI97oKl2TV3RFCB8mmjdYuUP3ZP/OdOprXOquhZQl
+/Q+RsrnXhuDpcZcKZzksB+g/pYtOFkFqAAav9euIwZsTth25SvOUjwdfotPnYAyE
+nkyoXBBsXffFtjo0rJQq7lcLs8mY
+-----END CERTIFICATE-----"""
+
+
+class SsoAndPasswords(unittest.TestCase):
+    def test_vcenter_sso_checks(self):
+        FAKE_VC["/api/vcenter/certificate-management/vcenter/signing-certificate"] = {
+            "active_cert_chain": {"cert_chain": [STS_PEM]}, "signing_cert_chains": [{"cert_chain": [STS_PEM]}]}
+        FAKE_VC["/api/vcenter/certificate-management/vcenter/tls"] = {
+            "valid_to": "2020-01-01T00:00:00.000Z", "subject_dn": "CN=vc01", "issuer_dn": "CN=CA"}
+        FAKE_VC["/api/appliance/local-accounts"] = ["root", "monitor"]
+        FAKE_VC["/api/appliance/local-accounts/root"] = {"enabled": True, "last_password_change": "2026-01-01T00:00:00.000Z",
+                                                         "password_expires_at": "2026-01-02T00:00:00.000Z"}
+        FAKE_VC["/api/appliance/local-accounts/monitor"] = {"enabled": True}
+        FAKE_VC["/api/vcenter/identity/providers"] = [{"name": "ADFS", "config_tag": "Oidc", "is_default": True,
+                                                       "domain_names": ["corp.example"]}]
+        srv, base, seen = fake_vcenter()
+        try:
+            api = v.VcApi("vc", "administrator@vsphere.local", "Secr3t!", base_url=base)
+            api.login()
+            sts, tls, idp, acc = v.vc_sts(api), v.vc_tls(api), v.vc_idp(api), v.vc_accounts(api)
+            api.logout()
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        self.assertIn("active signing certificate (ssoserverSign): valid until", sts)
+        self.assertTrue("EXPIRES SOON" in sts or "EXPIRED" in sts)
+        self.assertNotIn("BEGIN CERTIFICATE", sts)
+        self.assertIn("machine SSL certificate: valid until 2020-01-01", tls)
+        self.assertIn("EXPIRED", tls)
+        self.assertIn("provider: ADFS  type=Oidc  default=True", idp)
+        self.assertRegex(acc, r"root\s+True\s+2026-01-01\s+2026-01-02T00:00:00\s+EXPIRED")
+        self.assertRegex(acc, r"monitor .* never expires")
+        self.assertTrue(all(m == "GET" for m, p in seen if p != "/api/session"))
+
+    def test_nsx_users(self):
+        FAKE_NSX["/api/v1/node/users"] = {"results": [
+            {"username": "admin", "status": "ACTIVE", "password_change_frequency": 90, "last_password_change": 3},
+            {"username": "audit", "status": "PASSWORD_EXPIRED", "password_change_frequency": 90, "last_password_change": 120}]}
+        FAKE_NSX["/api/v1/node/aaa/auth-policy"] = {"api_failed_auth_lockout_period": 900, "_revision": 1}
+        srv, base, seen = fake_nsx()
+        try:
+            api = v.NsxApi("nsx", "admin", "Nsx-Pass1!", base_url=base)
+            api.login()
+            out = v.nsx_users(api)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        self.assertRegex(out, r"audit\s+PASSWORD_EXPIRED\s+90\s+120")
+        self.assertIn('"api_failed_auth_lockout_period": 900', out)
+        self.assertNotIn("_revision", out)
+
+    def test_sddc_stored_credentials(self):
+        import http.server
+        import json as _json
+        import threading
+        seen = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def send(self, code, obj):
+                data = _json.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_POST(self):
+                body = _json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                seen.append(("POST", self.path))
+                ok = body == {"username": "administrator@vsphere.local", "password": "Pw1!"}
+                self.send(200 if ok else 401, {"accessToken": "tok"} if ok else {})
+
+            def do_GET(self):
+                seen.append(("GET", self.path))
+                if self.headers.get("Authorization") != "Bearer tok":
+                    return self.send(401, {})
+                if self.path.startswith("/v1/credentials/tasks"):
+                    return self.send(200, {"elements": [{"creationTimestamp": "2026-11-17T10:00:00Z", "status": "FAILED",
+                                                         "name": "Rotate passwords",
+                                                         "errors": [{"message": "Password for esx02 root is out of sync"}]}]})
+                if self.path.startswith("/v1/credentials"):
+                    return self.send(200, {"elements": [
+                        {"username": "root", "credentialType": "SSH", "accountType": "USER",
+                         "resource": {"resourceType": "ESXI", "resourceName": "esx02.corp.example"},
+                         "expiry": {"expiryDate": "2026-11-20", "status": "EXPIRING"}}], "pageMetadata": {"totalPages": 1}})
+                self.send(404, {})
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = "http://127.0.0.1:%d" % srv.server_address[1]
+        try:
+            api = v.SddcApi("sddc", "administrator@vsphere.local", "Pw1!", base_url=base)
+            api.login()
+            self.assertIsNone(api.password)
+            creds, tasks = v.sddc_credentials(api), v.sddc_credential_tasks(api)
+            with self.assertRaises(v.VcApiError):
+                v.SddcApi("sddc", "administrator@vsphere.local", "bad", base_url=base).login()
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        self.assertIn("- ESXI esx02.corp.example  user=root  type=SSH/USER", creds)
+        self.assertIn("expiry.status=EXPIRING", creds)
+        self.assertIn("FAILED  Rotate passwords  Password for esx02 root is out of sync", tasks)
+
+    def test_esxi_password_age_never_prints_hashes(self):
+        import subprocess
+        import time
+        c = [c for g in v.COMPONENTS["esxi"]["groups"] if g[0] == "passwords" for c in g[2]
+             if c["label"] == "Password age (days)"][0]
+        with tempfile.TemporaryDirectory() as d:
+            shadow = os.path.join(d, "shadow")
+            today = int(time.time() // 86400)
+            with open(shadow, "w") as fh:
+                fh.write("root:$6$salt$HASHVALUE:%d:0:90:7:::\ndcui:*:%d:0:99999:7:::\nvpxuser:$6$x$OTHERHASH:%d::::::\n"
+                         % (today - 100, today, today - 5))
+            out = subprocess.run(["sh", "-c", c["cmd"].replace("/etc/shadow", shadow)], stdout=subprocess.PIPE).stdout.decode()
+        self.assertIn("root                 changed 100 days ago, max age 90 days", out)
+        self.assertIn("vpxuser              changed 5 days ago, max age none days", out)
+        self.assertNotIn("HASH", out)
+        self.assertNotIn("dcui", out)                        # locked accounts are skipped
+
+    def test_new_shell_checks_parse(self):
+        import subprocess
+        for typ in ("vcenter", "esxi"):
+            for key, title, cmds in v.COMPONENTS[typ]["groups"]:
+                for c in cmds:
+                    if c["mode"] == "sh" and key in ("vc-sso", "passwords"):
+                        r = subprocess.run(["bash", "-n", "-c", c["cmd"]], stderr=subprocess.PIPE)
+                        self.assertEqual(r.returncode, 0, (c["label"], r.stderr))
+        self.assertTrue(v.is_api_group("sddc-api-credentials"))
+
+
 class GuiApi(unittest.TestCase):
     """The browser GUI's local web API, without contacting any host."""
 
