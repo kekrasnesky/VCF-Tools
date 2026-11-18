@@ -1459,6 +1459,50 @@ class Conversation(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
 
+    def test_question_asking_for_a_secret_is_sent_back(self):
+        ask = ("QUESTION FOR THE ADMINISTRATOR: Could you please provide the administrator@vsphere.local password "
+               "or perform a password rotation in SDDC Manager?")
+
+        def answer(msgs):
+            if "Do not ask the administrator for passwords" in msgs[-1]["content"]:
+                return "QUESTION FOR THE ADMINISTRATOR: did a password rotation fail in SDDC Manager this week?"
+            return ask
+        srv, base, seen = scripted_ai(answer)
+        try:
+            inv, events = self.investigation(base, lambda p: "run")
+            res = inv.run()
+            self.assertEqual(len(seen), 2)
+            self.assertIn("Never ask the administrator for a password", seen[0][0]["content"])
+            self.assertEqual(res["how"], "question")
+            self.assertEqual(res["question"], "did a password rotation fail in SDDC Manager this week?")
+            self.assertFalse(any(k == "warn" and "secret" in str(t) for k, t in events))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_persistent_secret_request_warns_the_administrator(self):
+        srv, base, seen = scripted_ai(lambda msgs: "QUESTION FOR THE ADMINISTRATOR: please share the NSX admin password.")
+        try:
+            inv, events = self.investigation(base, lambda p: "run")
+            inv.run()
+            self.assertEqual(len(seen), 3)                    # first answer + two corrections
+            self.assertTrue(any(k == "warn" and "Do not type it here" in str(t) for k, t in events))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_secret_request_detection(self):
+        q = "QUESTION FOR THE ADMINISTRATOR: "
+        for text in ("Could you please provide the administrator@vsphere.local password?",
+                     "What is the root password of esxi-01?", "Please paste the API token.",
+                     "Can you share the credentials for vcenter-01?"):
+            self.assertTrue(v.asks_for_secret(q + text), text)
+        for text in ("Did the password rotation in SDDC Manager succeed?",
+                     "Was the transport zone deleted in the NSX UI?",
+                     "Is there a change window for restarting vpxd?"):
+            self.assertFalse(v.asks_for_secret(q + text), text)
+        self.assertFalse(v.asks_for_secret("Please provide the password.\n```vcf-plan\n```"))
+
     def test_run_it_myself_then_paste_output(self):
         def answer(msgs):
             last = msgs[-1]["content"]
