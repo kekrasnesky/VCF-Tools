@@ -57,7 +57,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
-VERSION = "1.18.0"
+VERSION = "1.19.0"
 
 # ----------------------------------------------------------------------------
 # Diagnostic catalog
@@ -3998,6 +3998,158 @@ def _fact_vcfa_certs(out):
     return f
 
 
+def _fact_df_full(out):
+    """Fullest filesystem plus every real filesystem at or above 85%."""
+    f = _fact_df(out)
+    full = []
+    for ln in out.splitlines():
+        m = re.match(r"^(\S+)\s+\S+\s+\S+\s+\S+\s+(\d+)%\s+(/\S*)\s*$", ln)
+        if m and int(m.group(2)) >= 85 and not m.group(1).startswith(("tmpfs", "devtmpfs", "none", "overlay", "shm")):
+            full.append("%s%% %s" % (m.group(2), m.group(3)))
+    if full:
+        f.append(("fs_over_85pct", ", ".join(full)))
+    return f
+
+
+def _fact_free(out):
+    """free -m: available memory and swap in use."""
+    f = []
+    m = re.search(r"(?m)^Mem:\s+(\d+)\s+\d+\s+\d+\s+\d+\s+\d+\s+(\d+)", out)
+    if m and int(m.group(1)):
+        f.append(("mem_available_pct", round(100.0 * int(m.group(2)) / int(m.group(1)))))
+    m = re.search(r"(?m)^Swap:\s+(\d+)\s+(\d+)", out)
+    if m:
+        f.append(("swap_used_mb", int(m.group(2))) if int(m.group(1)) else ("swap", "none"))
+    return f
+
+
+def _fact_memory(out):
+    return _fact_free(out) if re.search(r"(?m)^Mem:", out) else _fact_mem(out)
+
+
+def _fact_esxi_password_age(out):
+    late = []
+    for ln in out.splitlines():
+        m = re.match(r"^(\S+)\s+changed (\d+) days ago, max age (\d+) days", ln)
+        if m and int(m.group(3)) > 0 and int(m.group(2)) > int(m.group(3)):
+            late.append("%s %sd > %sd" % m.groups())
+    return [("passwords_past_max_age", ", ".join(late) if late else "none")]
+
+
+def _fact_chage(out, now=None):
+    """chage -l blocks ('== user'): accounts whose password has already expired."""
+    now = now or datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+    late, user = [], None
+    for ln in out.splitlines():
+        m = re.match(r"^==\s+(\S+)", ln)
+        if m:
+            user = m.group(1)
+            continue
+        m = re.match(r"^\s*Password expires\s*:\s*(.+?)\s*$", ln)
+        if m and user:
+            try:
+                when = datetime.datetime.strptime(m.group(1), "%b %d, %Y")
+            except ValueError:
+                continue
+            if when < now:
+                late.append("%s expired %s" % (user, when.strftime("%Y-%m-%d")))
+    return [("passwords_expired", ", ".join(late))] if late else []
+
+
+def _fact_failed_units(out):
+    units = re.findall(r"(?m)^\W*(\S+\.(?:service|mount|socket|timer|target|path|scope|slice))\s+\S+\s+failed", out)
+    return [("failed_units", ", ".join(units) if units else "none")]
+
+
+def _fact_core_files(out):
+    if re.match(r"(?i)\s*no core dumps", out):
+        return [("core_dumps", 0)]
+    files = [ln for ln in out.splitlines() if re.match(r"^-[rwx-]{9}", ln)]
+    if files or re.match(r"total \d", out.strip()):
+        return [("core_dumps", len(files))]
+    return []
+
+
+def _fact_nodes(out):
+    rows = [ln.split() for ln in out.splitlines() if ln.strip() and not ln.startswith("NAME")]
+    rows = [c for c in rows if len(c) >= 2 and re.match(r"(Not)?Ready", c[1])]
+    if not rows:
+        return []
+    ready = sum(1 for c in rows if c[1].split(",")[0] == "Ready")
+    return [("nodes_ready", "%d/%d" % (ready, len(rows)))]
+
+
+def _data_rows(out):
+    return [ln for ln in out.splitlines() if ln.strip() and not ln.startswith(("NAMESPACE", "NAME ", "No resources"))
+            and not ln.startswith(("error", "Error"))]
+
+
+def _fact_top_restarts(out):
+    rows = [ln.split() for ln in _data_rows(out)]
+    rows = [c for c in rows if len(c) >= 5 and c[4].isdigit()]
+    return [("top_restarts", "%s/%s %s" % (rows[0][0], rows[0][1], rows[0][4]))] if rows else []
+
+
+def kube_table(out):
+    """Rows of kubectl tables as dicts keyed by header field. Columns are found from the
+    header positions (fields are separated by 2+ spaces; 'CP READY' is one field)."""
+    rows, cols = [], None
+    for ln in out.splitlines():
+        if not ln.strip():
+            cols = None
+            continue
+        if ln.startswith("NAMESPACE") or (ln.startswith("NAME ") and cols is None):
+            cols = [(m.group(0), m.start()) for m in re.finditer(r"\S+(?: \S+)*", ln)]
+            continue
+        if not cols:
+            continue
+        row = {}
+        for i, (name, start) in enumerate(cols):
+            end = cols[i + 1][1] if i + 1 < len(cols) else len(ln)
+            row[name] = ln[start:end].strip() if start < len(ln) else ""
+        rows.append(row)
+    return rows
+
+
+def capi_problems(out):
+    """[(severity, text)] for Cluster API / TKC clusters that are not available or whose
+    control plane is not fully ready."""
+    res = []
+    for r in kube_table(out):
+        nm = r.get("NAME", "")
+        if not ("CP DESIRED" in r or "CONTROL PLANE" in r or nm.startswith(("cluster.", "tanzukubernetescluster"))):
+            continue                                 # machines, machine sets ...: not clusters
+        name = "%s/%s" % (r.get("NAMESPACE", "?"), nm.split("/", 1)[-1] or "?")
+        avail = r.get("AVAILABLE", r.get("READY", ""))
+        des, rdy = r.get("CP DESIRED", ""), r.get("CP READY", "")
+        cp = ""
+        if des.isdigit() and rdy.isdigit():
+            cp = "CP ready %s/%s" % (rdy, des)
+        if avail == "False" or (cp and int(rdy) == 0 and int(des) > 0):
+            res.append(("high", "%s AVAILABLE %s%s" % (name, avail or "?", (", " + cp) if cp else "")))
+        elif cp and int(rdy) < int(des):
+            res.append(("med", "%s %s" % (name, cp)))
+        elif r.get("PHASE") in ("Failed", "Deleting"):
+            res.append(("med", "%s phase %s" % (name, r["PHASE"])))
+    return res
+
+
+def _fact_capi(out):
+    probs = capi_problems(out)
+    return [("capi_clusters_unavailable", "; ".join(t for _, t in probs) if probs else "none")]
+
+
+def _fact_events(out):
+    by = {}
+    for ln in out.splitlines():
+        m = re.match(r"^\s*(\d+)x\s+\S+\s+\S+\s+\S+\s+(\S+)\s", ln)
+        if m:
+            by[m.group(2)] = by.get(m.group(2), 0) + int(m.group(1))
+    if not by:
+        return []
+    return [("warning_events_by_reason", ", ".join("%s %d" % kv for kv in sorted(by.items(), key=lambda kv: -kv[1])))]
+
+
 KEY_FACTS = {
     "Automation pods not Running or not Ready": _vcfa_fact("automation_pods_not_ready", _rows),
     "Automation workloads below desired replicas": _vcfa_fact("automation_workloads_below_desired", _rows),
@@ -4007,10 +4159,22 @@ KEY_FACTS = {
     "Version": lambda o: [("version", m.group(1)) for m in [re.search(r"Version (\S+)", o)] if m],
     "Uptime": _fact_uptime,
     "CPU": lambda o: [("cpus", int(m.group(1))) for m in [re.match(r"(\d+) logical CPU", o)] if m],
-    "Memory": _fact_mem,
-    "Filesystems": _fact_df,
-    "Disk usage": _fact_df,
-    "Core dumps": lambda o: [("core_dumps", 0)] if o.startswith("No core dumps") else [],
+    "Memory": _fact_memory,
+    "Filesystems": _fact_df_full,
+    "Disk usage": _fact_df_full,
+    "Key partitions": _fact_df_full,
+    "Core dumps": _fact_core_files,
+    "Failed units": _fact_failed_units,
+    "Password age (days)": _fact_esxi_password_age,
+    "Password ageing": _fact_chage,
+    "Local account password ageing": _fact_chage,
+    "Nodes": _fact_nodes,
+    "Pods not Running or not Ready": lambda o: [("pods_not_ready", len(_data_rows(o)))],
+    "Pods with most restarts": _fact_top_restarts,
+    "VKS / Cluster API clusters": _fact_capi,
+    "Cluster API machines (worker VM lifecycle)": _fact_capi,
+    "Machines not Running": lambda o: [("machines_not_running", len(_data_rows(o)))],
+    "Latest warning events": _fact_events,
     "NTP associations": _fact_ntp,
     "DNS servers": lambda o: [("dns_servers", n) for n in [len(set(re.findall(
         r"(?<![\w.:])(?:\d{1,3}(?:\.\d{1,3}){3}|[0-9A-Fa-f]{0,4}(?::[0-9A-Fa-f]{0,4}){2,7})(?![\w.:])", o)))] if n],
@@ -4043,10 +4207,144 @@ def key_facts(t):
             if k not in seen:
                 seen.add(k)
                 facts.append((k, val))
-    failed = [r["label"] for r in t.results if r["status"] in ("fail", "timeout")]
-    if failed:
-        facts.append(("checks_failed", "; ".join(failed)))
     return facts
+
+
+# ----------------------------------------------------------------------------
+# Findings: rule-based one-liners derived from the key facts, most severe first.
+# ----------------------------------------------------------------------------
+SEVERITIES = ("high", "med", "low", "info")
+
+
+def _pct(s):
+    m = re.match(r"(\d+)%", s or "")
+    return int(m.group(1)) if m else None
+
+
+def target_findings(t, facts):
+    """[(severity, text, evidence check label)] for one target."""
+    f = dict(facts)
+    res = []
+    if t.errkind and t.errkind != "skipped":
+        res.append(("med", "not collected: %s - %s" % (t.errkind, t.errmsg), "Summary"))
+    if t.clock_offset is not None and abs(t.clock_offset) > 5:
+        res.append(("med", "clock differs from the collector by %+.0f s" % t.clock_offset, "Summary"))
+    for r in t.results:
+        if r["status"] == "ok" and r["label"] in ("VKS / Cluster API clusters",
+                                                   "Cluster API machines (worker VM lifecycle)"):
+            for sev, text in capi_problems(r["out"]):
+                res.append((sev, "cluster " + text, r["label"]))
+    if "nodes_ready" in f:
+        a, b = f["nodes_ready"].split("/")
+        if a != b:
+            res.append(("high", "Kubernetes nodes ready %s" % f["nodes_ready"], "Nodes"))
+    if f.get("cluster_overall") and f["cluster_overall"] not in ("STABLE",):
+        res.append(("high", "NSX management cluster status %s" % f["cluster_overall"], "Cluster status"))
+    if f.get("services_down_unexpected") not in (None, "none"):
+        res.append(("med", "services not running: %s" % f["services_down_unexpected"], "Services"))
+    if f.get("transport_nodes_not_good"):
+        res.append(("med", "%d transport node(s) not in a good state" % f["transport_nodes_not_good"], "Transport nodes"))
+    if f.get("machines_not_running"):
+        res.append(("med", "%d Cluster API machine(s) not Running" % f["machines_not_running"], "Machines not Running"))
+    if f.get("automation_pods_not_ready"):
+        res.append(("med", "%d Automation pod(s) not ready" % f["automation_pods_not_ready"],
+                    "Automation pods not Running or not Ready"))
+    if f.get("automation_cert_expiring_30d"):
+        res.append(("med", "%d Automation certificate(s) expire within 30 days" % f["automation_cert_expiring_30d"],
+                    "Automation ingress hosts and certificates"))
+    for part in [p.strip() for p in str(f.get("fs_over_85pct", "")).split(",") if p.strip()]:
+        pct = _pct(part)
+        res.append(("med" if pct >= 90 else "low", "filesystem %s at %d%%" % (part.split(None, 1)[-1], pct),
+                    "Disk usage / Filesystems"))
+    if isinstance(f.get("mem_available_pct"), int) and f["mem_available_pct"] < 15:
+        res.append(("high" if f["mem_available_pct"] < 5 else "med",
+                    "memory available %d%%" % f["mem_available_pct"], "Memory"))
+    if isinstance(f.get("swap_used_mb"), int) and f["swap_used_mb"] >= 256:
+        res.append(("low", "swap in use: %.1f GiB" % (f["swap_used_mb"] / 1024.0), "Memory"))
+    if f.get("ntp_synced") == "no peer selected":
+        res.append(("med", "NTP: no time source selected", "NTP associations"))
+    if f.get("pods_not_ready"):
+        res.append(("low", "%d pod(s) not Running or not Ready" % f["pods_not_ready"], "Pods not Running or not Ready"))
+    if f.get("alarms_open"):
+        res.append(("low", "%d open NSX alarm(s): %s" % (f["alarms_open"], f.get("alarms_by_severity", "")), "Open alarms"))
+    if f.get("passwords_past_max_age") not in (None, "none"):
+        res.append(("low", "password older than its maximum age: %s" % f["passwords_past_max_age"],
+                    "Password age (days)"))
+    if f.get("passwords_expired"):
+        res.append(("low", "password expired: %s" % f["passwords_expired"], "Password ageing"))
+    m = re.match(r"(\S+) in (-?\d+) days", str(f.get("account_expiry_soonest", "")))
+    if m and int(m.group(2)) <= 14:
+        res.append(("med", "account %s password expires in %s days" % m.groups(), "Local users and password expiry"))
+    if isinstance(f.get("core_dumps"), int) and f["core_dumps"] > 0:
+        res.append(("low", "%d core dump file(s) present" % f["core_dumps"], "Core dumps"))
+    if f.get("failed_units") not in (None, "none"):
+        res.append(("info", "failed systemd unit(s): %s" % f["failed_units"], "Failed units"))
+    return res
+
+
+def report_findings(done, digest):
+    """[(severity, targets text, finding, evidence)] for the whole report. A finding with the same
+    text on several hosts of one group is listed once."""
+    facts = {id(t): f for t, f in digest}
+    rows = []
+    for item, targets in done:
+        merged, order = {}, []
+        for t in targets:
+            for sev, text, ev in target_findings(t, facts.get(id(t), [])):
+                key = (sev, text, ev)
+                if key not in merged:
+                    merged[key] = []
+                    order.append(key)
+                merged[key].append(t.ph)
+        for key in order:
+            hosts = merged[key]
+            if len(hosts) > 1 and len(hosts) == len(targets):
+                who = "all %d hosts of [%s]" % (len(hosts), item["sec"]["name"])
+            else:
+                who = ", ".join(hosts)
+            rows.append((key[0], who, key[1], key[2]))
+    rows.sort(key=lambda r: SEVERITIES.index(r[0]))
+    return rows
+
+
+# ----------------------------------------------------------------------------
+# Failed checks: why did the check fail?
+# ----------------------------------------------------------------------------
+RX_CHECK_LIMIT = re.compile(
+    r"(?i)permission denied|not permitted|operation not allowed|access denied|forbidden|unauthori[sz]ed|"
+    r"\b40[13]\b|login failed|authentication|credentials|password is required|sudo:|"
+    r"OCI runtime exec failed|executable file not found|unknown command|invalid command|unrecognized|"
+    r"unknown flag|usage:|syntax error|no such option|kubectl access")
+RX_NOT_IN_USE = re.compile(
+    r"(?i)not enabled|not configured|not in use|is not a member|not a control-plane|no such service|"
+    r"could not be found|not installed|command not found|: not found|no such file or directory|"
+    r"the server doesn't have a resource type|no matches for kind|not available on this")
+
+
+def classify_failure(r):
+    """('environment' | 'feature not in use' | 'check limitation', short reason) for a failed check."""
+    out = r.get("out") or ""
+    last = next((ln.strip() for ln in reversed(out.splitlines()) if ln.strip()), "")
+    if r["status"] == "timeout":
+        return "check limitation", "timed out"
+    if r.get("note") == TOOL_ERROR_NOTE:
+        return "check limitation", "the API refused the request (tool error)"
+    if RX_CHECK_LIMIT.search(out):
+        return "check limitation", last
+    if RX_NOT_IN_USE.search(out):
+        return "feature not in use", last
+    return "environment", last or "exit status %s, no output" % r.get("rc")
+
+
+LONG_COMMAND = 120          # longer commands are printed once, in the appendix
+
+
+def _status_text(r):
+    """'ok', 'exit 1', 'TIMEOUT'; the duration only when it matters (slow or timed out)."""
+    st = "ok" if r["status"] == "ok" else ("TIMEOUT" if r["status"] == "timeout" else "exit %s" % r["rc"])
+    if r["status"] == "timeout" or r["dur"] > 10:
+        st += ", %.0fs" % r["dur"]
+    return st
 
 
 def build_report(ctx, done, scrubber, started, max_lines, kind="health", title=""):
@@ -4067,6 +4365,19 @@ def build_report(ctx, done, scrubber, started, max_lines, kind="health", title="
     w("")
     w(LEGEND if scrubber.anonymize else LEGEND_PLAIN)
     w("")
+    digest = [(t, key_facts(t)) for _, targets in done for t in targets]
+    found = report_findings(done, digest)
+    w("## Findings")
+    w("")
+    if found:
+        w("Rule-based, from the key facts and check output below, most severe first. The check named")
+        w("after the arrow holds the evidence. Not a complete diagnosis: read the details.")
+        w("")
+        for sev, who, text, ev in found:
+            w("- **%s** %s: %s -> %s" % (sev, S(who), S(text), S(ev)))
+    else:
+        w("- none of the built-in rules matched; read the key facts and the check output.")
+    w("")
     w("## How to reply (for the analyst)")
     w("")
     w(ANALYST_GUIDE if scrubber.anonymize else ANALYST_GUIDE.replace(ANALYST_INTRO, ANALYST_INTRO_PLAIN))
@@ -4075,7 +4386,8 @@ def build_report(ctx, done, scrubber, started, max_lines, kind="health", title="
     w("")
     w("| Target | Group | Result | Shell | Checks | Failed | Timed out | Skipped | Clock offset (s) |")
     w("|---|---|---|---|---|---|---|---|---|")
-    attention = []
+    problems = []
+    by_class = {"environment": [], "feature not in use": [], "check limitation": []}
     for item, targets in done:
         for t in targets:
             n = len(t.results)
@@ -4088,29 +4400,31 @@ def build_report(ctx, done, scrubber, started, max_lines, kind="health", title="
             w("| %s | %s | %s | %s | %d | %d | %d | %d | %s |" % (
                 t.ph, item["sec"]["name"], result, t.mode or "-", n, f, to, sk, off))
             if t.errkind:
-                attention.append("- **%s**: %s - %s" % (t.ph, t.errkind, S(t.errmsg)))
+                problems.append("- **%s**: not collected over SSH: %s - %s" % (t.ph, t.errkind, S(t.errmsg)))
             if t.clock_offset is not None and abs(t.clock_offset) > 5:
-                attention.append("- **%s**: clock differs from the collector by %+.0f s" % (t.ph, t.clock_offset))
-            timed = [S(r["label"]) for r in t.results if r["status"] == "timeout"]
-            failed = [S(r["label"]) for r in t.results
-                      if r["status"] == "fail" and r.get("note") != TOOL_ERROR_NOTE]
-            tool_err = [S(r["label"]) for r in t.results
-                        if r["status"] == "fail" and r.get("note") == TOOL_ERROR_NOTE]
-            if timed:
-                attention.append("- %s: timed out: %s" % (t.ph, "; ".join(timed)))
-            if failed:
-                attention.append("- %s: non-zero exit status: %s" % (t.ph, "; ".join(failed)))
-            if tool_err:
-                attention.append("- %s: tool error (request refused by the API, not an environment fault): %s"
-                                 % (t.ph, "; ".join(tool_err)))
+                problems.append("- **%s**: clock differs from the collector by %+.0f s" % (t.ph, t.clock_offset))
+            for r in t.results:
+                if r["status"] in ("fail", "timeout"):
+                    cls, why = classify_failure(r)
+                    why = why if len(why) <= 160 else why[:160] + " ..."
+                    by_class[cls].append("%s: %s (%s)" % (t.ph, r["label"], why))
     w("")
-    w("### Items needing attention (collection level)")
+    w("### Collection problems and failed checks")
     w("")
-    out.extend(attention or ["- none"])
+    out.extend(problems)
+    labels = {"environment": "environment (look at these)",
+              "feature not in use": "feature not in use (component or tool not present)",
+              "check limitation": "check limitation (permissions, credentials, tool or timeout; not a fault)"}
+    for cls in ("environment", "feature not in use", "check limitation"):
+        if by_class[cls]:
+            w("- %s:" % labels[cls])
+            for x in by_class[cls]:
+                w("  - " + S(x))
+    if not problems and not any(by_class.values()):
+        w("- none")
     w("")
     w("A non-zero exit status is not always a fault: a check for a feature that is not in use")
     w("(vSAN, NSX, a missing tool) also ends that way. Read the output before concluding.")
-    digest = [(t, key_facts(t)) for _, targets in done for t in targets]
     if any(f for _, f in digest):
         w("")
         w("### Key facts")
@@ -4128,10 +4442,90 @@ def build_report(ctx, done, scrubber, started, max_lines, kind="health", title="
         w(f + "yaml")
         w(body)
         w(f)
+
+    long_cmds = {}            # scrubbed command -> [id, [labels]]
+
+    def command_line(r):
+        c = S(r["cmd"]).replace("`", "'")
+        if len(c) <= LONG_COMMAND:
+            return "`$ %s`" % c
+        ent = long_cmds.get(c)
+        if ent is None:
+            ent = long_cmds[c] = ["C%d" % (len(long_cmds) + 1), []]
+        if r["label"] not in ent[1]:
+            ent[1].append(r["label"])
+        return "`$ %s ...` (full command: **%s** in the appendix)" % (c[:80].rstrip(), ent[0])
+
+    def body_of(r):
+        body = S(clip(r["out"], max(r["spec"]["max_lines"] or max_lines, max_lines)))
+        body = "\n".join(ln.rstrip() for ln in body.split("\n")).strip("\n")
+        return body if body.strip() else "(no output)"
+
+    def write_check(r, body):
+        w("")
+        if r["status"] == "skipped":
+            w("**%s** - skipped: %s" % (S(r["label"]), S(r["note"])))
+            return
+        w("**%s** (%s)" % (S(r["label"]), _status_text(r)))
+        w("")
+        if r["note"]:
+            w("Note: " + S(r["note"]))
+            w("")
+        w(command_line(r))
+        f = fence(body)
+        w(f + "text")
+        w(body)
+        w(f)
+
     for item, targets in done:
         sec = item["sec"]
         w("")
         w("## [%s] %s" % (sec["name"], COMPONENTS[sec["type"]]["title"]))
+        # Checks whose (anonymized) output is the same on several hosts are printed once.
+        shown = {}             # id(target) -> {result index: rendered body}
+        sig = {}               # (group key, label) -> {signature: [(target, index)]}
+        for t in targets:
+            rx = re.compile(r"(?i)(?<![\w-])%s(?![\w-])" % re.escape(t.ph)) if t.ph else None
+            bodies = shown[id(t)] = {}
+            for i, r in enumerate(t.results):
+                body = body_of(r) if r["status"] != "skipped" else ""
+                bodies[i] = body
+                norm = rx.sub("{host}", body) if rx else body
+                note = rx.sub("{host}", S(r["note"] or "")) if rx else S(r["note"] or "")
+                key = (r["group"][0], r["label"])
+                sig.setdefault(key, {}).setdefault((r["status"], str(r["rc"]), r["cmd"], note, norm), []).append((t, i))
+        collapsed, common_all, common_some = set(), [], []
+        if len(targets) > 1:
+            for key, groups in sig.items():
+                have = sum(len(v) for v in groups.values())
+                best_sig, best = max(groups.items(), key=lambda kv: len(kv[1]))
+                if len(best) >= 2 and len(best) * 2 > have:
+                    collapsed.update((id(t), i) for t, i in best)
+                    (common_all if len(best) == len(targets) else common_some).append((best_sig, best))
+        if common_all or common_some:
+            uses_host = False
+            for title_, rows in (("all %d hosts (%s)" % (len(targets), ", ".join(t.ph for t in targets)), common_all),
+                                 ("several hosts", common_some)):
+                if not rows:
+                    continue
+                w("")
+                w("### Identical on %s" % title_)
+                gkey = None
+                for (st, rc, c, note, norm), best in rows:
+                    t, i = best[0]
+                    r = t.results[i]
+                    if r["group"][0] != gkey:
+                        gkey = r["group"][0]
+                        w("")
+                        w("#### %s - %s" % (gkey, r["group"][1]))
+                    if rows is common_some:
+                        w("")
+                        w("Same output on %d of %d hosts: %s" % (len(best), len(targets), ", ".join(x.ph for x, _ in best)))
+                    uses_host = uses_host or "{host}" in norm or "{host}" in note
+                    write_check(dict(r, note=note) if note else r, norm)
+            if uses_host:
+                w("")
+                w("`{host}` above stands for each host's own name.")
         for t in targets:
             w("")
             w("### %s" % t.ph)
@@ -4153,32 +4547,33 @@ def build_report(ctx, done, scrubber, started, max_lines, kind="health", title="
             w("Connection: " + ", ".join(info) + ".")
             for note in t.notes:
                 w("Note: " + S(note))
+            left = [(i, r) for i, r in enumerate(t.results) if (id(t), i) not in collapsed]
+            if t.results and not left:
+                w("")
+                w("Every check on this host is in an 'Identical on' section above.")
+            elif len(left) < len(t.results):
+                w("")
+                w("%d check(s) with the same output as the other hosts are in the 'Identical on' section above; "
+                  "the checks below differ." % (len(t.results) - len(left)))
             gkey = None
-            for r in t.results:
+            for i, r in left:
                 if r["group"][0] != gkey:
                     gkey = r["group"][0]
                     w("")
                     w("#### %s - %s" % (gkey, r["group"][1]))
-                w("")
-                if r["status"] == "skipped":
-                    w("**%s** - skipped: %s" % (S(r["label"]), S(r["note"])))
-                    continue
-                status = "ok" if r["status"] == "ok" else (
-                    "TIMEOUT" if r["status"] == "timeout" else "exit %s" % r["rc"])
-                w("**%s** (%s, %.1fs)" % (S(r["label"]), status, r["dur"]))
-                w("")
-                if r["note"]:
-                    w("Note: " + S(r["note"]))
-                    w("")
-                w("`$ %s`" % S(r["cmd"]).replace("`", "'"))
-                body = S(clip(r["out"], max(r["spec"]["max_lines"] or max_lines, max_lines)))
-                body = "\n".join(ln.rstrip() for ln in body.split("\n")).strip("\n")
-                if not body.strip():
-                    body = "(no output)"
-                f = fence(body)
-                w(f + "text")
-                w(body)
-                w(f)
+                write_check(r, shown[id(t)][i])
+    if long_cmds:
+        w("")
+        w("## Appendix: long commands")
+        w("")
+        w("Commands longer than %d characters, referenced from the checks above by id." % LONG_COMMAND)
+        for c, (cid, labels_) in long_cmds.items():
+            w("")
+            w("**%s** - %s" % (cid, "; ".join(S(x) for x in labels_)))
+            f = fence(c)
+            w(f + "sh")
+            w(c)
+            w(f)
     w("")
     w("## Anonymization statistics")
     w("")
@@ -4187,7 +4582,6 @@ def build_report(ctx, done, scrubber, started, max_lines, kind="health", title="
         "%s %d" % (k, v) for k, v in sorted(counts.items()) if k != "target") or "none"))
     w("")
     return "\n".join(out)
-
 
 def review_data(scrubber, text):
     """Local privacy check of finished text. The result contains real values:
@@ -5602,17 +5996,97 @@ note: impact, rollback
 ```""" % (names, max_rounds)
 
 
+# Checks whose output matters least when a report must be shortened for the AI
+LOW_VALUE_CHECKS = ("Persistent volumes not Bound", "Persistent volume claims", "Running services", "Interfaces",
+                    "Routes", "Enabled services", "Namespaces", "All machines", "VM Service virtual machines",
+                    "Components", "Package installs", "Deployments, StatefulSets, DaemonSets", "Top processes",
+                    "Inode usage", "Role bindings (namespace permissions)", "Limit ranges",
+                    "Resource quotas (CPU, memory, storage per policy)", "VM classes bound to namespaces",
+                    "All pods (per namespace)", "Storage adapters", "Physical NICs", "CPU summary")
+
+
+def _report_blocks(report):
+    """Split a report into [score, text] blocks. Lower scores are dropped first when it must be
+    shortened: 0 'Identical on' sections, 1 low-value checks, 2 other successful or skipped checks,
+    3 the long-command appendix, 4 failed checks; None = always kept (headings, summary, findings)."""
+    blocks, cur, fence_ = [], [None, []], None
+    section = ""                  # current '## ' heading
+    in_ident = False
+    for ln in report.split("\n"):
+        if fence_:
+            cur[1].append(ln)
+            if ln.strip() == fence_:
+                fence_ = None
+            continue
+        m = re.match(r"^(`{3,})\w*$", ln)
+        if m:
+            fence_ = m.group(1)
+            cur[1].append(ln)
+            continue
+        start = None
+        if ln.startswith("## "):
+            section, in_ident = ln, False
+            start = 3 if ln.startswith("## Appendix") else None
+        elif ln.startswith("### "):
+            in_ident = ln.startswith("### Identical on")
+            start = 0 if in_ident else None
+        elif ln.startswith("#### "):
+            start = 0 if in_ident else None
+        elif section.startswith("## [") and not in_ident and re.match(r"^\*\*.+?\*\* (\(|- skipped)", ln):
+            label = re.match(r"^\*\*(.+?)\*\*", ln).group(1)
+            if re.match(r"^\*\*.+?\*\* \((exit|TIMEOUT)", ln):
+                start = 4
+            else:
+                start = 1 if label in LOW_VALUE_CHECKS else 2
+        if ln.startswith("#") or start is not None:
+            if start is None and section.startswith("## Appendix") and not ln.startswith("## "):
+                cur[1].append(ln)
+                continue
+            blocks.append(cur)
+            cur = [start, [ln]]
+        else:
+            cur[1].append(ln)
+    blocks.append(cur)
+    return [[s_, "\n".join(lines)] for s_, lines in blocks if lines]
+
+
 def report_for_ai(report, limit):
-    """The part of a report the AI needs, shortened if it exceeds the limit (with a visible note)."""
+    """The part of a report the AI needs, shortened if it exceeds the limit (with a visible note).
+    Low-value detail goes first (identical-output sections, inventory-like lists, long successful
+    outputs); the legend, findings, summary, key facts and failed checks are kept."""
     report = re.sub(r"(?s)## How to reply \(for the analyst\)\n.*?(?=\n## )", "", report)
     if len(report) <= limit:
         return report, False
+    note = ("\n[... the collector left out %d check output(s) (%s) to stay under max_report_chars; "
+            "ask for them in a [collect] step if you need them ...]\n")
+    blocks = _report_blocks(report)
+    order = sorted((i for i, b in enumerate(blocks) if b[0] is not None),
+                   key=lambda i: (blocks[i][0], -len(blocks[i][1])))
+    size = len(report) + len(note) + 200
+    dropped = []
+    for i in order:
+        if size <= limit:
+            break
+        size -= len(blocks[i][1]) + 1
+        dropped.append(i)
+    if size <= limit:
+        gone = set(dropped)
+        names = []
+        for i in dropped:
+            m = re.search(r"(?m)^\*\*(.+?)\*\*", blocks[i][1]) or re.match(r"#+ (.*)", blocks[i][1])
+            names.append(m.group(1) if m else "?")
+        shown = ", ".join(names[:12]) + (", ..." if len(names) > 12 else "")
+        text = "\n".join(b[1] for i, b in enumerate(blocks) if i not in gone)
+        head, sep, rest = text.partition("\n## How to read this report")
+        text = head + (note % (len(dropped), shown)) + sep + rest
+        if len(text) <= limit:
+            return text, True
+        report = text
     head = int(limit * 0.6)
     tail = limit - head
     return (report[:head] + "\n\n[... %d characters of this report were left out by the collector because it is "
             "longer than max_report_chars. Ask for narrower checks if you need what is missing ...]\n\n"
             % (len(report) - limit) + report[-tail:]), True
-
 
 def inventory_overview(args):
     """The hosts and groups the AI may target, named as the AI will see them."""

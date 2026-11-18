@@ -2418,8 +2418,8 @@ class ReportDigest(unittest.TestCase):
         self.assertEqual(facts["ssh_root_login"], "enabled")
         self.assertEqual(facts["core_dumps"], 0)
         self.assertEqual(facts["account_expiry_soonest"], "admin in 80 days")
-        self.assertEqual(facts["checks_failed"], "Transport nodes")
-        self.assertEqual(v.KEY_FACTS["Core dumps"]("total 0"), [])     # vCenter ls output: no fact
+        self.assertNotIn("checks_failed", facts)            # listed once, under failed checks
+        self.assertEqual(v.KEY_FACTS["Core dumps"]("total 0"), [("core_dumps", 0)])     # vCenter ls output
         self.assertEqual(v.KEY_FACTS["DNS servers"]("   DNSServers: 10.1.1.1, 10.1.1.2"), [("dns_servers", 2)])
 
     def test_report_has_anonymized_key_facts_block(self):
@@ -2431,7 +2431,10 @@ class ReportDigest(unittest.TestCase):
         block = rep.split("### Key facts", 1)[1].split("```yaml\n", 1)[1].split("\n```", 1)[0]
         self.assertTrue(block.startswith("nsxmgr-01:\n  clock_offset_s: 0\n"))
         self.assertIn('  account_expiry_soonest: "admin in 80 days"', block)   # not redacted
-        self.assertIn('  checks_failed: "Transport nodes"', block)
+        self.assertNotIn("checks_failed", block)
+        failed = rep.split("### Collection problems and failed checks", 1)[1].split("###", 1)[0]
+        self.assertIn("- environment (look at these):\n  - nsxmgr-01: Transport nodes (HTTP 500 for /x)", failed)
+        self.assertIn("**Services** (ok)\n", rep)                 # no duration for quick checks
         self.assertIn("Note: left out because the API check", rep)
         self.assertNotIn("**Password expiry: admin**", rep)
 
@@ -2670,6 +2673,175 @@ class NoiseSummarizers(unittest.TestCase):
         self.assertIn("/Security/PasswordMaxDays = 90", out)
         self.assertIn("/Security/PasswordQualityControl = 0", out)
         self.assertIn("/Security/AccountUnlockTime: not available on this host (Error: Unable to find", out)
+
+
+
+def _res(group, label, out, status="ok", rc=None, cmd="c", dur=0.2, note="", **spec):
+    return {"group": group, "label": label, "cmd": cmd, "rc": (0 if status == "ok" else 1) if rc is None else rc,
+            "out": out, "dur": dur, "status": status, "note": note, "spec": dict({"max_lines": None}, **spec)}
+
+
+def _tgt(ph, results, mode="sh", clock=None):
+    return types.SimpleNamespace(ph=ph, mode=mode, errkind=None, errmsg="", identity=[], user="root", notes=[],
+                                 clock_offset=clock, results=results)
+
+
+CAPI_CLUSTERS = (
+    "NAMESPACE   NAME                               CLUSTERCLASS     AVAILABLE   CP DESIRED   CP CURRENT   "
+    "CP READY   PHASE         AGE   VERSION\n"
+    "ns-0011     cluster.cluster.x-k8s.io/vks-01    builtin-generic  False       4            4            "
+    "0          Provisioned   40d   v1.31.4\n"
+    "ns-0013     cluster.cluster.x-k8s.io/vks-02    builtin-generic  True        3            3            "
+    "2          Provisioned   40d   v1.31.4\n"
+    "ns-0014     cluster.cluster.x-k8s.io/vks-03    builtin-generic  True        3            3            "
+    "3          Provisioned   40d   v1.31.4\n"
+    "\n"
+    "NAMESPACE   NAME                                  CLUSTER   AVAILABLE   PHASE\n"
+    "ns-0011     machine.cluster.x-k8s.io/vks-01-cp1   vks-01    False       Provisioning\n")
+
+
+class ReportFindings(unittest.TestCase):
+    """Built from the problems found in a real 1.18.0 report."""
+
+    def sample(self):
+        G = ("g", "G")
+        sup = _tgt("supervisor-01", [
+            _res(("k8s-supervisor", "S"), "VKS / Cluster API clusters", CAPI_CLUSTERS),
+            _res(("k8s-cluster", "K"), "Nodes", "NAME STATUS ROLES AGE VERSION\ncp1 Ready control-plane 9d v1\n"
+                                                "cp2 Ready control-plane 9d v1\n"),
+        ])
+        vc = _tgt("vcenter-01", [
+            _res(("vc-storage", "S"), "Key partitions",
+                 "Filesystem Size Used Avail Use% Mounted on\n/dev/mapper/archive_vg-archive 50G 47G 2.5G 95% "
+                 "/storage/archive\n/dev/sda3 11G 5G 6G 45% /\n"),
+            _res(("os", "O"), "Memory", "              total        used        free      shared  buff/cache   available\n"
+                                       "Mem:          32000       20000        1000         100       11000       11500\n"
+                                       "Swap:         25000        7987       17013\n"),
+        ])
+        nsx = _tgt("nsxmgr-01", [_res(("nsx-node", "N"), "Memory",
+                                      "total 23.5 GiB, available 2.8 GiB (12%), free 0.7 GiB\nswap: none configured")],
+                   mode="nsxcli")
+        esx = _tgt("esxi-mgmt-01", [_res(("passwords", "P"), "Password age (days)",
+                                         "root                 changed 20 days ago, max age 90 days\n"
+                                         "nsx-user             changed 211 days ago, max age 90 days\n")])
+        units = "● cap_init.service loaded failed failed Cloud init\n"
+        mgmt = [_tgt("vcfmgmt-mgmt-%02d" % i, [_res(G, "Failed units", units)]) for i in (1, 2, 3)]
+        return [({"sec": {"name": "supervisor", "type": "supervisor"}}, [sup]),
+                ({"sec": {"name": "vcenter", "type": "vcenter"}}, [vc]),
+                ({"sec": {"name": "nsx", "type": "nsx"}}, [nsx]),
+                ({"sec": {"name": "esxi:mgmt", "type": "esxi"}}, [esx]),
+                ({"sec": {"name": "vcfmgmt:mgmt", "type": "vcfmgmt"}}, mgmt)]
+
+    def test_expected_findings(self):
+        done = self.sample()
+        digest = [(t, v.key_facts(t)) for _, ts in done for t in ts]
+        rows = v.report_findings(done, digest)
+        got = [(sev, who, text) for sev, who, text, _ in rows]
+        self.assertEqual(got[0], ("high", "supervisor-01", "cluster ns-0011/vks-01 AVAILABLE False, CP ready 0/4"))
+        self.assertIn(("med", "supervisor-01", "cluster ns-0013/vks-02 CP ready 2/3"), got)
+        self.assertIn(("med", "vcenter-01", "filesystem /storage/archive at 95%"), got)
+        self.assertIn(("med", "nsxmgr-01", "memory available 12%"), got)
+        self.assertIn(("low", "vcenter-01", "swap in use: 7.8 GiB"), got)
+        self.assertIn(("low", "esxi-mgmt-01", "password older than its maximum age: nsx-user 211d > 90d"), got)
+        self.assertEqual(got[-1], ("info", "all 3 hosts of [vcfmgmt:mgmt]", "failed systemd unit(s): cap_init.service"))
+        self.assertFalse(any("vks-03" in t or "machine" in t for _, _, t in got))
+        self.assertEqual([r[0] for r in rows], sorted([r[0] for r in rows], key=v.SEVERITIES.index))
+        facts = dict(digest[0][1])
+        self.assertEqual(facts["nodes_ready"], "2/2")
+        self.assertIn("ns-0011/vks-01", facts["capi_clusters_unavailable"])
+
+    def test_findings_section_is_near_the_top(self):
+        rep = v.build_report(types.SimpleNamespace(ssh_banner="x"), self.sample(), make(),
+                             v.datetime.datetime(2026, 11, 18), 400)
+        self.assertLess(rep.index("## How to read this report"), rep.index("## Findings"))
+        self.assertLess(rep.index("## Findings"), rep.index("## Summary"))
+        self.assertIn("- **high** supervisor-01: cluster ns-0011/vks-01 AVAILABLE False, CP ready 0/4 -> "
+                      "VKS / Cluster API clusters", rep)
+
+    def test_more_key_facts(self):
+        K = v.KEY_FACTS
+        self.assertEqual(K["Nodes"]("NAME STATUS\na Ready x\nb NotReady x\nc Ready,SchedulingDisabled x\n"),
+                         [("nodes_ready", "2/3")])
+        self.assertEqual(K["Pods with most restarts"]("ns-1 web-0 0/1 CrashLoopBackOff 37 (2m ago) 3d\n"),
+                         [("top_restarts", "ns-1/web-0 37")])
+        self.assertEqual(K["Failed units"](""), [("failed_units", "none")])
+        self.assertEqual(K["Core dumps"]("total 8\n-rw------- 1 root root 4.0K Nov 1 core.vpxd.1\n"), [("core_dumps", 1)])
+        self.assertEqual(K["Latest warning events"](v.post_events(
+            "NAMESPACE LAST SEEN TYPE REASON OBJECT MESSAGE\na 1m Warning Unhealthy pod/x bad\n"
+            "a 1m Warning Unhealthy pod/y bad\nb 2m Warning BackOff pod/z back-off\n")),
+            [("warning_events_by_reason", "Unhealthy 2, BackOff 1")])
+        old = v._fact_chage("== root\nLast password change : Jan 01, 2020\nPassword expires : Mar 31, 2020\n"
+                            "== admin\nPassword expires : never\n")
+        self.assertEqual(old, [("passwords_expired", "root expired 2020-03-31")])
+
+
+LONG_CMD = "kubeadm certs check-expiration 2>&1 | head -n 40; " * 4
+
+
+class ReportLayout(unittest.TestCase):
+    def mgmt(self):
+        G = ("os", "OS")
+        same = "NAME=Photon\nVERSION=5.0"
+        ts = []
+        for i in (1, 2, 3):
+            ph = "vcfmgmt-mgmt-worker-%02d" % i
+            ts.append(_tgt(ph, [
+                _res(G, "OS release", same),
+                _res(G, "Hostname echo", "I am %s" % ph),
+                _res(G, "Uptime and load", "up %d days" % i),
+                _res(("node-certs", "C"), "Control-plane certificates (kubeadm)", "x", cmd=LONG_CMD),
+            ]))
+        ts[2].results.append(_res(G, "Failed thing", "ls: cannot open: Permission denied", status="fail"))
+        ts[2].results.append(_res(G, "vSAN", "vSAN Clustering is not enabled on this host", status="fail"))
+        ts[2].results.append(_res(G, "Slow", "boom", status="timeout", dur=45.0))
+        return [({"sec": {"name": "vcfmgmt:mgmt", "type": "vcfmgmt"}}, ts)]
+
+    def report(self):
+        return v.build_report(types.SimpleNamespace(ssh_banner="x"), self.mgmt(), make(),
+                              v.datetime.datetime(2026, 11, 18), 400)
+
+    def test_identical_output_is_printed_once(self):
+        rep = self.report()
+        self.assertIn("### Identical on all 3 hosts (vcfmgmt-mgmt-worker-01, vcfmgmt-mgmt-worker-02, "
+                      "vcfmgmt-mgmt-worker-03)", rep)
+        self.assertEqual(rep.count("NAME=Photon"), 1)
+        self.assertEqual(rep.count("**Hostname echo**"), 1)          # own name normalized
+        self.assertIn("I am {host}", rep)
+        self.assertIn("`{host}` above stands for each host's own name.", rep)
+        self.assertEqual(rep.count("**Uptime and load**"), 3)       # differs: printed per host
+        self.assertIn("3 check(s) with the same output as the other hosts", rep)
+
+    def test_failures_are_classified_once(self):
+        rep = self.report()
+        sec = rep.split("### Collection problems and failed checks", 1)[1].split("### Key facts", 1)[0]
+        self.assertIn("- check limitation (permissions, credentials, tool or timeout; not a fault):", sec)
+        self.assertIn("vcfmgmt-mgmt-worker-03: Failed thing (ls: cannot open: Permission denied)", sec)
+        self.assertIn("vcfmgmt-mgmt-worker-03: Slow (timed out)", sec)
+        self.assertIn("- feature not in use (component or tool not present):\n  - vcfmgmt-mgmt-worker-03: vSAN", sec)
+        self.assertIn("non-zero exit status is not always a fault", rep)
+        self.assertNotIn("Items needing attention", rep)
+        self.assertIn("**Slow** (TIMEOUT, 45s)", rep)
+        self.assertIn("**Failed thing** (exit 1)", rep)
+
+    def test_long_commands_go_to_the_appendix(self):
+        rep = self.report()
+        self.assertIn("(full command: **C1** in the appendix)", rep)
+        app = rep.split("## Appendix: long commands", 1)[1]
+        self.assertIn("**C1** - Control-plane certificates (kubeadm)", app)
+        self.assertIn(LONG_CMD, app)
+        self.assertEqual(rep.count(LONG_CMD), 1)
+
+    def test_ai_copy_drops_low_value_detail_first(self):
+        rep = self.report() + "\n"
+        filler = "\n".join("line %d" % i for i in range(3000))
+        big = rep.replace("NAME=Photon", "NAME=Photon\n" + filler)
+        text, cut = v.report_for_ai(big, len(rep) + 2000)
+        self.assertTrue(cut)
+        self.assertNotIn("line 2999", text)
+        for keep in ("## Findings", "### Collection problems", "**Failed thing** (exit 1)",
+                     "Permission denied", "the collector left out 1 check output(s) (OS release)"):
+            self.assertIn(keep, text)
+        self.assertLessEqual(len(text), len(rep) + 2000)
 
 
 if __name__ == "__main__":

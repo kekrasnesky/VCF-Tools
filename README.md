@@ -206,7 +206,8 @@ The Kubernetes types (management cluster, Kubernetes control plane, Supervisor) 
 
 - nodes: every condition with its reason (Ready, MemoryPressure, DiskPressure, PIDPressure,
   NetworkUnavailable), cordoned or tainted nodes, kubelet / kernel / container-runtime / OS
-  versions side by side (mismatches stand out), allocatable resources and running pods per node,
+  versions side by side in the wide node list (mismatches stand out), allocatable resources and
+  running pods per node,
   control-plane component pods, and etcd endpoint health and status (leader, database size);
 - pods: every container that is not ready, waiting (CrashLoopBackOff, ImagePullBackOff ...),
   restarted, or whose last run ended badly, with reason, exit code and time; OOMKilled containers;
@@ -281,7 +282,7 @@ It reports, per Supervisor: configuration and Kubernetes status, status messages
 used; per vSphere Namespace: status and messages, permissions, storage policies and limits, VM
 classes and content libraries, resource limits and usage; and the Supervisor services that are
 registered and installed, with their status. Namespaces and Supervisors that are not healthy are
-listed first. With anonymization on, organisation-specific namespace and cluster names become
+listed first, and only for those is the full API answer (JSON) added. With anonymization on, organisation-specific namespace and cluster names become
 `ns-0001` and `vcluster-0001`; product namespaces such as `svc-velero-...` stay readable.
 
 The vCenter certificate is verified. If your Mac does not trust vCenter's CA, download it from
@@ -298,6 +299,28 @@ You can add your own read-only commands per component type:
 [commands:esxi]
 Advanced settings changed from default = esxcli system settings advanced list -d
 ```
+
+### Reading the report
+
+The report is built for an analyst (human or AI) who has to find the real problems quickly:
+
+- **Findings** (right after the legend): one line per problem the built-in rules recognise,
+  most severe first (high, med, low, info), with the target and the check that holds the
+  evidence. A finding seen on every host of a group is listed once.
+- **Summary**: one table row per target, then the failed checks once, sorted by likely cause:
+  *environment* (look at these), *feature not in use* (component or tool not present) and
+  *check limitation* (permissions, credentials, tool errors, timeouts).
+- **Key facts**: a YAML digest per target (nodes ready, pods not ready, unavailable Cluster API
+  clusters, full filesystems, swap in use, passwords past their maximum age, failed units ...).
+- Per group, checks with the same output on several hosts are printed once under
+  **Identical on all N hosts**; each host then shows only what differs.
+- Noisy output is summarized before anonymizing: repeated log lines are grouped with a count and
+  first/last time stamp, warning events are aggregated, container and pod mounts are left out of
+  `df`, all pods are counted per namespace. The anonymizer still reads the full output.
+- Commands longer than 120 characters are printed once, in **Appendix: long commands**.
+- When a report is too long for the AI, the lowest-value detail is left out first (identical
+  sections, inventory-like lists, long successful outputs), never the findings, the summary,
+  the key facts or failed checks.
 
 ### What is anonymized
 
