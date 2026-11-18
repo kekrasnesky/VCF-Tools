@@ -956,7 +956,7 @@ FAKE_NSX = {
     "/api/v1/transport-nodes?page_size=500": {"results": [
         {"id": "tn1", "display_name": "esx01.corp.example-widgets.com", "node_deployment_info": {"resource_type": "HostNode"}},
         {"id": "tn2", "display_name": "edge01", "node_deployment_info": {"resource_type": "EdgeNode"}}]},
-    "/api/v1/transport-nodes/state?page_size=500": {"results": [
+    "/api/v1/transport-nodes/state": {"results": [
         {"transport_node_id": "tn1", "state": "success"},
         {"transport_node_id": "tn2", "state": "failed", "failure_message": "Host config failed: MTU mismatch",
          "node_deployment_state": {"state": "NODE_READY"}}]},
@@ -2179,6 +2179,128 @@ class GuiApi(unittest.TestCase):
         self.assertEqual(out["review"]["hits"], [])
         code, back = self.call("api/decode", {"text": "check esxi-01.domain-01 and ip-n1-h1"})
         self.assertEqual(back["text"], "check esx01.corp.example-widgets.com and 10.4.4.4")
+
+
+class ReportReadability(unittest.TestCase):
+    """Summarizers and redaction fixes that keep reports short and correct for an analyst."""
+
+    HDR = "    UUID                                       IPV4             IPV6          STATUS    FQDN   "
+
+    @staticmethod
+    def row(uuid, ip, fqdn, status="UP"):
+        return "    %s   %s   not configured   %s   %s      " % (uuid, ip, status, fqdn)
+
+    def cluster_status(self, down=None):
+        u = "aaaaaaaa-1111-2222-3333-%012d"
+        nodes = [("10.20.30.11", "nsx01.corp.example-widgets.com"), ("10.20.30.12", "nsx02.corp.example-widgets.com")]
+        out = ["Wed Nov 18 2026 UTC 14:17:30.899", "Cluster Id: " + u % 0, "Overall Status: STABLE", ""]
+        for g in ("DATASTORE", "CONTROLLER", "MANAGER"):
+            bad = g == down
+            out += ["Group Type: " + g, "Group Status: " + ("DEGRADED" if bad else "STABLE"), "", "Members:", self.HDR]
+            out += [self.row(u % (i + 1), ip, f, "DOWN" if bad and i else "UP") for i, (ip, f) in enumerate(nodes)]
+            out.append("")
+        out += ["Wed Nov 18 2026 UTC 14:17:32.743", "Node Services:", "", "Service Name: SEARCH", "", "Nodes:",
+                self.HDR, self.row(u % 1, *nodes[0]), "", self.row(u % 2, *nodes[1])]
+        return "\n".join(out)
+
+    def test_nsxcli_time_stamp_is_removed_and_parsed(self):
+        ts, out = v.nsxcli_stamp(self.cluster_status())
+        self.assertAlmostEqual(ts, 1795011450.899, places=2)
+        self.assertNotIn("UTC 14:17", out)
+        self.assertEqual(v.nsxcli_stamp("no stamp"), (None, "no stamp"))
+
+    def test_cluster_status_is_folded(self):
+        out = v.post_nsx_cluster_status(v.nsxcli_stamp(self.cluster_status())[1])
+        self.assertIn("Overall Status: STABLE", out)
+        self.assertIn("3 of 3 groups STABLE with every member UP: DATASTORE, CONTROLLER, MANAGER", out)
+        self.assertEqual(out.count("nsx01.corp.example-widgets.com"), 1)
+        self.assertIn("node services with every node UP: SEARCH (2)", out)
+        self.assertNotIn("aaaaaaaa-1111-2222-3333-000000000001", out)     # per-group member UUIDs dropped
+
+    def test_cluster_status_shows_unhealthy_groups(self):
+        out = v.post_nsx_cluster_status(self.cluster_status(down="CONTROLLER"))
+        self.assertIn("2 of 3 groups STABLE", out)
+        self.assertIn("group CONTROLLER: DEGRADED", out)
+        self.assertIn("nsx02.corp.example-widgets.com  10.20.30.12  DOWN", out)
+
+    def test_cluster_config_is_folded(self):
+        hdr = "    ENTITY      UUID       IPV4 ADDRESS      IPV6 ADDRESS      PORT     FQDN"
+        out = ["Cluster Id: c1", "Cluster Configuration Version: 3", "Number of nodes in the cluster: 2"]
+        for n, ip, f in (("1", "10.20.30.11", "nsx01.corp.example-widgets.com"),
+                         ("2", "10.20.30.12", "nsx02.corp.example-widgets.com")):
+            out += ["", "Node UUID: node-uuid-%s" % n, "Node Status: JOINED", hdr]
+            for i, (ent, port) in enumerate((("CONTROLLER", "-"), ("DATASTORE", "9000"), ("HTTPS", "443"))):
+                out.append("    %-12s ent-uuid-%s%d   %s   not configured   %s   %s   " % (ent, n, i, ip, port, f))
+        res = v.post_nsx_cluster_config("\n".join(out))
+        self.assertIn("node-uuid-1  JOINED  10.20.30.11  nsx01.corp.example-widgets.com  3 entities", res)
+        self.assertIn("entities on every node: CONTROLLER, DATASTORE, HTTPS", res)
+        self.assertIn("entity ports: DATASTORE 9000, HTTPS 443", res)
+        self.assertNotIn("ent-uuid", res)
+
+    def test_cpu_and_memory_summaries(self):
+        cpu = "\n\n".join("processor\t: %d\nmodel name\t: Example CPU 9000\ncpu MHz\t\t: 2499.999\n"
+                          "cache size\t: 61440 KB\nphysical id\t: %d\nmicrocode\t: 0x1\n"
+                          "flags\t\t: fpu aes avx2 hypervisor\nbugs\t\t: spectre_v1" % (i, i) for i in range(4))
+        out = v.post_cpuinfo(cpu)
+        self.assertIn("4 logical CPU(s) in 4 socket(s)", out)
+        self.assertIn("4 x Example CPU 9000, 2500 MHz", out)
+        self.assertIn("virtual machine: yes", out)
+        self.assertEqual(out.count("Example CPU"), 1)
+        mem = v.post_meminfo("MemTotal: 24599336 kB\nMemFree: 806016 kB\nMemAvailable: 1181560 kB\n"
+                             "SwapTotal: 0 kB\nAnonPages: 20528248 kB\nCommitLimit: 12299668 kB\n"
+                             "Committed_AS: 28908164 kB\nHugePages_Total: 0\n")
+        self.assertIn("total 23.5 GiB, available 1.1 GiB (5%)", mem)
+        self.assertIn("swap: none configured", mem)
+        self.assertIn("committed 27.6 GiB against commit limit 11.7 GiB", mem)
+        self.assertIn("NOTE: less than 10% of memory is available", mem)
+        for f in (v.post_cpuinfo, v.post_meminfo, v.post_nsx_cluster_status, v.post_nsx_cluster_config):
+            self.assertEqual(f("something unexpected"), "something unexpected")
+
+    def test_version_banner_dropped(self):
+        out = v.post_nsx_version("VMware NSX Software, Version 9.1.1.0.1\nProduct Version 9.1.1.0.2\n"
+                                 "Technical Support: https://support.example.com/\n\nCopyright (c) 2026 Example.\n")
+        self.assertEqual(out, "VMware NSX Software, Version 9.1.1.0.1\nProduct Version 9.1.1.0.2")
+
+    def test_truncated_ntp_peer_names_do_not_leak(self):
+        raw = ("     remote           refid      st t when poll reach   delay   offset  jitter\n"
+               "==============================================================================\n"
+               "*timesrv1.widge .GPS.            1 u  299 1024  377    0.396   -1.069   0.140\n"
+               "+timesrv2.wid   .GPS.            1 u  535 1024  377    0.489   -0.967   0.162\n"
+               "-10.1.2.3       timesrv1.wid     2 u  535 1024  377    0.489   -0.967   0.162\n")
+        out = v.post_ntpq_peers(raw)
+        self.assertNotIn("timesrv", out)
+        self.assertNotIn("wid", out)
+        self.assertIn("*peer-1         .GPS.            1 u  299", out)
+        self.assertIn("-10.1.2.3       peer-3-ref       2 u", out)
+
+    def test_password_policy_values_are_not_redacted(self):
+        text = ('policy: {"invalid_password_chars": ["\\u0000", ":"], "minimum_password_length": 12, '
+                '"password_remembrance": 5, "password": "Sup3r", "password_change": "S3cret", "api_token": 42}')
+        out = run(make(), text)
+        self.assertIn('"invalid_password_chars": ["\\u0000", ":"]', out)
+        self.assertIn('"minimum_password_length": 12', out)
+        self.assertIn('"password_remembrance": 5', out)
+        for gone in ("Sup3r", "S3cret", ": 42"):
+            self.assertNotIn(gone, out)
+
+    def test_run_catalog_strips_stamp_sets_clock_and_summarizes(self):
+        t = v.Target.__new__(v.Target)
+        t.mode, t.sec, t.clock_offset = "nsxcli", {"type": "nsx"}, None
+        reply = {}
+        t.exec = lambda command, timeout: (reply["rc"], reply["out"], False)
+
+        def boom(_):
+            raise RuntimeError("parser bug")
+        stamp = v.time.strftime("%a %b %d %Y UTC %H:%M:%S.000", v.time.gmtime())
+        reply.update(rc=0, out=stamp + "\nVMware NSX Software, Version 9.1\nCopyright (c) 2026 Example.\n")
+        res = t.run_catalog(("g", "G"), v.ncli("Version", "get version", post=v.post_nsx_version))
+        self.assertEqual(res["out"], "VMware NSX Software, Version 9.1")
+        self.assertLess(abs(t.clock_offset), 3)
+        reply.update(rc=0, out="raw text\n")
+        self.assertEqual(t.run_catalog(("g", "G"), v.ncli("X", "get x", post=boom))["out"], "raw text\n")
+        reply.update(rc=1, out="% Command not found\n")
+        res = t.run_catalog(("g", "G"), v.ncli("X", "get x", post=lambda o: "summary"))
+        self.assertEqual((res["status"], res["out"]), ("fail", "% Command not found\n"))
 
 
 if __name__ == "__main__":

@@ -57,7 +57,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
-VERSION = "1.15.0"
+VERSION = "1.16.0"
 
 # ----------------------------------------------------------------------------
 # Diagnostic catalog
@@ -69,9 +69,12 @@ VERSION = "1.15.0"
 #          values are registered as names to anonymize everywhere in the report.
 
 
-def cmd(label, command, timeout=30, mode="sh", harvest=(), max_lines=None, k8s=None, sudo=False, api=None):
+def cmd(label, command, timeout=30, mode="sh", harvest=(), max_lines=None, k8s=None, sudo=False, api=None,
+        post=None):
+    # post: function(raw output) -> shorter output, applied to successful runs before anonymization
     return {"label": label, "cmd": command, "timeout": timeout, "mode": mode,
-            "harvest": tuple(harvest), "max_lines": max_lines, "k8s": k8s, "sudo": sudo, "api": api}
+            "harvest": tuple(harvest), "max_lines": max_lines, "k8s": k8s, "sudo": sudo, "api": api,
+            "post": post}
 
 
 H_NAMESPACE = ("k8sns", r"(?m)^namespace: (\S+)", None)
@@ -104,6 +107,257 @@ def ncli(label, command, **kw):
 def kctl(label, command, **kw):
     kw.setdefault("timeout", 45)
     return cmd(label, command, mode="kubectl", **kw)
+
+
+# ----------------------------------------------------------------------------
+# Output summarizers: turn long, repetitive raw output into a few lines an analyst
+# (human or AI) can read. Each one returns its input unchanged when it cannot parse it.
+# ----------------------------------------------------------------------------
+
+RX_NSXCLI_STAMP = re.compile(r"(?m)^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (\w{3}) +(\d{1,2}) (\d{4}) UTC "
+                             r"(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?[ \t]*\n?")
+
+
+def nsxcli_stamp(out):
+    """(epoch seconds of the first NSX CLI time stamp line or None, output without those lines)."""
+    m = RX_NSXCLI_STAMP.search(out or "")
+    if not m:
+        return None, out
+    try:
+        dt = datetime.datetime.strptime("%s %s %s %s:%s:%s" % m.groups()[:6], "%b %d %Y %H:%M:%S")
+        ts = dt.replace(tzinfo=datetime.timezone.utc).timestamp() + float("0." + (m.group(7) or "0"))
+    except ValueError:
+        ts = None
+    return ts, RX_NSXCLI_STAMP.sub("", out)
+
+
+def _gib(kb):
+    return "%.1f GiB" % (kb / 1048576.0)
+
+
+def post_nsx_version(out):
+    """Drop the support URL and the copyright banner."""
+    keep = []
+    for ln in out.splitlines():
+        if re.match(r"\s*(Technical Support:|Copyright)", ln):
+            break
+        keep.append(ln)
+    return "\n".join(keep).strip() or out
+
+
+def post_cpuinfo(out):
+    """Summarize /proc/cpuinfo: one line per distinct CPU model instead of one block per vCPU."""
+    blocks = [b for b in re.split(r"\n\s*\n", out) if re.search(r"(?m)^processor\s*:", b)]
+    if not blocks:
+        return out
+    cpus = []
+    for b in blocks:
+        cpus.append({k.strip(): v.strip() for k, _, v in
+                     (ln.partition(":") for ln in b.splitlines() if ":" in ln)})
+    models = {}
+    for c in cpus:
+        try:
+            mhz = "%d" % round(float(c.get("cpu MHz", "")))
+        except ValueError:
+            mhz = "?"
+        key = (c.get("model name", "?"), mhz, c.get("cache size", "?"),
+               c.get("microcode", "?"))
+        models[key] = models.get(key, 0) + 1
+    sockets = len({c.get("physical id") for c in cpus})
+    flags = set(cpus[0].get("flags", "").split())
+    lines = ["%d logical CPU(s) in %d socket(s)" % (len(cpus), sockets)]
+    for (name, mhz, cache, mc), n in models.items():
+        lines.append("  %d x %s, %s MHz, cache %s, microcode %s" % (n, name, mhz, cache, mc))
+    lines.append("virtual machine: %s" % ("yes (hypervisor flag set)" if "hypervisor" in flags else "no"))
+    key_flags = ["aes", "avx", "avx2", "avx512f", "sse4_2", "pdpe1gb", "x2apic", "rdrand", "pcid", "invpcid"]
+    lines.append("key CPU flags present: %s" % (" ".join(f for f in key_flags if f in flags) or "none"))
+    missing = [f for f in key_flags if f not in flags]
+    if missing:
+        lines.append("key CPU flags missing: %s" % " ".join(missing))
+    if len({c.get("flags") for c in cpus}) > 1:
+        lines.append("WARNING: the CPU flags differ between logical CPUs")
+    if cpus[0].get("bugs"):
+        lines.append("kernel-reported CPU vulnerabilities (mitigated where possible): %s" % cpus[0]["bugs"])
+    return "\n".join(lines)
+
+
+def post_meminfo(out):
+    """Summarize /proc/meminfo into the values that matter for a health check."""
+    kv = {}
+    for ln in out.splitlines():
+        m = re.match(r"\s*([\w()]+):\s+(\d+)(?:\s*kB)?\s*$", ln)
+        if m:
+            kv[m.group(1)] = int(m.group(2))
+    if "MemTotal" not in kv:
+        return out
+    tot = kv["MemTotal"] or 1
+    avail = kv.get("MemAvailable", kv.get("MemFree", 0))
+    lines = ["total %s, available %s (%.0f%%), free %s" % (
+        _gib(tot), _gib(avail), 100.0 * avail / tot, _gib(kv.get("MemFree", 0)))]
+    if kv.get("SwapTotal"):
+        lines.append("swap %s, free %s" % (_gib(kv["SwapTotal"]), _gib(kv.get("SwapFree", 0))))
+    else:
+        lines.append("swap: none configured")
+    lines.append("process memory (AnonPages) %s, page cache %s, slab %s (unreclaimable %s)" % (
+        _gib(kv.get("AnonPages", 0)), _gib(kv.get("Cached", 0) + kv.get("Buffers", 0)),
+        _gib(kv.get("Slab", 0)), _gib(kv.get("SUnreclaim", 0))))
+    if kv.get("CommitLimit"):
+        lines.append("committed %s against commit limit %s (%.0f%%; only enforced with vm.overcommit_memory=2)" % (
+            _gib(kv.get("Committed_AS", 0)), _gib(kv["CommitLimit"]),
+            100.0 * kv.get("Committed_AS", 0) / kv["CommitLimit"]))
+    if kv.get("HugePages_Total"):
+        lines.append("huge pages %d, free %d" % (kv["HugePages_Total"], kv.get("HugePages_Free", 0)))
+    if kv.get("HardwareCorrupted"):
+        lines.append("WARNING: hardware-corrupted memory %d kB" % kv["HardwareCorrupted"])
+    if 100.0 * avail / tot < 10:
+        lines.append("NOTE: less than 10% of memory is available")
+    return "\n".join(lines)
+
+
+RX_NSX_MEMBER = re.compile(r"^\s*(\S{8,})\s+(\S+)\s+(not configured|\S+)\s+(UP|DOWN|UNKNOWN|\S+)\s+(\S+)\s*$")
+
+
+def _nsx_member(ln):
+    m = RX_NSX_MEMBER.match(ln)
+    if not m or m.group(1) == "UUID":
+        return None
+    return m.group(5), m.group(2), m.group(4)          # fqdn, ipv4, status
+
+
+def _member_lines(members, indent="  "):
+    return ["%s%s  %s  %s" % (indent, f, ip, st) for f, ip, st in members]
+
+
+def summarize_nsx_groups(head, groups, services=()):
+    """head: lines to keep first; groups: [(name, status, [(fqdn, ip, status)])];
+    services: [(name, [(fqdn, ip, status)])]."""
+    lines = list(head)
+    stable = [g for g in groups if g[1] == "STABLE" and all(m[2] == "UP" for m in g[2])]
+    other = [g for g in groups if g not in stable]
+    sets = {tuple(sorted(g[2])) for g in stable}
+    if stable:
+        lines.append("%d of %d groups STABLE with every member UP: %s" % (
+            len(stable), len(groups), ", ".join(g[0] for g in stable)))
+        if len(sets) == 1:
+            lines.append("members (the same in each of these groups):")
+            lines += _member_lines(sorted(stable[0][2]))
+        else:
+            for g in stable:
+                lines.append("group %s members:" % g[0])
+                lines += _member_lines(sorted(g[2]))
+    for g in other:
+        lines.append("group %s: %s" % (g[0], g[1]))
+        lines += _member_lines(sorted(g[2]))
+    if services:
+        ok = [s_ for s_ in services if s_[1] and all(m[2] == "UP" for m in s_[1])]
+        if ok:
+            lines.append("node services with every node UP: %s" % ", ".join(
+                "%s (%d)" % (s_[0], len(s_[1])) for s_ in ok))
+        for s_ in services:
+            if s_ not in ok:
+                lines.append("node service %s:" % s_[0])
+                lines += _member_lines(sorted(s_[1])) or ["  (no nodes listed)"]
+    return lines
+
+
+def post_nsx_cluster_status(out):
+    """Fold 'get cluster status' (every group lists every member) into a few lines."""
+    head, groups, services, cur = [], [], [], None
+    for ln in out.splitlines():
+        m = re.match(r"\s*(Cluster Id|Overall Status):\s*(.*)$", ln)
+        if m:
+            head.append("%s: %s" % m.groups())
+            continue
+        m = re.match(r"\s*Group Type:\s*(\S+)", ln)
+        if m:
+            cur = [m.group(1), "?", []]
+            groups.append(cur)
+            continue
+        m = re.match(r"\s*Group Status:\s*(\S+)", ln)
+        if m and cur is not None:
+            cur[1] = m.group(1)
+            continue
+        m = re.match(r"\s*Service Name:\s*(\S+)", ln)
+        if m:
+            cur = [m.group(1), None, []]
+            services.append(cur)
+            continue
+        mem = _nsx_member(ln)
+        if mem and cur is not None:
+            cur[2].append(mem)
+    if not groups:
+        return out
+    return "\n".join(summarize_nsx_groups(
+        head, [tuple(g) for g in groups], [(s_[0], s_[2]) for s_ in services]))
+
+
+def post_nsx_cluster_config(out):
+    """Fold 'get cluster config' into one line per node, plus the service ports."""
+    head, nodes, cur = [], [], None
+    for ln in out.splitlines():
+        m = re.match(r"\s*(Cluster Id|Cluster Configuration Version|Number of nodes in the cluster):\s*(.*)$", ln)
+        if m:
+            head.append("%s: %s" % m.groups())
+            continue
+        m = re.match(r"\s*Node UUID:\s*(\S+)", ln)
+        if m:
+            cur = {"uuid": m.group(1), "status": "?", "ents": []}
+            nodes.append(cur)
+            continue
+        m = re.match(r"\s*Node Status:\s*(\S+)", ln)
+        if m and cur:
+            cur["status"] = m.group(1)
+            continue
+        m = re.match(r"^\s*([A-Z][A-Z_-]+)\s+(\S{8,})\s+(\S+)\s+(not configured|\S+)\s+(\S+)\s+(\S+)\s*$", ln)
+        if m and cur and m.group(1) != "ENTITY":
+            cur["ents"].append((m.group(1), m.group(3), m.group(5), m.group(6)))
+    if not nodes:
+        return out
+    lines = head + ["nodes (node UUID, status, address, name, entity count):"]
+    for n in nodes:
+        ips = sorted({e[1] for e in n["ents"]}) or ["?"]
+        names = sorted({e[3] for e in n["ents"]}) or ["?"]
+        lines.append("  %s  %s  %s  %s  %d entities" % (n["uuid"], n["status"], ",".join(ips), ",".join(names),
+                                                       len(n["ents"])))
+    kinds = [tuple(sorted(e[0] for e in n["ents"])) for n in nodes]
+    if len(set(kinds)) == 1:
+        lines.append("entities on every node: %s" % ", ".join(kinds[0]))
+    else:
+        for n, k in zip(nodes, kinds):
+            lines.append("entities on %s: %s" % (n["uuid"], ", ".join(k)))
+    ports = sorted({(e[0], e[2]) for n in nodes for e in n["ents"] if e[2] not in ("-", "")})
+    if ports:
+        lines.append("entity ports: %s" % ", ".join("%s %s" % p for p in ports))
+    return "\n".join(lines)
+
+
+def post_ntpq_peers(out):
+    """ntpq cuts peer names to about 15 characters, so the anonymizer cannot recognize them as
+    host names. Replace the remote (and a non-IP refid) column with peer-N before anonymizing."""
+    lines, n = [], 0
+    for ln in out.splitlines():
+        m = re.match(r"^([ *+#ox.\-]?)(\S+)(\s+)(\S+)(\s+\d+\s+\w\s+.*)$", ln)
+        if not m or m.group(2) == "remote" or ln.startswith("="):
+            lines.append(ln)
+            continue
+        n += 1
+        remote = m.group(2)
+        if not re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", remote):
+            remote = "peer-%d" % n
+        refid = m.group(4)
+        if not re.fullmatch(r"\.[A-Z0-9]{1,4}\.|\d{1,3}(?:\.\d{1,3}){3}", refid):
+            refid = "peer-%d-ref" % n
+        # keep the columns where ntpq put them: pad to the old width, eat padding on overflow
+        rest = m.group(5)
+        over = max(0, len(refid) - len(m.group(4)))
+        gap = len(rest) - len(rest.lstrip())
+        rest = rest[min(over, gap - 1):]
+        lines.append("%s%s %s%s" % (m.group(1), remote.ljust(len(m.group(2) + m.group(3)) - 1),
+                                    refid.ljust(len(m.group(4))), rest))
+    if n:
+        lines.append("(peer names are cut off by ntpq and cannot be anonymized reliably: shown as peer-N, "
+                     "in the order ntpq listed them. The configured servers are under 'NTP servers'.)")
+    return "\n".join(lines)
 
 
 H_SEARCH = ("domain", r"(?m)^\s*(?:search|domain)\s+(.+)$", r"[\s,]+")
@@ -418,12 +672,12 @@ VCENTER_GROUPS = [
 
 NSX_NODE_CMDS = [
     ncli("Uptime", "get uptime"),
-    ncli("CPU", "get cpu-stats"),
-    ncli("Memory", "get memory-stats"),
+    ncli("CPU", "get cpu-stats", post=post_cpuinfo),
+    ncli("Memory", "get memory-stats", post=post_meminfo),
     ncli("Filesystems", "get filesystem-stats"),
     ncli("Core dumps", "get core-dumps"),
     ncli("NTP servers", "get ntp-servers"),
-    ncli("NTP associations", "get ntp-server associations"),
+    ncli("NTP associations", "get ntp-server associations", post=post_ntpq_peers),
     ncli("DNS servers", "get name-servers"),
     ncli("Password expiry: admin", "get user admin password-expiration"),
     ncli("Password expiry: audit", "get user audit password-expiration"),
@@ -431,9 +685,10 @@ NSX_NODE_CMDS = [
 
 NSX_GROUPS = [
     ("nsx-cluster", "Management cluster and services", [
-        ncli("Version", "get version"),
-        ncli("Cluster status", "get cluster status", timeout=60),
-        ncli("Cluster configuration", "get cluster config", timeout=60, max_lines=300),
+        ncli("Version", "get version", post=post_nsx_version),
+        ncli("Cluster status", "get cluster status", timeout=60, post=post_nsx_cluster_status),
+        ncli("Cluster configuration", "get cluster config", timeout=60, max_lines=300,
+             post=post_nsx_cluster_config),
         ncli("Managers", "get managers"),
         ncli("Services", "get services", timeout=60, max_lines=400),
     ]),
@@ -461,7 +716,7 @@ NSX_GROUPS = [
 
 NSXEDGE_GROUPS = [
     ("edge-status", "Edge cluster and connectivity", [
-        ncli("Version", "get version"),
+        ncli("Version", "get version", post=post_nsx_version),
         ncli("Managers", "get managers"),
         ncli("Controllers", "get controllers"),
         ncli("Edge cluster status", "get edge-cluster status", timeout=60),
@@ -955,7 +1210,18 @@ RX_URLCRED = re.compile(r"(://[^/\s:@]+:)([^/\s@]+)(@)")
 RX_AUTHZ = re.compile(r"(?i)(authorization\s*[:=]\s*(?:bearer|basic|token)\s+)(\S+)")
 RX_KV_SECRET = re.compile(
     r"(?i)((?<![A-Za-z])[\w.-]*(?:password|passwd|pwd|secret|token|apikey|api[_-]key|access[_-]key|"
-    r"private[_-]key|credential)[\w.-]*[\"']?\s*[:=]\s*)(\"[^\"\n]*\"|'[^'\n]*'|[^\s\"',;]+)")
+    r"private[_-]key|credential)[\w.-]*[\"']?\s*[:=]\s*)(\"[^\"\n]*\"|'[^'\n]*'|[^\s\"',;\[\]{}]+)")
+# Keys that name a password *setting* (length, history, age ...), not a secret. Their value is
+# kept when it is a plain number, boolean or null, so password policies stay readable.
+RX_KV_POLICY_KEY = re.compile(
+    r"(?i)(?:length|len|chars|count|remembrance|history|frequency|expir\w*|change|changed|age|days|"
+    r"period|attempts|failures|repeats|sequence|lockout\w*|status|enabled|required|policy|complexity)[\"']?$")
+RX_KV_PLAIN_VALUE = re.compile(r"(?i)[\"']?(?:-?\d+(?:\.\d+)?|true|false|null|none)[\"']?")
+
+
+def _kv_secret_is_setting(m):
+    key = m.group(1).rstrip().rstrip(":=").rstrip()
+    return bool(RX_KV_POLICY_KEY.search(key) and RX_KV_PLAIN_VALUE.fullmatch(m.group(2)))
 RX_VMX_NAME = re.compile(r"(?<![\w.-])([A-Za-z0-9][A-Za-z0-9_.-]{1,80}?)\.vmx(?:@|\b)|\bvm=([^\s,;]+)")
 RX_HASH = re.compile(r"\$(?:1|2[aby]?|5|6|y)\$[./A-Za-z0-9$]{20,}")
 RX_SSHKEY = re.compile(r"AAAA[0-9A-Za-z+/]{60,}={0,2}")
@@ -1276,7 +1542,8 @@ class Scrubber:
         t = RX_JWT.sub(lambda m: self._tok("[REDACTED-JWT]"), t)
         t = RX_URLCRED.sub(lambda m: m.group(1) + self._tok("[REDACTED]") + m.group(3), t)
         t = RX_AUTHZ.sub(lambda m: m.group(1) + self._tok("[REDACTED]"), t)
-        t = RX_KV_SECRET.sub(lambda m: m.group(1) + self._tok("[REDACTED]"), t)
+        t = RX_KV_SECRET.sub(lambda m: m.group(0) if _kv_secret_is_setting(m)
+                             else m.group(1) + self._tok("[REDACTED]"), t)
         t = RX_HASH.sub(lambda m: self._tok("[REDACTED-HASH]"), t)
         t = RX_SSHKEY.sub(lambda m: self._tok("[REDACTED-KEY]"), t)
         t = RX_BLOB.sub(lambda m: self._tok("[REDACTED-ENCODED-DATA]"), t)
@@ -1880,7 +2147,17 @@ class Target:
         if c["mode"] == "nsxcli" and self.mode != "nsxcli" and self.sec["type"] == "opsnet" and rc == 127:
             res.update(status="skipped", note="a consoleuser CLI command: not available to this login", dur=time.time() - t0)
             return res
-        res.update(rc=rc, out=out, dur=time.time() - t0)
+        t1 = time.time()
+        if c["mode"] == "nsxcli":
+            ts, out = nsxcli_stamp(out)
+            if ts is not None and self.clock_offset is None and not to:
+                self.clock_offset = ts - (t0 + t1) / 2.0
+        if c.get("post") and rc == 0 and not to:
+            try:
+                out = c["post"](out)
+            except Exception:  # noqa: BLE001 - a summarizer must never lose the raw output
+                pass
+        res.update(rc=rc, out=out, dur=t1 - t0)
         if to:
             res.update(status="timeout", note="timed out after %ds" % c["timeout"])
         elif rc != 0:
@@ -2116,11 +2393,12 @@ def nsx_cluster(api):
     out = ["overall: %s   management cluster: %s   control cluster: %s" % (
         det.get("overall_status"), (st.get("mgmt_cluster_status") or {}).get("status"),
         (st.get("control_cluster_status") or {}).get("status"))]
-    for g in det.get("groups") or []:
-        out.append("group %s: %s" % (g.get("group_type"), g.get("group_status")))
-        for m in g.get("members") or []:
-            out.append("  member: %s  %s  %s" % (m.get("member_fqdn") or m.get("member_uuid"), m.get("member_ip"),
-                                                 m.get("member_status")))
+    groups = [(g.get("group_type"), g.get("group_status"),
+               [(m.get("member_fqdn") or m.get("member_uuid"), m.get("member_ip"), m.get("member_status"))
+                for m in g.get("members") or []]) for g in det.get("groups") or []]
+    # "member: <name>" lines are kept: the H_NSXNODE harvest learns the peer names from them
+    lines = summarize_nsx_groups([], groups)
+    out += [re.sub(r"^  (?=\S)", "  member: ", ln) for ln in lines]
     return "\n".join(out)
 
 
@@ -2150,7 +2428,8 @@ def nsx_alarms(api):
 
 def nsx_transport_nodes(api):
     nodes = {n.get("id"): n for n in api.paged("/api/v1/transport-nodes?page_size=500")}
-    states = api.paged("/api/v1/transport-nodes/state?page_size=500")
+    # The state list takes no page_size: NSX 9.x refuses it with HTTP 400 (error 268).
+    states = api.paged("/api/v1/transport-nodes/state")
     counts, bad = {}, []
     for s_ in states:
         n = nodes.get(s_.get("transport_node_id")) or {}
@@ -2453,6 +2732,10 @@ VCAPI_FUNCS = {"supervisors": api_supervisors, "namespaces": api_namespaces, "se
                "sddc_credentials": sddc_credentials, "sddc_credential_tasks": sddc_credential_tasks}
 
 
+TOOL_ERROR_NOTE = ("tool error: the API refused the request itself (HTTP 400). This points to a problem "
+                   "in vcf_diag for this product version, not to a fault in the environment.")
+
+
 def collect_api(t, groups):
     """Run vCenter API checks for one vCenter target, from this computer."""
     todo = [(g, c) for g in groups for c in g[2]]
@@ -2484,6 +2767,8 @@ def collect_api(t, groups):
                 res["out"] = VCAPI_FUNCS[c["api"]](api)
             except (VcApiError, ValueError, KeyError, TypeError, AttributeError) as e:
                 res.update(rc=1, status="fail", out="%s" % e)
+                if isinstance(e, VcApiError) and str(e).startswith("HTTP 400 "):
+                    res["note"] = TOOL_ERROR_NOTE
             res["dur"] = time.time() - t0
             t.results.append(res)
     finally:
@@ -3103,11 +3388,17 @@ def build_report(ctx, done, scrubber, started, max_lines, kind="health", title="
             if t.clock_offset is not None and abs(t.clock_offset) > 5:
                 attention.append("- **%s**: clock differs from the collector by %+.0f s" % (t.ph, t.clock_offset))
             timed = [S(r["label"]) for r in t.results if r["status"] == "timeout"]
-            failed = [S(r["label"]) for r in t.results if r["status"] == "fail"]
+            failed = [S(r["label"]) for r in t.results
+                      if r["status"] == "fail" and r.get("note") != TOOL_ERROR_NOTE]
+            tool_err = [S(r["label"]) for r in t.results
+                        if r["status"] == "fail" and r.get("note") == TOOL_ERROR_NOTE]
             if timed:
                 attention.append("- %s: timed out: %s" % (t.ph, "; ".join(timed)))
             if failed:
                 attention.append("- %s: non-zero exit status: %s" % (t.ph, "; ".join(failed)))
+            if tool_err:
+                attention.append("- %s: tool error (request refused by the API, not an environment fault): %s"
+                                 % (t.ph, "; ".join(tool_err)))
     w("")
     w("### Items needing attention (collection level)")
     w("")
@@ -3158,7 +3449,8 @@ def build_report(ctx, done, scrubber, started, max_lines, kind="health", title="
                     w("Note: " + S(r["note"]))
                     w("")
                 w("`$ %s`" % S(r["cmd"]).replace("`", "'"))
-                body = S(clip(r["out"], max(r["spec"]["max_lines"] or max_lines, max_lines))).strip("\n")
+                body = S(clip(r["out"], max(r["spec"]["max_lines"] or max_lines, max_lines)))
+                body = "\n".join(ln.rstrip() for ln in body.split("\n")).strip("\n")
                 if not body.strip():
                     body = "(no output)"
                 f = fence(body)
