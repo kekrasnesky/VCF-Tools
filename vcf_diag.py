@@ -57,7 +57,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
-VERSION = "1.20.0"
+VERSION = "1.21.0"
 
 # ----------------------------------------------------------------------------
 # Diagnostic catalog
@@ -1142,7 +1142,8 @@ SDDC_GROUPS = [
             "find /var/log/vmware/vcf/domainmanager /var/log/vmware/vcf/operationsmanager "
             "/var/log/vmware/vcf/commonsvcs -name '*.log' -mmin -4320 2>/dev/null | head -n 40 | xargs -r grep -hiE "
             "'transport.?zone|transport.?node.?profile|transport.?node.?collection|referenceToken|reference token' "
-            "2>/dev/null | grep -iE 'error|fail|exception|not found' | tail -n 200",
+            "2>/dev/null | grep -vE '^[0-9TZ:.+-]+ +(DEBUG|TRACE) ' | grep -iE 'error|fail|exception|not found' "
+            "| tail -n 200",
             timeout=120, max_lines=150, sudo=True, post=post_log_dedup),
     ]),
 ] + linux_groups()
@@ -1718,8 +1719,14 @@ RX_KV_POLICY_KEY = re.compile(
 RX_KV_PLAIN_VALUE = re.compile(r"(?i)[\"']?(?:-?\d+(?:\.\d+)?|true|false|null|none)[\"']?")
 
 
+RX_REFTOKEN_KEY = re.compile(r"(?i)reference[_-]?token[\"']?$")
+RX_REFTOKEN_VALUE = re.compile(r"[\"']?[A-Z0-9]{4,12}[\"']?")
+
+
 def _kv_secret_is_setting(m):
     key = m.group(1).rstrip().rstrip(":=").rstrip()
+    if RX_REFTOKEN_KEY.search(key) and RX_REFTOKEN_VALUE.fullmatch(m.group(2)):
+        return True      # a VCF error reference code that support asks for, not a credential
     return bool(RX_KV_POLICY_KEY.search(key) and RX_KV_PLAIN_VALUE.fullmatch(m.group(2)))
 RX_VMX_NAME = re.compile(r"(?<![\w.-])([A-Za-z0-9][A-Za-z0-9_.-]{1,80}?)\.vmx(?:@|\b)|\bvm=([^\s,;]+)")
 RX_HASH = re.compile(r"\$(?:1|2[aby]?|5|6|y)\$[./A-Za-z0-9$]{20,}")
@@ -1906,6 +1913,10 @@ class Scrubber:
             (strict if len(short) == 3 else loose)[short] = ph
         for cat in OBJECT_CATS:
             for real, ph in self.m.maps.get(cat, {}).items():
+                # a mapping written by an older version may hold a size or duration ("10m") that
+                # was learned from a kubectl table: replacing it would hit "10M" in df output
+                if real.isdigit() or RX_QUANTITY.fullmatch(real):
+                    continue
                 loose.setdefault(real, ph)       # a host placeholder wins over an object one
         for ip, ph in self.m.maps.get("ipv4", {}).items():
             digit[ip.replace(".", "-")] = ph
@@ -1962,14 +1973,22 @@ class Scrubber:
     # ---- replacement callbacks --------------------------------------------
     def _r_fqdn_env(self, m, learn_only=False):
         full = m.group(0)
-        if self._safe(full.lower()):
+        low = full.lower()
+        if self._safe(low):
             return full
-        labels = m.group(1).rstrip(".")
+        # The regex takes the shortest environment domain at the end ("b.example.com" ->
+        # host b in example.com). When the name is itself a known domain (a resolver search
+        # domain, a rootDomain value) or ends in a longer known one, use the longest.
+        if low in self.env_domains:
+            ph = self.m.get("domain", low, width=2)
+            return full if learn_only else self._tok(self._style(ph, full))
+        base = max((d for d in self.env_domains if low.endswith("." + d)), key=len, default=m.group(2).lower())
+        labels = full[:len(full) - len(base) - 1]
         if not labels:
             ph = self.m.get("domain", m.group(2), width=2)
             return full if learn_only else self._tok(self._style(ph, full))
         short, _, mid = labels.partition(".")
-        dom = (mid + "." if mid else "") + m.group(2)
+        dom = (mid + "." if mid else "") + base
         self.learn_domain(dom)
         dph = self.m.get("domain", dom, width=2)
         hph = self.m.get("host", short, prefix="host", width=4)
@@ -4240,7 +4259,8 @@ def _fact_mem(out):
 
 
 def _fact_ntp(out):
-    m = re.search(r"(?m)^\*\S+\s+\S+\s+(\d+)\s+\w\s+\S+\s+\d+\s+\d+\s+[\d.]+\s+(-?[\d.]+)", out)
+    # ntpq prints a positive offset with a leading "+" (NSX: +0.501), chrony / newer ntpq without
+    m = re.search(r"(?m)^\*\S+\s+\S+\s+(\d+)\s+\w\s+\S+\s+\d+\s+\d+\s+[\d.]+\s+([+-]?[\d.]+)", out)
     if m:
         return [("ntp_synced", "yes, stratum %s" % m.group(1)), ("ntp_offset_ms", float(m.group(2)))]
     return [("ntp_synced", "no peer selected")] if re.search(r"(?m)^=+$", out) else []
@@ -4565,7 +4585,7 @@ def target_findings(t, facts):
             for sev, text in capi_problems(r["out"]):
                 res.append((sev, "cluster " + text, r["label"]))
         if r["status"] == "ok" and r["label"] == "Transport zones, node profiles and cluster attachments":
-            for p in re.findall(r"(?m)^PROBLEM: (.+)$", r["out"]):
+            for p in merge_tz_problems(re.findall(r"(?m)^PROBLEM: (.+)$", r["out"])):
                 res.append(("high", "NSX " + p, r["label"]))
         if r["status"] == "ok" and r["label"].startswith("Compute managers (vCenter registration"):
             for m in re.finditer(r"(?m)^compute manager: (\S+).*?connection=(\S+)", r["out"]):
@@ -4603,8 +4623,18 @@ def target_findings(t, facts):
         res.append(("med" if pct >= 90 else "low", "filesystem %s at %d%%" % (part.split(None, 1)[-1], pct),
                     "Disk usage / Filesystems"))
     if isinstance(f.get("mem_available_pct"), int) and f["mem_available_pct"] < 15:
-        res.append(("high" if f["mem_available_pct"] < 5 else "med",
-                    "memory available %d%%" % f["mem_available_pct"], "Memory"))
+        pct = f["mem_available_pct"]
+        if (getattr(t, "sec", None) or {}).get("type") == "nsx":
+            # NSX Manager keeps most of its memory in its Java services (Corfu, proton ...) by
+            # design: only very little left over is worth a finding of its own
+            if pct < 5:
+                res.append(("med", "memory available %d%% (NSX Manager normally runs with little free "
+                                   "memory; this is lower than usual)" % pct, "Memory"))
+            else:
+                res.append(("info", "memory available %d%% (normal for NSX Manager, whose services keep "
+                                    "most memory in use)" % pct, "Memory"))
+        else:
+            res.append(("high" if pct < 5 else "med", "memory available %d%%" % pct, "Memory"))
     if isinstance(f.get("swap_used_mb"), int) and f["swap_used_mb"] >= 256:
         res.append(("low", "swap in use: %.1f GiB" % (f["swap_used_mb"] / 1024.0), "Memory"))
     if f.get("ntp_synced") == "no peer selected":
@@ -4625,7 +4655,28 @@ def target_findings(t, facts):
         res.append(("low", "%d core dump file(s) present" % f["core_dumps"], "Core dumps"))
     if f.get("failed_units") not in (None, "none"):
         res.append(("info", "failed systemd unit(s): %s" % f["failed_units"], "Failed units"))
+    if f.get("ssh_root_login") == "enabled":
+        res.append(("info", "SSH login as root is allowed (check that this is intended)", "Services"))
     return res
+
+
+def merge_tz_problems(problems):
+    """Fold "N host transport node(s) reference transport zone X" into the profile problem for
+    the same X: hosts inherit the reference from the profile, so it is one cause, not two."""
+    out, by_ref = [], {}
+    for p in problems:
+        m = re.match(r"profile .* references transport zone (\S+):", p)
+        if m:
+            by_ref.setdefault(m.group(1), len(out))
+        out.append(p)
+    merged = []
+    for p in out:
+        m = re.match(r"(\d+) host transport node\(s\) reference transport zone (\S+), which does not resolve", p)
+        if m and m.group(2) in by_ref:
+            i = by_ref[m.group(2)]
+            out[i] += " - inherited by %s host transport node(s)" % m.group(1)
+            merged.append(p)
+    return [p for p in out if p not in merged]
 
 
 def report_findings(done, digest):
@@ -5220,9 +5271,19 @@ Rules for the block:
   changes anything is refused, as is one that would print secrets.
 - `[fix]` steps are never run by the tool. The person reads them with real names and applies
   them by hand. Make each one a complete command, put them in the order they must be applied,
-  and state impact and rollback in `note:`.
-- One command per `run:`; continue a long command on indented lines. On Kubernetes nodes write
-  `{K}` for kubectl. On NSX nodes NSX CLI commands (`get ...`) can be given directly.
+  and state impact and rollback in `note:`. Prefer the smallest change that can be undone
+  (correct a wrong reference rather than recreate a deleted object). A step labelled "Verify"
+  must only read.
+- `[collect]`: one command per `run:`; continue a long command on indented lines. A `[fix]` may
+  be a short script: put its lines under `run:`, indented as the script needs (no YAML `|`).
+  On Kubernetes nodes write `{K}` for kubectl.
+- Each host's "Connection:" line shows its shell mode. With shell mode `nsxcli` only single NSX
+  CLI commands (`get ...`) run: no shell, pipes, python or curl. NSX, vCenter and SDDC Manager
+  API data comes from the tool's own API checks (sections marked "NSX API", "SDDC Manager API"):
+  do not write scripts that call these APIs.
+- Never put a password, token, API key or Authorization header in a step, and do not turn off
+  certificate checks. You do not know the passwords; for an API call in a `[fix]`, let the
+  person authenticate (`curl -u admin ...` asks for the password).
 - Optional per step: `timeout:` seconds (default 60) and `lines:` output lines to keep (default 400).
 - Commands run on the target as the login user shown in each host's "Connection:" line, through
   sudo where the tool has it. Do not add sudo yourself. Use `journalctl` and log files freely.
@@ -5234,18 +5295,46 @@ Rules for the block:
 PLAN_FENCE = re.compile(r"`{3,}[ \t]*vcf-plan[^\n]*\n(.*?)`{3,}", re.S)
 PLAN_STEP = re.compile(r"(?i)^\[(collect|fix)\][ \t]*(.*)$")
 PLAN_KEY = re.compile(r"(?i)^(targets?|label|run|note|mode|timeout|lines)[ \t]*[:=][ \t]?(.*)$")
+YAML_BLOCK_MARK = re.compile(r"[|>][+-]?[0-9]?")
 FOLLOWUP_GROUP = ("followup", "Follow-up diagnostics requested by the analyst")
 
 
 def parse_plan(text):
-    """Extract the steps of a vcf-plan block from an analyst reply."""
+    """Extract the steps of a vcf-plan block from an analyst reply.
+
+    A value continues on the indented lines below its key. For run: the continuation keeps its
+    indentation relative to the least indented line, so a pasted script (Python, a shell loop)
+    stays valid. A YAML block marker after the key (run: |, run: >-) is accepted and dropped,
+    and blank lines inside a multi-line run: are kept."""
     text = text.replace("\r\n", "\n")
     blocks = PLAN_FENCE.findall(text)
     body = "\n".join(textwrap.dedent(b) for b in blocks) if blocks else text
     title, steps, cur, last = "", [], None, None
+    cont = []                       # raw continuation lines of the current key
+
+    def flush():
+        if cur is None or last is None or not cont:
+            return
+        lines = list(cont)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        if not lines:
+            return
+        if last == "run":
+            block = textwrap.dedent("\n".join(ln.expandtabs(4) for ln in lines))
+            cur["run"] = (cur["run"] + "\n" + block) if cur["run"] else block
+        else:
+            joined = " ".join(ln.strip() for ln in lines if ln.strip())
+            cur[last] = (cur[last] + " " + joined) if cur[last] else joined
+
     for raw in body.split("\n"):
         line = raw.rstrip()
         indented = raw[:1] in (" ", "\t")
+        if last and (indented and line.strip() or not line.strip() and last == "run" and cont):
+            cont.append(line)
+            continue
+        flush()
+        cont = []
         m = None if indented else PLAN_STEP.match(line)
         if m:
             cur = {"kind": m.group(1).lower(), "targets": [], "label": "", "run": "", "note": "",
@@ -5261,9 +5350,6 @@ def parse_plan(text):
             if tm and not title:
                 title = tm.group(1).strip()
             continue
-        if indented and last and line.strip():
-            cur[last] += ("\n" if last == "run" else " ") + line.strip()
-            continue
         km = None if indented else PLAN_KEY.match(line)
         if km:
             key = km.group(1).lower()
@@ -5271,10 +5357,12 @@ def parse_plan(text):
                 cur["targets"] += split_list(km.group(2))
                 last = None
             else:
-                cur[key] = km.group(2).strip()
+                val = km.group(2).strip()
+                cur[key] = "" if YAML_BLOCK_MARK.fullmatch(val) else val
                 last = key
             continue
         last = None
+    flush()
     return {"title": title, "steps": steps}
 
 
@@ -5370,7 +5458,12 @@ def readonly_problem(command, mode):
 
 
 class Decoder:
-    """Translates placeholders back to real names with the private mapping."""
+    """Translates placeholders back to real names with the private mapping.
+
+    A placeholder is translated wherever it is not glued to a letter or digit, also after a
+    hyphen ("restored-tz-uuid-0332"): leaving it there would put a placeholder into a command
+    the person copies. "exthost-0001" is still not read as "host-0001" (a letter before it), nor
+    "ip-n1-h2" inside "ip-n1-h25"."""
 
     def __init__(self, mapping):
         self.rev = {}
@@ -5379,11 +5472,114 @@ class Decoder:
                 continue
             for real, ph in vals.items():
                 self.rev.setdefault(ph.lower(), real)
-        self.rx = re.compile(r"(?i)(?<![\w-])(?:%s)(?![\w-])" % "|".join(
+        self.reals = {str(r).lower() for r in self.rev.values()}
+        self.rx = re.compile(r"(?i)(?<![A-Za-z0-9_])(?:%s)(?![A-Za-z0-9_]|-[0-9])" % "|".join(
             re.escape(k) for k in sorted(self.rev, key=len, reverse=True))) if self.rev else None
 
     def __call__(self, text):
         return self.rx.sub(lambda m: self.rev[m.group(0).lower()], text) if self.rx else text
+
+    def unknown_placeholders(self, translated):
+        """Placeholder-shaped words left after translation: the analyst used a placeholder that
+        is not in the mapping (mistyped or made up). Real names that look alike are ignored."""
+        found = []
+        for m in RX_PLACEHOLDER_SHAPE.finditer(translated):
+            w = m.group(0)
+            if w.lower() not in self.reals and w.lower() not in self.rev and w not in found:
+                found.append(w)
+        return found
+
+
+# Generic placeholder shapes written by the anonymizer (inventory prefixes such as esxi-01 are
+# left out: real host names often look like that)
+RX_PLACEHOLDER_SHAPE = re.compile(
+    r"(?i)(?<![A-Za-z0-9_-])(?:(?:host|exthost|domain|uuid|mac|wwn|serial|thumbprint|license|datastore|"
+    r"portgroup|dvs|lrouter|ns|k8sobj|cluster|wld|nsxobj|edgecluster|vcluster|vm|dn|term|ip6|ip6-ll)-\d{2,}"
+    r"|ip-n\d+-h\d+)(?![A-Za-z0-9_]|-[0-9])")
+
+# ---- checks on the analyst's steps -------------------------------------------------------
+# A credential written into a step: the analyst never knows the passwords, so whatever is there
+# is made up (or, worse, real). The tool supplies its own logins.
+RX_STEP_CREDENTIAL = [(re.compile(rx), what) for rx, what in [
+    (r"(?i)authorization[\"']?\s*[:=]\s*[\"']?\s*(?:basic|bearer|token|negotiate)\s+[A-Za-z0-9+/=._~-]{6,}",
+     "an Authorization header with a credential"),
+    (r"(?i)(?:^|\s)(?:-u|--user)[ =]?[\"']?[^\s:\"'$]+:[^\s\"'$<]+", "a user:password pair (curl -u)"),
+    (r"://[^/\s:@]+:[^/\s@<$]+@", "a password in a URL"),
+    (r"(?i)\bx-[a-z-]*(?:token|api-?key|auth)[\"']?\s*[:=]\s*[\"']?(?!\$|<)[A-Za-z0-9+/=._~-]{8,}", "a token header"),
+    (r"(?i)(?:^|\s)--?(?:password|passwd|pass|pwd|token|secret|api-?key)[ =][\"']?(?![\"'\s]|\$|<)[^\s\"']{3,}",
+     "a password or token option"),
+    (r"(?i)(?<![A-Za-z])(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?key)[\"']?\s*[:=]\s*"
+     r"[\"']?(?![\"'\s]|\$|<|\[|\*{3})[^\s\"',;)}]{3,}", "a password or key value"),
+]]
+RX_B64_WORD = re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{8,}={0,2}(?![A-Za-z0-9+/=])")
+RX_TLS_OFF = re.compile(r"CERT_NONE|check_hostname\s*=\s*False|verify\s*=\s*False|_create_unverified_context|"
+                        r"(?:^|\s)(?:-k|--insecure)(?=\s|$)|InsecureRequestWarning|-SkipCertificateCheck")
+# NSX CLI commands that a fix may contain (the admin login opens the NSX CLI, not a shell)
+RX_NSXCLI_FIX = re.compile(r"\s*(?:get|set|del|clear|start|stop|restart|request|copy|join|detach|ping|traceroute|"
+                           r"nslookup|st\s+e)\b")
+# readonly_problem reasons that mean the command needs root on a Linux appliance
+NEEDS_ROOT = ("it can change a service", "it can start or stop a service", "it can stop processes or the system",
+              "it can install or remove software", "it can change accounts")
+
+
+def step_credential(command):
+    """What kind of credential a step contains, or None."""
+    for rx, what in RX_STEP_CREDENTIAL:
+        if rx.search(command):
+            return what
+    for m in RX_B64_WORD.finditer(command):
+        word = m.group(0)
+        if len(word) % 4:
+            continue
+        try:
+            dec = base64.b64decode(word, validate=True).decode("ascii")
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if re.fullmatch(r"[\x21-\x7e]{1,64}:[\x20-\x7e]{1,128}", dec):
+            return "a base64-encoded user:password pair"
+    return None
+
+
+def step_mode(st, sec):
+    """The shell mode a step runs in on a host of section sec."""
+    run = st["run"]
+    if st["mode"].lower() in ("sh", "nsxcli", "kubectl"):
+        return st["mode"].lower()
+    if "{K}" in run:
+        return "kubectl"
+    return "nsxcli" if COMPONENTS[sec["type"]].get("nsxcli") and re.match(r"\s*get\s", run) else "sh"
+
+
+def restricted_cli(sec):
+    """True when the inventory login for sec opens a restricted CLI (NSX admin), not a shell."""
+    return bool(COMPONENTS[sec["type"]].get("nsxcli")) and sec.get("user", "") not in ("root",) \
+        and sec.get("escalate") != "su"
+
+
+def fix_warnings(st, label, resolved, changes):
+    """Things the person should know before applying a [fix] step by hand."""
+    run, warn = st["run"], []
+    cred = step_credential(run)
+    if cred:
+        warn.append("It contains %s written by the analyst. The analyst never knows your passwords, so it is "
+                    "made up: put in your own when you apply it, and do not send it back." % cred)
+    if RX_TLS_OFF.search(run):
+        warn.append("It turns off certificate checking (TLS verification). Use it only if you know why the "
+                    "certificate cannot be verified.")
+    if re.fullmatch(r"(?is)\s*(?:verify|verification|check|confirm)\b.*", label) and changes:
+        warn.append("It is labelled as a verification, but it changes the system (%s)." % changes)
+    secs = {s["name"]: s for s, a, ph in resolved}
+    for s in secs.values():
+        if restricted_cli(s) and not RX_NSXCLI_FIX.match(run):
+            warn.append("The %s login in your inventory (%s) opens the NSX CLI, where shell commands (python, "
+                        "curl, systemctl ...) do not work. Run it in a root shell on the appliance, or as an API "
+                        "call from your own computer." % (s["name"], s.get("user") or "admin"))
+        elif changes in NEEDS_ROOT and s.get("user", "root") != "root" and not restricted_cli(s) and \
+                (s.get("sudo") or COMPONENTS[s["type"]].get("sudo") or "no") == "no" and \
+                not re.match(r"\s*sudo\b", run):
+            warn.append("It needs root, and the %s login in your inventory (%s) has no sudo: run it as root."
+                        % (s["name"], s.get("user")))
+    return warn
 
 
 def _clamp(value, default, lo, hi):
@@ -5425,6 +5621,12 @@ def prepare_plan(args, text, require_mapping=True):
     parsed = parse_plan(text)
     out = {"title": parsed["title"], "translated": dec(text), "collect": [], "manual": [], "problems": [],
            "settings": settings, "sections": sections, "plan": []}
+    if not plain and dec.rev:
+        left = dec.unknown_placeholders(out["translated"])
+        if left:
+            shown = ", ".join(left[:10]) + (" ..." if len(left) > 10 else "")
+            out["problems"].append("The reply uses placeholder(s) that are in none of your reports, so they could not "
+                                   "be translated: %s. Do not apply a step that contains one." % shown)
     per_host = {}
     for n, st in enumerate(parsed["steps"], 1):
         label = st["label"] or "Step %d" % n
@@ -5448,9 +5650,14 @@ def prepare_plan(args, text, require_mapping=True):
             out["problems"].append("Step %d (%s): %s is not a host or group in your inventory."
                                    % (n, label, ", ".join(unknown)))
         entry = {"kind": st["kind"], "label": dec(label), "note": dec(st["note"]), "command": dec(st["run"]),
-                 "reason": "", "targets": [{"section": s["name"], "address": a, "placeholder": ph}
-                                           for s, a, ph in resolved]}
+                 "reason": "", "changes": "", "warnings": [],
+                 "targets": [{"section": s["name"], "address": a, "placeholder": ph} for s, a, ph in resolved]}
         if st["kind"] == "fix":
+            # whether it changes anything decides how it is shown: never trust the label for that
+            modes = {step_mode(st, s) for s, a, ph in resolved} or {"sh"}
+            changes = next((r for r in (readonly_problem(st["run"], m) for m in modes) if r), "")
+            entry["changes"] = changes
+            entry["warnings"] = fix_warnings(st, label, resolved, changes)
             out["manual"].append(entry)
             continue
         if not resolved:
@@ -5459,13 +5666,18 @@ def prepare_plan(args, text, require_mapping=True):
                 any(s["type"] in K8S_TYPES for s, a, ph in resolved):
             st["run"] = re.sub(r"(^|[|;&(`]\s*|\$\(\s*)kubectl(?=\s)", r"\1{K}", st["run"])
             entry["command"] = dec(st["run"])
-        modes = {}
-        for s, a, ph in resolved:
-            mode = st["mode"].lower() if st["mode"].lower() in ("sh", "nsxcli", "kubectl") else (
-                "kubectl" if "{K}" in st["run"] else
-                "nsxcli" if COMPONENTS[s["type"]].get("nsxcli") and re.match(r"\s*get\s", st["run"]) else "sh")
-            modes[(s["name"], a)] = mode
+        modes = {(s["name"], a): step_mode(st, s) for s, a, ph in resolved}
         reason = next((r for r in (readonly_problem(st["run"], m) for m in set(modes.values())) if r), None)
+        cred = step_credential(st["run"])
+        if cred:      # said first: it matters more than any other reason
+            reason = ("it contains %s; the tool brings its own logins (API checks are part of the report) and "
+                      "a credential must never be in a step" % cred)
+        if not reason:
+            cli = sorted({s["name"] for s, a, ph in resolved if modes[(s["name"], a)] == "sh" and restricted_cli(s)})
+            if cli:
+                out["problems"].append("Step %d (%s): the %s login opens the NSX CLI, so this shell command will be "
+                                       "skipped there; only single NSX CLI 'get' commands run on it."
+                                       % (n, label, ", ".join(cli)))
         if reason:
             entry.update(kind="blocked", reason=reason)
             out["manual"].append(entry)
@@ -5493,31 +5705,15 @@ def plan_public(prep):
 def cmd_plan(args):
     with open(args.plan, encoding="utf-8", errors="replace") as fh:
         prep = prepare_plan(args, fh.read())
-
-    def show(e):
-        print("  - %s" % e["label"])
-        print("      on:  %s" % (", ".join("%s (%s)" % (t["address"], t["placeholder"]) for t in e["targets"]) or "?"))
-        for i, ln in enumerate(e["command"].split("\n")):
-            print("      %s %s" % ("run:" if i == 0 else "    ", ln))
-        if e["note"]:
-            print("      note: %s" % e["note"])
-        if e["reason"]:
-            print("      NOT RUN by this tool: %s" % e["reason"])
-
     if prep["title"]:
         print("Plan: %s" % prep["title"])
-    for p in prep["problems"]:
-        print("warning: %s" % p)
-    if prep["manual"]:
-        print("\nTo apply by hand (this tool never runs these):")
-        for e in prep["manual"]:
-            show(e)
+    print_plan_steps(prep, include_collect=False)
     if not prep["collect"]:
         print("\nNo read-only diagnostics to run." if prep["manual"] else "\nNo plan steps were found in that file.")
         return 0
     print("\nRead-only diagnostics requested:")
     for e in prep["collect"]:
-        show(e)
+        print_step(e)
     if not ask_yes("\nRun these %d read-only diagnostic(s) now?" % len(prep["collect"]), default=False):
         return 0
     if args.parallel is None:
@@ -6327,16 +6523,30 @@ Fix steps must be exact, complete commands or scripts for the named hosts that t
 can paste into a terminal, with real values filled in from the reports: service names, file paths,
 object names, IDs. Never write general advice such as "check the logs", "verify the configuration"
 or "restart the affected service" instead of commands. A longer fix may be a multi-line script
-(indent the continuation lines under run:). Where a fix can only be done in a web UI, give the exact
-menu path, and the equivalent CLI or API command when one exists. After each fix add a step that
-verifies it (as a [fix] step labelled "Verify ...").
+(put its lines under run:, indented as the script needs; no YAML "|"). Where a fix can only be done
+in a web UI, give the exact menu path, and the equivalent CLI or API command when one exists, with
+the full, correct API path. After each fix add a step that verifies it (as a [fix] step labelled
+"Verify ..."); a Verify step must only read, never restart or change anything.
+
+Choose the least invasive fix the evidence supports: correct a wrong or stale reference rather
+than recreate a deleted object under its old ID (a recreated object is empty, and pushing it can
+touch every host that uses it). Do not restart services unless the evidence shows a restart is
+needed; when one is, say in note: what it interrupts (running tasks, workflows marked IN_PROGRESS).
+Never write "No rollback needed" for a change that has an effect.
 
 The administrator may also run your commands in a terminal and paste the output back, or tell you
 what happened after applying a fix. Continue from there.
 
 Rules:
 - Base conclusions on evidence in the reports, not on assumptions. Do not conclude early when one
-  more targeted check would confirm or rule out the cause; do not ask again for data you have.
+  more targeted check would confirm or rule out the cause; do not ask again for data you have:
+  read the report first (the API sections already list NSX transport zones, profiles, transport
+  nodes, alarms, backups and users).
+- Each host's "Connection:" line gives the login and the shell mode. With shell mode nsxcli only
+  single NSX CLI commands (get ...) run: no shell, pipes, python, curl or API scripts. When the
+  login is not root and a fix needs root, say so in note:.
+- Never write a script that calls the NSX, vCenter or SDDC Manager API with a login: API data
+  comes from the tool's API checks. Do not turn off certificate checks in any command.
 - The administrator approves every round, and you have at most %d rounds before you must
   conclude. Each message from the tool says which round it is.
 - A [collect] step that looks as if it changes something, or that would print secrets, is refused
@@ -6708,32 +6918,40 @@ def plan_as_script(entries, title="Steps"):
         out.append("#    on: %s" % hosts)
         if e.get("note"):
             out.append("#    note: %s" % e["note"])
+        for w in e.get("warnings") or ():
+            out.append("#    WARNING: %s" % w)
         out.append(e["command"].rstrip())
         out.append("")
     return "\n".join(out)
 
 
-def print_plan_steps(prep, include_collect=True):
-    def show(e):
-        print("  - %s" % e["label"])
-        print("      on:  %s" % (", ".join("%s (%s)" % (t["address"], t["placeholder"]) for t in e["targets"]) or "?"))
-        for i, ln in enumerate(e["command"].split("\n")):
-            print("      %s %s" % ("run:" if i == 0 else "    ", ln))
-        if e["note"]:
-            print("      note: %s" % e["note"])
-        if e["reason"]:
-            print("      NOT RUN by this tool: %s" % e["reason"])
+def print_step(e):
+    """One plan step for the terminal, with real names."""
+    print("  - %s" % e["label"])
+    print("      on:  %s" % (", ".join("%s (%s)" % (t["address"], t["placeholder"]) for t in e["targets"]) or "?"))
+    for i, ln in enumerate(e["command"].split("\n")):
+        print("      %s %s" % ("run:" if i == 0 else "    ", ln))
+    if e["note"]:
+        print("      note: %s" % e["note"])
+    if e["reason"]:
+        print("      NOT RUN by this tool: %s" % e["reason"])
+    if e.get("kind") == "fix":
+        print("      effect: %s" % (("changes the system (%s)" % e["changes"]) if e.get("changes") else "read-only"))
+    for w in e.get("warnings") or ():
+        print("      WARNING: %s" % w)
 
+
+def print_plan_steps(prep, include_collect=True):
     for p in prep["problems"]:
         print("warning: %s" % p)
     if prep["manual"]:
         print("\nTo apply by hand (this tool never runs these):")
         for e in prep["manual"]:
-            show(e)
+            print_step(e)
     if include_collect and prep["collect"]:
         print("\nRead-only diagnostics requested:")
         for e in prep["collect"]:
-            show(e)
+            print_step(e)
 
 
 def cmd_investigate(args):
@@ -6930,6 +7148,7 @@ td.mono { font-family: ui-monospace, Menlo, monospace; font-size: 13px; overflow
 .tablewrap { overflow-x: auto; }
 .pill { display: inline-block; padding: 1px 9px; border-radius: 999px; font-size: 12.5px; border: 1px solid; }
 .pill.good { color: var(--good); } .pill.bad { color: var(--bad); } .pill.warn { color: var(--warn); }
+.stepwarn { color: var(--warn); margin: 6px 0; }
 .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: flex; align-items: center;
   justify-content: center; padding: 20px; z-index: 10; }
 .modal { background: var(--panel); border-radius: 12px; padding: 20px; width: 100%; max-width: 760px;
@@ -7865,6 +8084,15 @@ function credFields(l) {
   card.dataset.name = l.name;
   return card;
 }
+// How a step to apply by hand is labelled: from what its command does, never from its label
+function stepPill(e) {
+  if (e.kind !== "fix") return el("span", { className: "pill bad", textContent: "not run by the tool" });
+  return e.changes ? el("span", { className: "pill warn", textContent: "changes the system" })
+    : el("span", { className: "pill good", textContent: "read-only" });
+}
+function stepWarnings(card, e) {
+  for (const w of (e.warnings || [])) card.append(el("p", { className: "stepwarn", textContent: "\u26a0 " + w }));
+}
 function renderPlan(r) {
   $("#replyOut").hidden = false;
   $("#replyText").textContent = r.translated;
@@ -7877,12 +8105,11 @@ function renderPlan(r) {
   r.manual.forEach((e, i) => {
     const msg = el("span", { className: "muted" });
     const card = el("div", { className: "card" },
-      el("div", { className: "row" }, el("b", { textContent: (i + 1) + ". " + e.label }),
-        el("span", { className: "pill " + (e.kind === "fix" ? "warn" : "bad"),
-          textContent: e.kind === "fix" ? "changes the system" : "not run by the tool" })),
+      el("div", { className: "row" }, el("b", { textContent: (i + 1) + ". " + e.label }), stepPill(e)),
       el("p", { textContent: "On: " + hostNames(e.targets) }));
     if (e.reason) card.append(el("p", { className: "muted", textContent:
       "It was requested as a read-only check, but " + e.reason + ". Run it yourself only if you agree with it." }));
+    stepWarnings(card, e);
     if (e.note) card.append(el("p", { textContent: e.note }));
     card.append(el("pre", { textContent: e.command }),
       el("div", { className: "actions" }, el("button", { className: "btn", textContent: "Copy command",
@@ -8063,10 +8290,9 @@ async function invPoll() {
   fixes.forEach((e, i) => {
     const msg = el("span", { className: "muted" });
     const card = el("div", { className: "card" },
-      el("div", { className: "row" }, el("b", { textContent: (i + 1) + ". " + e.label }),
-        /^verify|^check/i.test(e.label) ? el("span", { className: "pill good", textContent: "verification" })
-          : el("span", { className: "pill warn", textContent: "changes the system" })),
+      el("div", { className: "row" }, el("b", { textContent: (i + 1) + ". " + e.label }), stepPill(e)),
       el("p", { textContent: "On: " + hostNames(e.targets) }));
+    stepWarnings(card, e);
     if (e.note) card.append(el("p", { textContent: e.note }));
     card.append(el("pre", { textContent: e.command }), el("div", { className: "actions" },
       el("button", { className: "btn", textContent: "Copy command", onclick: () => copyText(e.command, msg) }), msg));

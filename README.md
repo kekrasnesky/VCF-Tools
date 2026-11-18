@@ -469,6 +469,14 @@ You stay in the conversation:
 - **Fixes as a script:** fix steps are exact commands for the named hosts. **Copy all fixes as one
   script** copies them in order, with the host, impact and rollback note above each block, and a
   verification step after each fix.
+- **Checks on fix steps:** each fix is labelled by what its command does ("changes the system"
+  or "read-only"), not by its title, and carries warnings where it needs a second look: a
+  password, token or Authorization header written by the AI (always made up: the AI never knows
+  your passwords), certificate checking turned off, a shell command aimed at an NSX Manager whose
+  login opens the NSX CLI, a command that needs root on a login without sudo, or a "Verify ..."
+  step that changes something. A requested diagnostic that contains a credential is refused, and
+  placeholders in the reply that are in none of your reports are listed, so nothing is applied
+  with an untranslated name.
 - **After a fix:** paste what happened (choose "Result of the fixes I applied") and the AI checks
   the result or continues. You can also ask follow-up questions at any time, and the AI can ask
   you questions when it needs something only a person knows.

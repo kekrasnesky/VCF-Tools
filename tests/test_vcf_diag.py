@@ -2769,6 +2769,7 @@ class ReportFindings(unittest.TestCase):
         nsx = _tgt("nsxmgr-01", [_res(("nsx-node", "N"), "Memory",
                                       "total 23.5 GiB, available 2.8 GiB (12%), free 0.7 GiB\nswap: none configured")],
                    mode="nsxcli")
+        nsx.sec = {"name": "nsx", "type": "nsx"}
         esx = _tgt("esxi-mgmt-01", [_res(("passwords", "P"), "Password age (days)",
                                          "root                 changed 20 days ago, max age 90 days\n"
                                          "nsx-user             changed 211 days ago, max age 90 days\n")])
@@ -2788,7 +2789,9 @@ class ReportFindings(unittest.TestCase):
         self.assertEqual(got[0], ("high", "supervisor-01", "cluster ns-0011/vks-01 AVAILABLE False, CP ready 0/4"))
         self.assertIn(("med", "supervisor-01", "cluster ns-0013/vks-02 CP ready 2/3"), got)
         self.assertIn(("med", "vcenter-01", "filesystem /storage/archive at 95%"), got)
-        self.assertIn(("med", "nsxmgr-01", "memory available 12%"), got)
+        # NSX Manager keeps most memory in use by design: worth a note, not a "med" finding
+        self.assertIn(("info", "nsxmgr-01", "memory available 12% (normal for NSX Manager, whose services keep "
+                                            "most memory in use)"), got)
         self.assertIn(("low", "vcenter-01", "swap in use: 7.8 GiB"), got)
         self.assertIn(("low", "esxi-mgmt-01", "password older than its maximum age: nsx-user 211d > 90d"), got)
         self.assertEqual(got[-1], ("info", "all 3 hosts of [vcfmgmt:mgmt]", "failed systemd unit(s): cap_init.service"))
@@ -3052,3 +3055,171 @@ class TransportZoneReferences(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AnalystReplyChecks(unittest.TestCase):
+    """Problems found in a 1.20.0 report and in an AI reply to it (all names invented)."""
+
+    INV = ("[nsx]\nhosts = nsx01.corp.example-widgets.com\n"
+           "[sddc]\nhosts = sddc01.corp.example-widgets.com\n")
+
+    def prep(self, reply, extra=()):
+        import argparse
+        d = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, d)
+        inv = os.path.join(d, "inventory.ini")
+        with open(inv, "w") as fh:
+            fh.write(self.INV)
+        m = v.Mapping(os.path.join(d, "private", "mapping.json"))
+        sc = v.Scrubber(m)
+        sc.learn_host("nsx01.corp.example-widgets.com", prefix="nsxmgr")
+        sc.learn_host("sddc01.corp.example-widgets.com", prefix="sddcmgr")
+        for cat, real in extra:
+            m.get(cat, real)
+        m.save()
+        return v.prepare_plan(argparse.Namespace(inventory=inv, private_dir=os.path.join(d, "private")), reply)
+
+    # --- report side -----------------------------------------------------------------
+    def test_ntp_with_a_positive_offset_is_synced(self):
+        out = v.post_ntpq_peers(
+            "     remote           refid      st t when poll reach   delay   offset  jitter\n"
+            "==============================================================================\n"
+            "*ntp1.corp.examp .GPS.            1 u  161 1024  377    0.458   +0.501   0.304\n"
+            "+ntp2.corp.examp .GPS.            1 u  479 1024  377    0.374   +0.522   0.361\n")
+        self.assertEqual(v._fact_ntp(out), [("ntp_synced", "yes, stratum 1"), ("ntp_offset_ms", 0.501)])
+        self.assertEqual(v._fact_ntp("remote refid\n=====\n+a .GPS. 1 u 1 64 377 0.1 -0.2 0.1\n"),
+                         [("ntp_synced", "no peer selected")])
+
+    def test_stale_quantity_in_the_mapping_is_not_replaced(self):
+        m = v.Mapping(None)
+        m.get("k8sobj", "10m", prefix="k8sobj")        # written by an older version from a kubectl AGE column
+        out = run(make(mapping=m), "/dev/sda2  10M  2.4M  7.6M  24% /boot/efi\npod age 10m")
+        self.assertIn("/dev/sda2  10M  2.4M", out)
+        self.assertNotIn("k8sobj", out.lower())
+
+    def test_environment_domain_on_its_own_is_a_domain(self):
+        sc = make()
+        sc.learn_domain("example-widgets.com")
+        out = run(sc, "name esx01.corp.example-widgets.com\nsearch corp.example-widgets.com\n"
+                      "other app.example-widgets.com")
+        dom = re.search(r"esxi-01\.(domain-\d+)", out).group(1)
+        self.assertIn("search %s\n" % dom, out)
+        self.assertRegex(out, r"other host-\d+\.domain-\d+")
+
+    def test_reference_tokens_are_kept_but_tokens_are_not(self):
+        out = run(make(), '{"errorCode":"X","referenceToken":"53TFGG"} reference_token=KR17KQ '
+                          '"token":"c2VjcmV0LXZhbHVlLTEyMw" access_token=abc.def.ghi')
+        self.assertIn('"referenceToken":"53TFGG"', out)
+        self.assertIn("reference_token=KR17KQ", out)
+        self.assertNotIn("c2VjcmV0", out)
+        self.assertNotIn("abc.def.ghi", out)
+
+    def test_profile_and_host_problems_are_one_finding(self):
+        got = v.merge_tz_problems([
+            "profile p1 (used by c1) references transport zone /x/tz-9: MISSING - gone",
+            "9 host transport node(s) reference transport zone /x/tz-9, which does not resolve",
+            "3 host transport node(s) reference transport zone /x/tz-7, which does not resolve"])
+        self.assertEqual(got, ["profile p1 (used by c1) references transport zone /x/tz-9: MISSING - gone - "
+                               "inherited by 9 host transport node(s)",
+                               "3 host transport node(s) reference transport zone /x/tz-7, which does not resolve"])
+
+    def test_sddc_log_check_drops_debug_lines(self):
+        c = find("sddc", "NSX transport zone / profile errors in SDDC Manager logs (last 3 days)")
+        self.assertIn("(DEBUG|TRACE)", c["cmd"])
+
+    def test_reply_rules_cover_shell_modes_and_credentials(self):
+        for text in (v.ANALYST_GUIDE, v.investigator_prompt(5, True)):
+            self.assertIn("nsxcli", text)
+            self.assertIn("certificate checks", text)
+            self.assertIn("no YAML", text)
+
+    # --- plan parsing and translation ----------------------------------------------------
+    def test_yaml_block_marker_and_indentation_are_kept(self):
+        st = v.parse_plan("```vcf-plan\n[fix] target=nsxmgr-01\nlabel: x\nrun: |\n"
+                          "  python3 -c \"\n  try:\n      print(1)\n  except Exception as e:\n      print(e)\n\n"
+                          "  print(2)\n  \"\nnote: a\n  b\n```")["steps"][0]
+        self.assertEqual(st["run"], 'python3 -c "\ntry:\n    print(1)\nexcept Exception as e:\n    print(e)\n\n'
+                                    'print(2)\n"')
+        self.assertEqual(st["note"], "a b")
+        st = v.parse_plan("```vcf-plan\n[collect] target=a\nrun: grep x f\n  | tail -n 5\n```")["steps"][0]
+        self.assertEqual(st["run"], "grep x f\n| tail -n 5")
+
+    def test_decoder_translates_after_a_hyphen_only(self):
+        m = v.Mapping(None)
+        uid = m.get("uuid", "1027ca04-0000-0000-0000-000000000001")
+        m.get("host", "realhost")              # host-0001
+        dec = v.Decoder(m)
+        self.assertEqual(dec("restored-tz-%s" % uid), "restored-tz-1027ca04-0000-0000-0000-000000000001")
+        self.assertEqual(dec("exthost-0001 host-0001"), "exthost-0001 realhost")
+        self.assertEqual(dec("ip-%s-2" % uid), "ip-%s-2" % uid)        # followed by -digit: not a placeholder
+        self.assertEqual(dec.unknown_placeholders(dec("host-0001 uuid-0999 ip-n9-h9 esxi-01")),
+                         ["uuid-0999", "ip-n9-h9"])
+
+    def test_step_credentials(self):
+        self.assertTrue(v.step_credential("headers={'Authorization': 'Basic YWRtaW46UGxhY2Vob2xkZXI='}"))
+        self.assertIn("base64", v.step_credential("echo YWRtaW46UGxhY2Vob2xkZXI= > /dev/null"))
+        self.assertTrue(v.step_credential("curl -u admin:VMware1! https://x/api"))
+        self.assertTrue(v.step_credential("python3 x.py --password Secret123"))
+        for ok in ("curl -u admin https://x/api", "curl -H \"X-Auth-Token: $TOKEN\" https://x",
+                   "grep -i password /var/log/x.log", "chage -l root", "echo password=<your password>",
+                   "get cluster status", "grep -c 'referenceToken' /var/log/x"):
+            self.assertIsNone(v.step_credential(ok), ok)
+
+    def test_ai_reply_from_the_report(self):
+        reply = """```vcf-plan
+plan: fix
+[collect] target=nsxmgr-01
+label: profiles via python
+run: python3 -c "import urllib.request; urllib.request.Request('https://localhost/policy/api/v1/infra/host-transport-node-profiles', headers={'Authorization': 'Basic YWRtaW46UGxhY2Vob2xkZXI='})"
+
+[collect] target=nsxmgr-01
+label: disk
+run: df -h
+
+[fix] target=nsxmgr-01
+label: recreate the missing transport zone
+run: |
+  python3 -c "
+  import urllib.request, ssl
+  ctx = ssl.create_default_context()
+  ctx.verify_mode = ssl.CERT_NONE
+  data = {'display_name': 'restored-tz-uuid-0001'}
+  req = urllib.request.Request(url, headers={'Authorization': 'Basic YWRtaW46UGxhY2Vob2xkZXI='}, method='PUT')
+  try:
+      urllib.request.urlopen(req, context=ctx)
+  except Exception as e:
+      print(e)
+  "
+note: impact: x
+
+[fix] target=sddcmgr-01
+label: Verify SDDC Manager and NSX synchronization
+run: systemctl restart domainmanager.service operationsmanager.service
+note: rollback: none
+
+[fix] target=sddcmgr-01
+label: Verify the services
+run: systemctl is-active domainmanager.service
+```"""
+        p = self.prep(reply, extra=[("uuid", "1027ca04-0000-0000-0000-000000000001")])
+        blocked = [e for e in p["manual"] if e["kind"] == "blocked"]
+        self.assertEqual(len(blocked), 1)
+        self.assertIn("Authorization header", blocked[0]["reason"])
+        self.assertTrue(any("nsx login opens the NSX CLI" in pr and "(disk)" in pr for pr in p["problems"]))
+        fixes = [e for e in p["manual"] if e["kind"] == "fix"]
+        tz, restart, verify = fixes
+        self.assertIn("\n    urllib.request.urlopen(req, context=ctx)\n", tz["command"])   # indentation kept
+        self.assertNotIn("\n|", "\n" + tz["command"])
+        self.assertIn("restored-tz-1027ca04-0000-0000-0000-000000000001", tz["command"])
+        w = " ".join(tz["warnings"])
+        self.assertIn("Authorization header", w)
+        self.assertIn("certificate checking", w)
+        self.assertIn("opens the NSX CLI", w)
+        self.assertTrue(tz["changes"])
+        self.assertEqual(restart["changes"], "it can change a service")
+        w = " ".join(restart["warnings"])
+        self.assertIn("labelled as a verification, but it changes the system", w)
+        self.assertIn("has no sudo: run it as root", w)
+        self.assertEqual((verify["changes"], verify["warnings"]), ("", []))
+        script = v.plan_as_script(fixes)
+        self.assertIn("#    WARNING: It is labelled as a verification", script)
