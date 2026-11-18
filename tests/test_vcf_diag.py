@@ -2385,5 +2385,125 @@ class ReportDigest(unittest.TestCase):
         self.assertNotIn("**Password expiry: admin**", rep)
 
 
+FAKE_KUBECTL = r"""#!/bin/sh
+a="$*"
+case "$a" in
+  "get ns --no-headers -o custom-columns=:metadata.name") printf 'default\nkube-system\nprelude\nvmsp-platform\nwidgets-team\n';;
+  "get pods -A --no-headers"|"get pods -A -o wide --no-headers") printf '%s\n' \
+    'kube-system coredns-1 1/1 Running 0 5d 10.0.0.1 node1' \
+    'prelude provisioning-service-app-7f 1/1 Running 3 5d 10.0.0.2 node1' \
+    'prelude ebs-app-5c 0/1 CrashLoopBackOff 42 5d 10.0.0.3 node2' \
+    'prelude postgres-0 1/1 Running 0 5d 10.0.0.4 node2' \
+    'widgets-team web-1 0/1 Pending 0 1d 10.0.0.6 node1';;
+  "get deploy,sts -A --no-headers") printf 'prelude deployment.apps/ebs-app 0/1 1 0 5d\nkube-system deployment.apps/coredns 1/2 2 1 5d\n';;
+  "get pvc -A --no-headers") printf 'prelude data-postgres-0 Bound pvc-1 20Gi RWO sc 5d\n';;
+  get\ events*) printf 'prelude 2m Warning BackOff pod/ebs-app-5c Back-off\n';;
+  get\ pods\ -n\ *jsonpath*) printf 'registry.example/vmware/ebs:9.0.1.0-123\n';;
+  get\ pods\ -n\ prelude\ --field-selector*) printf 'pod/ebs-app-5c\npod/provisioning-service-app-7f\n';;
+  get\ pods\ -n\ *) ;;
+  logs\ -n\ prelude\ pod/ebs-app-5c*) printf 'INFO ok\nERROR db connection refused\njava.lang.IllegalStateException: x\n';;
+  logs*) printf 'INFO fine\nterror-free line\n';;
+  get\ ingress*) ;;
+  *) echo "unhandled: $a" >&2; exit 1;;
+esac
+"""
+
+
+class Automation(unittest.TestCase):
+    """VCF Automation component: wiring, namespace option and the shell checks themselves."""
+
+    def test_component_and_inventory(self):
+        c = v.COMPONENTS["vcfa"]
+        self.assertEqual((c["user"], c["prefix"], c["sudo"]), ("vmware-system-user", "vcfa", "auto"))
+        self.assertEqual([g[0] for g in c["groups"]][:2], ["vcfa-services", "vcfa-detail"])
+        self.assertIn("k8s-cluster", [g[0] for g in c["groups"]])
+        self.assertIn("vcfa", v.K8S_TYPES)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "i.ini")
+            with open(path, "w") as fh:
+                fh.write("[vcfa]\nhosts = 10.1.1.5\nnamespaces = prelude, vmsp-*\n[vcfa:b]\nhosts = 10.1.1.6\n")
+            _, sections, _ = v.load_inventory(path)
+            self.assertEqual(sections[0]["user"], "vmware-system-user")
+            self.assertEqual(sections[0]["namespaces_rx"], "^(prelude|vmsp-.*)$")
+            self.assertIsNone(sections[1]["namespaces_rx"])
+            with open(path, "w") as fh:
+                fh.write("[vcfa]\nhosts = 10.1.1.5\nnamespaces = a;rm\n")
+            with self.assertRaises(BaseException):
+                v.load_inventory(path)
+
+    def test_settings_round_trip_keeps_namespaces(self):
+        text = v.INVENTORY_TEMPLATE.replace("[vcfa]\nhosts =\n", "[vcfa]\nhosts = 10.1.1.5\nnamespaces = prelude\n")
+        model = v.read_settings_model(text)
+        g = [x for x in model["groups"] if x["type"] == "vcfa"][0]
+        self.assertEqual(g["namespaces"], "prelude")
+        self.assertIn("namespaces = prelude", v.render_settings_model(model))
+
+    def run_checks(self, nsrx=None):
+        out = {}
+        with tempfile.TemporaryDirectory() as d:
+            k = os.path.join(d, "kubectl")
+            with open(k, "w") as fh:
+                fh.write(FAKE_KUBECTL)
+            os.chmod(k, 0o755)
+            for g in v.AUTOMATION_GROUPS:
+                for c in g[2]:
+                    if c["mode"] != "kubectl":
+                        continue
+                    cmd = c["cmd"].replace("{K}", k).replace(
+                        "{NSRX}", v.shlex.quote(nsrx or v.AUTOMATION_NS_DEFAULT))
+                    r = v.subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, timeout=60)
+                    self.assertEqual((r.returncode, r.stderr), (0, ""), c["label"])
+                    out[c["label"]] = r.stdout
+        return out
+
+    def test_checks_look_only_at_automation_namespaces(self):
+        out = self.run_checks()
+        self.assertIn("prelude CrashLoopBackOff 1", out["Automation namespaces and pod states"])
+        self.assertNotIn("widgets-team", "".join(out.values()))
+        self.assertNotIn("coredns", "".join(out.values()))
+        self.assertEqual(out["Automation pods not Running or not Ready"].split()[1], "ebs-app-5c")
+        self.assertIn("deployment.apps/ebs-app", out["Automation workloads below desired replicas"])
+        images = out["Automation container images (versions)"]
+        self.assertIn("2 ebs version 9.0.1.0-123", images)             # one per Automation namespace
+        self.assertIn("ebs version 9.0.1.0-123", run(make(keep=()), images))   # kept as a version, not an IP
+        self.assertNotIn("registry.example", images)                    # registry host dropped
+        self.assertIn("prelude postgres-0", out["Automation databases and volumes"])
+        logs = out["Errors in Automation pod logs (last 30 min)"]
+        self.assertIn("== prelude/ebs-app-5c: 2 error line(s)", logs)
+        self.assertIn("IllegalStateException", logs)
+        self.assertNotIn("provisioning-service", logs)                  # "terror-free" is not an error
+        self.assertIn("no ingress objects", out["Automation ingress hosts and certificates"])
+
+    def test_missing_namespaces_are_explained(self):
+        out = self.run_checks(v.automation_ns_regex("nothing-here"))
+        for text in out.values():
+            self.assertTrue(text.startswith("No VCF Automation namespaces found"), text)
+        self.assertEqual(v.KEY_FACTS["Automation pods not Running or not Ready"](text),
+                         [("automation_namespaces", "none found")])
+
+    def test_run_catalog_fills_in_the_namespace_pattern(self):
+        t = v.Target.__new__(v.Target)
+        t.mode, t.clock_offset = "sh", None
+        t.sec = {"type": "vcfa", "namespaces_rx": "^(prelude)$"}
+        t.kube = {"kubectl": "kubectl", "kubeconfig": None, "sudo": None}
+        seen = []
+        t.sh = lambda command, timeout, sudo=None: (seen.append(command) or (0, "none\n", False))
+        c = v.AUTOMATION_GROUPS[0][2][1]
+        t.run_catalog(v.AUTOMATION_GROUPS[0], c)
+        self.assertIn("grep -E '^(prelude)$'", seen[0])
+        self.assertNotIn("{NSRX}", seen[0])
+        self.assertNotIn("{K}", seen[0])
+
+    def test_key_facts(self):
+        K = v.KEY_FACTS
+        self.assertEqual(K["Automation pods not Running or not Ready"]("none"), [("automation_pods_not_ready", 0)])
+        self.assertEqual(K["Errors in Automation pod logs (last 30 min)"]("== prelude/a: 2 error line(s)\n   x\n"),
+                         [("automation_pods_with_log_errors", 1)])
+        certs = dict(K["Automation ingress hosts and certificates"](
+            "== h\n   notAfter=Jan  5 12:00:00 2027 GMT\n   WARNING: the certificate expires within 30 days\n"))
+        self.assertEqual(certs["automation_cert_expires_first"], "2027-01-05")
+        self.assertEqual(certs["automation_cert_expiring_30d"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

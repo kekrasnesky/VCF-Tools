@@ -139,6 +139,7 @@ still asked), `--list` prints every check and the exact command behind it.
 | `[nsx]` | NSX Manager | `admin` | `admin` runs NSX CLI checks; `root` adds OS-level checks |
 | `[nsxedge]` | NSX Edge | `admin` | same model as NSX Manager, plus interfaces, tunnel ports, BFD sessions and datapath CPU |
 | `[opsnet]` | VCF Operations for networks platform and collector nodes | `support` | version, service status and SSH service (CLI), service health script, recent application-log errors, OS health; `consoleuser` runs the CLI checks only |
+| `[vcfa]` | VCF Automation nodes | `vmware-system-user` | pods, workloads, restarts and warning events in the Automation namespaces; container image versions; database pods and volumes; error lines in pod logs (last 30 min); certificates on the ingress hosts; `vracli status` where installed; plus the Kubernetes and node checks. Namespaces are found by name; set `namespaces = prelude, vmsp-*` to choose them |
 | `[sddc]` | SDDC Manager | `vcf` | add `escalate = su` to also run the checks that need root |
 | `[k8s]` | Kubernetes control-plane nodes: VCF services runtime, Operations, Automation, Supervisor | `vmware-system-user` | finds a working `kubectl` on its own (plain, `KUBECONFIG=/etc/kubernetes/admin.conf`, with `sudo`) |
 | `[vcfmgmt]` | VCF management cluster (VCF services runtime) | `vmware-system-user` | list the control-plane IPs; workers are discovered; service endpoints are checked (see below) |

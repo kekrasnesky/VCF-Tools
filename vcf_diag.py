@@ -57,7 +57,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
-VERSION = "1.17.0"
+VERSION = "1.18.0"
 
 # ----------------------------------------------------------------------------
 # Diagnostic catalog
@@ -907,6 +907,92 @@ def is_cluster_group(key):
     return key.startswith("k8s-") or key == "endpoints"
 
 
+# ----------------------------------------------------------------------------
+# VCF Automation: its own Kubernetes cluster, nodes reached as vmware-system-user.
+# The checks below look only at the Automation namespaces. {NSRX} is replaced at run
+# time by the namespace pattern (inventory option "namespaces", or the default below).
+# ----------------------------------------------------------------------------
+AUTOMATION_NS_DEFAULT = (r"^(prelude|vmsp-.*|vcfa.*|.*automation.*|tenant-manager.*|cci-.*|"
+                         r"provisioning.*|idem.*|abx.*)$")
+
+_VCFA_NS = ("NS=$({K} get ns --no-headers -o custom-columns=:metadata.name 2>/dev/null | grep -E {NSRX}"
+            " | tr '\\n' ' '); if [ -z \"$NS\" ]; then echo \"No VCF Automation namespaces found (pattern:"
+            " {NSRX}). Set 'namespaces = ...' in this inventory section.\"; exit 0; fi; ")
+# keep only rows whose first column (the namespace) is one of $NS
+_VCFA_IN = "awk -v ns=\" $NS\" 'index(ns, \" \"$1\" \")"
+_NONE = "out=$(%s); if [ -n \"$out\" ]; then echo \"$out\"; else echo none; fi"
+
+
+def _vcfa(label, body, **kw):
+    kw.setdefault("timeout", 90)
+    return kctl(label, _VCFA_NS + body, **kw)
+
+
+AUTOMATION_GROUPS = [
+    ("vcfa-services", "VCF Automation services (pods in the Automation namespaces only)", [
+        _vcfa("Automation namespaces and pod states",
+              "{K} get pods -A --no-headers 2>&1 | " + _VCFA_IN + " {c[$1\" \"$4]++} END{for(k in c) print k, c[k]}'"
+              " | sort", k8s="nsrows"),
+        _vcfa("Automation pods not Running or not Ready", _NONE % (
+              "{K} get pods -A -o wide --no-headers 2>&1 | " + _VCFA_IN +
+              " {split($3,a,\"/\"); if ($4!=\"Completed\" && ($4!=\"Running\" || a[1]!=a[2])) print}'"),
+              k8s="nsrows", max_lines=200),
+        _vcfa("Automation workloads below desired replicas", _NONE % (
+              "{K} get deploy,sts -A --no-headers 2>&1 | " + _VCFA_IN +
+              " {split($3,a,\"/\"); if (a[1]!=a[2]) print}'"), k8s="nsrows"),
+        _vcfa("Automation pods with restarts", _NONE % (
+              "{K} get pods -A --no-headers 2>&1 | " + _VCFA_IN + " && $5+0>0' | sort -k5 -n -r | head -n 25"),
+              k8s="nsrows"),
+        _vcfa("Automation warning events (latest 60)", _NONE % (
+              "{K} get events -A --field-selector type!=Normal --sort-by=.lastTimestamp --no-headers 2>&1 | "
+              + _VCFA_IN + "' | tail -n 60"), k8s="nsrows", max_lines=120),
+    ]),
+    ("vcfa-detail", "VCF Automation versions, databases, logs and certificates", [
+        _vcfa("Automation container images (versions)",
+              "for ns in $NS; do {K} get pods -n \"$ns\" -o jsonpath='{range .items[*]}{range .spec.containers[*]}"
+              "{.image}{\"\\n\"}{end}{end}' 2>/dev/null; done | sed 's#^.*/##; s#:\\([^:]*\\)$# version \\1#'"
+              " | sort | uniq -c | sort -k1 -n -r"
+              " | head -n 60", max_lines=80),
+        _vcfa("Automation databases and volumes",
+              "echo 'database pods:'; " + _NONE % (
+                  "{K} get pods -A -o wide --no-headers 2>&1 | " + _VCFA_IN +
+                  " && $2 ~ /postgres|pgsql|-db-|database/'") + "; echo; echo 'volume claims:'; " + _NONE % (
+                  "{K} get pvc -A --no-headers 2>&1 | " + _VCFA_IN + "'"), k8s="nsrows", max_lines=150),
+        _vcfa("Errors in Automation pod logs (last 30 min)", _NONE % (
+              "for ns in $NS; do for p in $({K} get pods -n \"$ns\" --field-selector=status.phase=Running -o name"
+              " 2>/dev/null); do e=$({K} logs -n \"$ns\" \"$p\" --all-containers --since=30m --tail=5000 2>/dev/null"
+              " | grep -iE '(^|[^a-z])(error|fatal|severe)([^a-z]|$)|exception'); n=$(printf '%s\\n' \"$e\" | grep -c .);"
+              " if [ \"$n\" -gt 0 ]; then echo \"== $ns/${p#pod/}: $n error line(s)\"; printf '%s\\n' \"$e\""
+              " | tail -n 2 | cut -c1-300 | sed 's/^/   /'; fi; done; done"),
+              k8s="nsslash", timeout=300, max_lines=300),
+        _vcfa("Automation ingress hosts and certificates",
+              "hosts=$(for ns in $NS; do {K} get ingress -n \"$ns\" -o jsonpath='{range .items[*]}"
+              "{range .spec.rules[*]}{.host}{\"\\n\"}{end}{end}' 2>/dev/null; done | grep . | sort -u | head -n 5);"
+              " if [ -z \"$hosts\" ]; then echo 'no ingress objects in the Automation namespaces'; exit 0; fi;"
+              " for h in $hosts; do echo \"== $h\"; c=$(echo | timeout 10 openssl s_client -connect \"$h:443\""
+              " -servername \"$h\" 2>/dev/null | openssl x509 2>/dev/null); if [ -z \"$c\" ]; then"
+              " echo '   no TLS answer on port 443'; continue; fi; printf '%s\\n' \"$c\" | openssl x509 -noout"
+              " -subject -issuer -enddate | sed 's/^/   /'; printf '%s\\n' \"$c\" | openssl x509 -noout"
+              " -checkend 2592000 >/dev/null || echo '   WARNING: the certificate expires within 30 days'; done",
+              timeout=120),
+        cmd("vracli status (if installed)",
+            "if command -v vracli >/dev/null 2>&1; then vracli version 2>&1 | head -n 5; vracli status 2>&1"
+            " | head -n 120; else echo 'vracli is not installed on this node'; fi", timeout=90, sudo=True),
+    ]),
+]
+
+
+def automation_ns_regex(value):
+    """Inventory 'namespaces = prelude, vmsp-*' -> an anchored regex; empty -> the default."""
+    names = [x for x in re.split(r"[\s,]+", value or "") if x]
+    bad = [x for x in names if not re.fullmatch(r"[a-z0-9*][a-z0-9.*-]*", x)]
+    if bad:
+        raise ValueError("namespace '%s' may only contain a-z, 0-9, '-', '.' and '*'" % bad[0])
+    if not names:
+        return AUTOMATION_NS_DEFAULT
+    return "^(%s)$" % "|".join(x.replace(".", r"\.").replace("*", ".*") for x in names)
+
+
 OPSNET_GROUPS = [
     ("opsnet-cli", "Operations for networks CLI (works as consoleuser or support)", [
         ncli("Version", "show-version"),
@@ -927,6 +1013,9 @@ OPSNET_GROUPS = [
     ]),
 ] + linux_groups()
 
+# component types whose nodes run Kubernetes: kubectl is detected and {K} is available
+K8S_TYPES = ("k8s", "vcfmgmt", "supervisor", "vcfa")
+
 COMPONENTS = {
     "esxi": {"title": "ESXi hosts", "user": "root", "prefix": "esxi", "groups": ESXI_GROUPS},
     "vcenter": {"title": "vCenter Server", "user": "root", "prefix": "vcenter",
@@ -938,6 +1027,8 @@ COMPONENTS = {
     "sddc": {"title": "SDDC Manager", "user": "vcf", "prefix": "sddcmgr", "groups": SDDC_GROUPS},
     "opsnet": {"title": "VCF Operations for networks (platform and collector nodes)", "user": "support",
                "prefix": "opsnet", "groups": OPSNET_GROUPS, "nsxcli": True, "nsxcli_wrap": "{c}"},
+    "vcfa": {"title": "VCF Automation nodes", "user": "vmware-system-user", "prefix": "vcfa",
+             "groups": AUTOMATION_GROUPS + K8S_GROUPS + MGMT_NODE_GROUPS, "sudo": "auto"},
     "k8s": {"title": "Kubernetes control plane (VCF services runtime, Operations, Automation)",
             "user": "vmware-system-user", "prefix": "k8snode",
             "groups": K8S_GROUPS + MGMT_NODE_GROUPS, "sudo": "auto"},
@@ -973,6 +1064,8 @@ INVENTORY_TEMPLATE = """\
 #   supervisor  vSphere Supervisor control plane (root; the vCenter check
 #            "Supervisor clusters" shows its address)
 #   opsnet   VCF Operations for networks platform / collector nodes (support or consoleuser)
+#   vcfa     VCF Automation nodes            (vmware-system-user; Automation-specific
+#            checks plus the Kubernetes and node checks)
 #   linux    Any other Linux appliance, e.g. Operations for logs
 #
 # Per-section options (all optional):
@@ -982,6 +1075,7 @@ INVENTORY_TEMPLATE = """\
 #   escalate   = su                 log in, then "su -" (asks for the root password)
 #   kubeconfig = /path/admin.conf   k8s only; auto-detected when omitted
 #   kubectl    = /path/to/kubectl   k8s only; default "kubectl"
+#   namespaces = prelude, vmsp-*    vcfa only; Automation namespaces (default: found by name)
 
 [settings]
 # anonymize = no      keep real names and addresses in reports (secrets are still redacted)
@@ -1017,6 +1111,10 @@ hosts =
 [opsnet]
 hosts =
 # user = support        (consoleuser runs the CLI checks only)
+
+[vcfa]
+hosts =
+# user = vmware-system-user        namespaces = prelude, vmsp-*
 
 [nsxedge]
 hosts =
@@ -2100,7 +2198,7 @@ class Target:
                 self.sudo = self._detect_sudo()
                 if want == "yes" and not self.sudo:
                     self.notes.append("sudo was requested but is not available for this user")
-            if self.sec["type"] in ("k8s", "vcfmgmt", "supervisor"):
+            if self.sec["type"] in K8S_TYPES:
                 self._detect_kubectl()
         return True
 
@@ -2185,6 +2283,8 @@ class Target:
                 res.update(status="skipped", note=self.kube_note or "kubectl is not available")
                 return res
             command = command.replace("{K}", self.kube["kubectl"])
+            if "{NSRX}" in command:
+                command = command.replace("{NSRX}", shlex.quote(self.sec.get("namespaces_rx") or AUTOMATION_NS_DEFAULT))
             res["cmd"] = command
             pre = "export KUBECONFIG=%s; " % shlex.quote(self.kube["kubeconfig"]) \
                 if self.kube["kubeconfig"] else ""
@@ -2914,12 +3014,17 @@ def load_inventory(path):
         esc = (s.get("escalate") or "").strip().lower() or None
         if esc not in (None, "su"):
             die("inventory: [%s] escalate must be 'su' or omitted" % name)
+        try:
+            nsrx = automation_ns_regex(s.get("namespaces")) if s.get("namespaces", "").strip() else None
+        except ValueError as e:
+            die("inventory: [%s] %s" % (name, e))
         sections.append({
             "name": name, "type": typ, "label": label, "prefix": prefix, "hosts": hosts,
             "user": (s.get("user") or COMPONENTS[typ]["user"]).strip(),
             "port": int(s.get("port", "22")), "sudo": sudo, "escalate": esc,
             "kubeconfig": (s.get("kubeconfig") or "").strip() or None,
             "kubectl": (s.get("kubectl") or "").strip() or None,
+            "namespaces_rx": nsrx,
             "ssh_options": shlex.split(s.get("ssh_options", "")),
             "ssh_workers": (s.get("ssh_workers") or "no").strip().lower() in ("yes", "true", "1"),
             "sso_user": (s.get("sso_user") or ("admin" if typ == "nsx" else "administrator@vsphere.local")).strip(),
@@ -2950,7 +3055,7 @@ AI_FIELDS = [("profile", ""), ("genai_model", ""), ("capra_model", ""),
              ("timeout", "600"), ("max_report_chars", "150000"), ("max_context_chars", "400000"), ("ca_file", ""),
              ("tls_verify", "yes"), ("use_proxy", "yes"), ("proxy", ""), ("key_env", "")]
 GROUP_FIELDS = ["user", "port", "sudo", "escalate", "kubeconfig", "kubectl", "ssh_workers", "sso_user", "ca_file",
-                "tls_verify", "api_base", "ssh_options"]
+                "tls_verify", "api_base", "ssh_options", "namespaces"]
 STANDARD_MGMT_SERVICES = ["VCF Operations", "VCF Operations for networks", "VCF Automation", "VCF services runtime",
                           "Fleet lifecycle", "Log management", "Salt RaaS", "Software depot", "Real-time metrics",
                           "Real-time metrics store", "Salt master", "SDDC lifecycle", "Telemetry"]
@@ -3514,7 +3619,46 @@ def _fact_nsx_users(out):
     return [("account_expiry_soonest", "%s in %d days" % (min(due)[1], min(due)[0]))] if due else []
 
 
+def _vcfa_fact(key, count):
+    """Key fact from an Automation check; reports a missing namespace once, as its own fact."""
+    def fn(out):
+        if out.startswith("No VCF Automation namespaces found"):
+            return [("automation_namespaces", "none found")]
+        return [(key, count(out))]
+    return fn
+
+
+def _rows(out):
+    return 0 if out.strip() == "none" else len([ln for ln in out.splitlines() if ln.strip()])
+
+
+def _fact_vcfa_certs(out):
+    if out.startswith("No VCF Automation namespaces found"):
+        return [("automation_namespaces", "none found")]
+    ends = re.findall(r"notAfter=(.+)", out)
+    f = [("automation_certs_checked", len(ends))] if ends else []
+    if ends:
+        dates = []
+        for e in ends:
+            try:
+                dates.append(datetime.datetime.strptime(e.strip().replace("  ", " "), "%b %d %H:%M:%S %Y %Z"))
+            except ValueError:
+                pass
+        if dates:
+            f.append(("automation_cert_expires_first", min(dates).strftime("%Y-%m-%d")))
+    if "expires within 30 days" in out:
+        f.append(("automation_cert_expiring_30d", out.count("expires within 30 days")))
+    if "no TLS answer" in out:
+        f.append(("automation_hosts_without_tls", out.count("no TLS answer")))
+    return f
+
+
 KEY_FACTS = {
+    "Automation pods not Running or not Ready": _vcfa_fact("automation_pods_not_ready", _rows),
+    "Automation workloads below desired replicas": _vcfa_fact("automation_workloads_below_desired", _rows),
+    "Errors in Automation pod logs (last 30 min)": _vcfa_fact(
+        "automation_pods_with_log_errors", lambda o: len(re.findall(r"(?m)^== ", o))),
+    "Automation ingress hosts and certificates": _fact_vcfa_certs,
     "Version": lambda o: [("version", m.group(1)) for m in [re.search(r"Version (\S+)", o)] if m],
     "Uptime": _fact_uptime,
     "CPU": lambda o: [("cpus", int(m.group(1))) for m in [re.match(r"(\d+) logical CPU", o)] if m],
@@ -4227,7 +4371,7 @@ def prepare_plan(args, text, require_mapping=True):
         if not resolved:
             continue
         if re.search(r"(?:^|[|;&(`]\s*|\$\(\s*)kubectl\s", st["run"]) and \
-                any(s["type"] in ("k8s", "vcfmgmt", "supervisor") for s, a, ph in resolved):
+                any(s["type"] in K8S_TYPES for s, a, ph in resolved):
             st["run"] = re.sub(r"(^|[|;&(`]\s*|\$\(\s*)kubectl(?=\s)", r"\1{K}", st["run"])
             entry["command"] = dec(st["run"])
         modes = {}
@@ -6267,10 +6411,15 @@ function groupCard(g) {
     el("label", { className: "f" }, "After login", Object.assign(sel([["", "use the login as is"],
       ["su", "switch to root with su (asks for the root password)"]], g.escalate || ""), { className: "gesc" })));
   card.append(f);
-  if (g.type === "k8s" || g.type === "vcfmgmt" || g.type === "supervisor")
+  if (g.type === "k8s" || g.type === "vcfmgmt" || g.type === "supervisor" || g.type === "vcfa")
     card.append(el("div", { className: "fields" },
       el("label", { className: "f" }, "kubeconfig path (empty = find automatically)", inp("text", g.kubeconfig, { className: "gkcfg" })),
       el("label", { className: "f" }, "kubectl command", inp("text", g.kubectl, { placeholder: "kubectl", className: "gkctl" }))));
+  if (g.type === "vcfa")
+    card.append(el("div", { className: "fields" },
+      el("label", { className: "f" }, "Automation namespaces (empty = find automatically; * allowed)",
+        inp("text", g.namespaces, { placeholder: "prelude, vmsp-*", className: "gns" }))),
+      el("p", { className: "muted", textContent: "Log in as vmware-system-user (sudo is used for kubectl when needed)." }));
   if (g.type === "vcenter" || g.type === "nsx" || g.type === "sddc") {
     const nsx = g.type !== "vcenter";
     card.append(el("div", { className: "fields" },
@@ -6352,7 +6501,7 @@ function collectSettings() {
     const g = Object.assign({ type: card.dataset.type, label: v(".glabel"),
       hosts: $(".ghosts", card).value.split(/[\s,]+/).map(x => x.trim()).filter(Boolean),
       user: v(".guser"), port: v(".gport"), sudo: v(".gsudo"), escalate: v(".gesc"), kubeconfig: v(".gkcfg"),
-      kubectl: v(".gkctl"), sso_user: v(".gsso"), ca_file: v(".gca"), endpoints: [] }, card._extra);
+      kubectl: v(".gkctl"), namespaces: v(".gns"), sso_user: v(".gsso"), ca_file: v(".gca"), endpoints: [] }, card._extra);
     if ($(".gtls", card)) g.tls_verify = $(".gtls", card).checked ? "yes" : "no";
     if ($(".gworkers", card)) g.ssh_workers = $(".gworkers", card).checked ? "yes" : "no";
     for (const r of $$(".eprow", card)) g.endpoints.push({ service: $(".epsvc", r).value.trim(), endpoint: $(".epname", r).value.trim() });
