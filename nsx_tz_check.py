@@ -67,6 +67,7 @@ class ApiError(Exception):
     def __init__(self, status, method, path, body):
         super().__init__(f"{method} {path} -> HTTP {status}: {body}")
         self.status = status
+        self.body = body
 
 
 class Api:
@@ -484,8 +485,12 @@ def sddc_login(host, user, ctx):
         tok = api.req("POST", "/v1/tokens", {"username": user,
                                              "password": password_for("SDDC_PASSWORD", f"Password for {user}@{host}: ")})
     except ApiError as e:
-        raise SystemExit(f"error: SDDC Manager login failed for {user} (HTTP {e.status}). "
-                         "Use an account with the ADMIN role, e.g. administrator@vsphere.local or admin@local.")
+        detail = " ".join((e.body or "").split())[:400]
+        raise SystemExit(f"error: SDDC Manager login failed for {user} (HTTP {e.status}).\n"
+                         + (f"  SDDC Manager said: {detail}\n" if detail else "")
+                         + "  Use an account with the ADMIN role in SDDC Manager: --sddc-user admin@local, your own "
+                         "directory account, or administrator@<your SSO domain> (it may not be vsphere.local). "
+                         "Repeated failures can lock an SSO account for a few minutes.")
     api.auth = "Bearer " + tok["accessToken"]
     return api
 
