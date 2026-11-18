@@ -2909,7 +2909,7 @@ FAKE_HOSTCFG = {
          "realization_id": TZ_OVL},
         {"id": "widgets-vlan-tz", "display_name": "widgets-vlan-tz", "tz_type": "VLAN_BACKED",
          "path": PATH + "widgets-vlan-tz", "realization_id": TZ_VLAN_MP}]},
-    "/api/v1/transport-zones?page_size=500": {"results": [
+    "/api/v1/transport-zones?page_size=500&include_system_owned=true": {"results": [
         {"id": TZ_OVL, "display_name": "widgets-overlay-tz", "transport_type": "OVERLAY"},
         {"id": TZ_VLAN_MP, "display_name": "widgets-vlan-tz", "transport_type": "VLAN"}]},
     "/api/v1/fabric/compute-collections?page_size=500": {"results": [

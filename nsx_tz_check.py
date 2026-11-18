@@ -180,7 +180,7 @@ def collect(nsx, log=print):
                 inv["tz_ids"][tz[key]] = tz
 
     try:
-        inv["mp_tzs"] = {t["id"]: t for t in nsx.list_all("/api/v1/transport-zones")}
+        inv["mp_tzs"] = {t["id"]: t for t in nsx.list_all("/api/v1/transport-zones?include_system_owned=true")}
     except ApiError as e:
         inv["mp_tzs"] = None
         inv["notes"].append(f"manager API transport zone list not available ({e.status}): "
@@ -292,7 +292,9 @@ def report(inv, f, search_ids):
         print(f"\n  PROBLEM profile {tnp.get('display_name')!r} (id {tnp.get('id')})")
         print(f"    host switch {item['hs']!r} lists transport zone {item['ref']}")
         print(f"    -> {STATUS_TEXT[item['status']]}"
-              + (f": {item['tz'].get('display_name')!r} {item['tz'].get('path', '')}" if item["tz"] else ""))
+              + (f": {item['tz'].get('display_name')!r} {item['tz'].get('path', '')}" if item["tz"] else "")
+              + (" (system-owned: NSX created it and keeps it out of the policy API)"
+                 if item["tz"] and item["tz"].get("_system_owned") else ""))
         users = clusters_using(inv, tnp)
         print("    used by clusters: " + (", ".join(name for _, name in users) or "none"))
         keep = [ep.get("transport_zone_id") for hs, ep in tz_endpoints(tnp)

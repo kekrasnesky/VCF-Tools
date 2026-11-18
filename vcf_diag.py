@@ -3315,7 +3315,7 @@ def nsx_host_config(api):
         for z in api.paged((POLICY_EP % (site, ep)) + "/transport-zones"):
             z.setdefault("path", "/infra/sites/%s/enforcement-points/%s/transport-zones/%s" % (site, ep, z.get("id")))
             ptz.append(z)
-    mtz = api.paged("/api/v1/transport-zones?page_size=500")
+    mtz = api.paged("/api/v1/transport-zones?page_size=500&include_system_owned=true")
     by_path = {z.get("path"): z for z in ptz}
     by_pid = {z.get("id"): z for z in ptz}
     by_alt = {}
