@@ -193,6 +193,53 @@ class Harvest(unittest.TestCase):
                      "v1.31.4+vmware.1", "NotReady,SchedulingDisabled"):
             self.assertIn(keep, out)
 
+    def test_event_ages_and_quantities_are_never_learned_as_names(self):
+        # Regression: cols[1] of "kubectl get events -A" is LAST SEEN (10m, 11m ...); these were
+        # learned as k8s object names and then replaced everywhere (df sizes, top pods CPU ...).
+        sc = make()
+        events = ("NAMESPACE   LAST SEEN   TYPE      REASON      OBJECT                     MESSAGE\n"
+                  "widgets-ns  10m         Warning   Unhealthy   pod/ledger-api-7f6d5c4b3   Readiness probe failed\n"
+                  "widgets-ns  11m         Warning   BackOff     pod/ledger-db-0            Back-off restarting\n"
+                  "widgets-ns  2d3h        Warning   Failed      pod/ledger-db-1            failed\n")
+        noheader = "widgets-ns   14m   Warning   Unhealthy   pod/ledger-api-7f6d5c4b3   probe failed\n"
+        top = ("NAMESPACE NAME CPU(cores) MEMORY(bytes)\n"
+               "widgets-ns pgdatabase-0 250m 2236Mi\n")
+        sc.learn_k8s("nsrows", events)
+        sc.learn_k8s("nsrows", noheader)
+        sc.learn_k8s("nsrows", top)
+        for q in ("10m", "11m", "14m", "2d3h", "250m", "2236Mi", "10M", "15%"):
+            self.assertIsNone(sc.learn_term("k8sobj", q), q)
+        df = ("Filesystem Size Used Avail Use% Mounted on\n"
+              "/dev/sda2 10M 2.0M 8.0M 20% /boot/efi\ntmpfs 3.9G 11M 3.9G 1% /run\n")
+        out = run(sc, events + noheader + top + df)
+        self.assertNotIn("K8SOBJ", out)
+        self.assertEqual(len(sc.m.maps.get("k8sobj", {})), 4)      # the four pod names, nothing else
+        for keep in (" 10m ", " 11m ", " 2d3h ", "250m 2236Mi", "/dev/sda2 10M 2.0M", "tmpfs 3.9G 11M"):
+            self.assertIn(keep, out)
+        for gone in ("ledger-api", "ledger-db", "pgdatabase-0", "widgets-ns"):
+            self.assertNotIn(gone, out)
+
+    def test_nsrows_learns_the_name_column_only_where_the_header_has_one(self):
+        sc = make()
+        sc.learn_k8s("nsrows", "NAMESPACE   LAST SEEN   TYPE   REASON   OBJECT   MESSAGE\n"
+                               "widgets-ns  33s   Warning   FailedMount   widgetsvol   nope\n")
+        self.assertIsNone(sc.m.lookup("k8sobj", "33s"))
+        self.assertIsNone(sc.m.lookup("k8sobj", "warning"))
+        sc.learn_k8s("nsrows", "NAMESPACE NAME READY STATUS\nwidgets-ns ledger-api-1 1/1 Running\n")
+        self.assertTrue(sc.m.lookup("k8sobj", "ledger-api-1"))
+
+    def test_vib_versions_are_not_ip_addresses(self):
+        sc = make()
+        vibs = ("nsx-python-protobuf   4.2.1.0-9.1.24837353   VMware  VMwareCertified  2025-03-01\n"
+                "nsx-esx-datapath      9.1.0.0-0.0.24837353   VMware  VMwareCertified  2025-03-01\n"
+                "range 10.40.1.10-10.40.1.20 host 10.40.1.5\n")
+        out = run(sc, vibs)
+        self.assertIn("4.2.1.0-9.1.24837353", out)
+        self.assertIn("9.1.0.0-0.0.24837353", out)
+        for gone in ("10.40.1.10", "10.40.1.20", "10.40.1.5"):
+            self.assertNotIn(gone, out)
+
+
 
 class MappingAndTools(unittest.TestCase):
     def test_mapping_is_stable_across_runs_and_private(self):

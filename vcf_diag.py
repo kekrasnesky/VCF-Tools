@@ -1394,6 +1394,12 @@ RX_DN_LINE = re.compile(r"(?i)\b(?:subject|issuer)\b|\bCN\s*=")
 RX_DN_ATTR = re.compile(r"\b(CN|OU|O|L|ST|C|DC|emailAddress)(\s*=\s*)([^,/\n\"+;]+)")
 RX_FQDN_ANY = re.compile(r"(?i)(?<![A-Za-z0-9_])((?:%s\.)+)(%s)(?![A-Za-z0-9_-])(?!\.[A-Za-z0-9_])"
                          % (LABEL, "|".join(GENERIC_TLDS + CC_TLDS)))
+# Durations, ages and resource quantities that appear in kubectl / df tables (10m, 2d3h, 250m,
+# 2236Mi, 15%, 1.5G). They are never names, and learning them would replace them everywhere.
+RX_QUANTITY = re.compile(r"(?i)(?:\d+(?:\.\d+)?(?:ns|us|ms|s|m|h|d|w|y|ki|mi|gi|ti|pi|k|g|t|p|b|kb|mb|gb|tb|%)?"
+                         r"|(?:\d+[smhdwy])+|<(?:unknown|none|invalid)>)")
+# A dotted quad that starts a package version (VIB "4.2.1.0-9.1.24837353", "1.2.3.4-0.0.123")
+RX_QUAD_VERSION_TAIL = re.compile(r"-\d+(?:\.\d+)*")
 RX_DOTTED_QUAD = re.compile(r"(?<![\w.])\d{1,3}(?:\.\d{1,3}){3}(?!\.?\d)(?!\w)")
 
 OBJECT_CATS = {"edgecl": "edgecluster", "vcluster": "vcluster", "datastore": "datastore", "portgroup": "portgroup", "dvs": "dvs", "vm": "vm",
@@ -1449,7 +1455,7 @@ class Scrubber:
 
     def learn_term(self, cat, value):
         v = value.strip()
-        if len(v) < 3 or v.lower() in DEFAULT_OBJECT_NAMES or v.isdigit():
+        if len(v) < 3 or v.lower() in DEFAULT_OBJECT_NAMES or v.isdigit() or RX_QUANTITY.fullmatch(v):
             return None
         if re.fullmatch(r"(?i)(vSwitch|vmk|vmnic|vusb|eth|ens)\d+", v):
             return None
@@ -1469,9 +1475,15 @@ class Scrubber:
 
     def learn_k8s(self, kind, text, prefix="k8snode"):
         """Learn node names and organisation-specific namespaces from kubectl tables."""
+        name_col = 1        # nsrows: column with the object name (1 for tables without a header)
         for line in text.splitlines():
             cols = line.split()
-            if not cols or cols[0] in ("NAMESPACE", "NAME", "No", "Error", "error:"):
+            if cols and cols[0] == "NAMESPACE":
+                # a header: only tables with a NAME column right after NAMESPACE carry object
+                # names there (events have LAST SEEN, top pods has NAME, quotas have none ...)
+                name_col = 1 if len(cols) > 1 and cols[1] == "NAME" else None
+                continue
+            if not cols or cols[0] in ("NAME", "No", "Error", "error:"):
                 continue
             if kind == "nodes":
                 if len(cols) >= 3 and cols[1] in ("Ready", "NotReady") or (
@@ -1500,9 +1512,10 @@ class Scrubber:
                     continue
                 self.learn_term("namespace", ns)
                 if kind == "nsrows" and len(cols) > 1:
-                    for c in cols[1:]:
-                        name = c.split("/", 1)[1] if "/" in c else (c if c is cols[1] else "")
-                        if re.fullmatch(r"[a-z0-9][a-z0-9.-]{2,}", name) and not name.isdigit():
+                    for i, c in enumerate(cols[1:], 1):
+                        name = c.split("/", 1)[1] if "/" in c else (c if i == name_col else "")
+                        if re.fullmatch(r"[a-z0-9][a-z0-9.-]{2,}", name) and not name.isdigit() \
+                                and not RX_QUANTITY.fullmatch(name):
                             self.learn_term("k8sobj", name)
 
     def prescan(self, text):
@@ -1641,6 +1654,9 @@ class Scrubber:
             return "version"
         if re.match(r"-\d*[A-Za-z]", text[m.end():m.end() + 6]):
             return "version"
+        tail = RX_QUAD_VERSION_TAIL.match(text, m.end())
+        if tail and "." in tail.group(0) and not is_ipv4(tail.group(0)[1:]):
+            return "version"        # "4.2.1.0-9.1.24837353", but not a range "10.0.0.1-10.0.0.9"
         return "ip"
 
     def _r_ipv4(self, m):
