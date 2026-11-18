@@ -546,7 +546,27 @@ def retry_task(api, task_id):
 
 # --------------------------------------------------------------------------- main
 
+DASHES = "\u2010\u2011\u2012\u2013\u2014\u2015\u2212"
+
+
+def fix_dashes(argv):
+    """Turn option names typed or pasted with typographic dashes (-, -, -- auto-replaced by
+    chat or office apps) back into '--name'. Values are left alone."""
+    out = []
+    for a in argv:
+        head = a.split("=", 1)[0]
+        if head[:1] in DASHES or (head.startswith("-") and head[1:2] in DASHES):
+            name = head.lstrip("-" + DASHES)
+            if name:
+                a = "--" + name + a[len(head):]
+        out.append(a)
+    return out
+
+
 def parse_args(argv):
+    if argv is None:
+        argv = sys.argv[1:]
+    argv = fix_dashes(argv)
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
                                 formatter_class=argparse.RawDescriptionHelpFormatter,
                                 epilog="See the top of the script for details and examples.")
