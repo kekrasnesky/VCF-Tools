@@ -6285,6 +6285,24 @@ def make_ai_client(cfg, key):
                     use_proxy=cfg["use_proxy"], provider=cfg["provider"], proxy=cfg.get("proxy", ""))
 
 
+# An AI question that asks the administrator to hand over a secret (not one that merely mentions one,
+# such as "did the password rotation in the UI succeed?")
+SECRET_REQUEST = re.compile(
+    r"(?i)\b(provide|give|send|share|paste|tell|enter|type|supply|post|what\s+is|what's|need)\b(?:[^.?!\n]|\.(?=\S)){0,80}?"
+    r"\b(passwords?|passphrases?|pass\s?words?|credentials?|secrets?|api[ -]?keys?|tokens?|private\s+keys?)\b")
+SECRET_CORRECTION = (
+    "Do not ask the administrator for passwords, tokens, keys or other secrets: they must never be sent to you. "
+    "The logins the tool uses for API checks are entered in the tool on the administrator's computer, so a check "
+    "that failed to log in is a limitation of that check, not a fault in the environment. Reply again: tell the "
+    "administrator to correct that login in the tool and collect again, and continue with the data you have "
+    "(a vcf-plan block, a ROOT CAUSE, or a question that does not ask for a secret).")
+
+
+def asks_for_secret(reply):
+    m = re.search(r"(?is)QUESTION FOR THE ADMINISTRATOR\s*:\s*(.+)$", reply)
+    return bool(m and SECRET_REQUEST.search(m.group(1)))
+
+
 def investigator_prompt(max_rounds, anonymized):
     names = ("Hosts, domains and addresses are anonymized placeholders; use them exactly as written."
              if anonymized else "Hosts are named as in the inventory; use those names exactly.")
@@ -6324,6 +6342,12 @@ Rules:
 - A [collect] step that looks as if it changes something, or that would print secrets, is refused
   by the tool; you will be told which and why. Never put sudo in a command.
 - Prefer commands that print a bounded amount of output (tail, grep, head).
+- Never ask the administrator for a password, token, key or any other secret, and never put one
+  in a command: secrets must not reach you. The logins the tool uses for API checks are entered in
+  the tool on the administrator's computer. A check that ends with "login failed" is a limitation
+  of the check on that computer, not a fault in the environment and not a reason to rotate a
+  password: tell the administrator to correct that login in the tool and collect again, and carry
+  on with the data you have.
 
 Format of the plan block (the same as described in the reports):
 
@@ -6566,6 +6590,8 @@ class Investigation:
     def _format_problem(self, reply):
         """What is wrong with a reply that does not follow the required format, or None."""
         has_plan = bool(PLAN_FENCE.search(reply))
+        if asks_for_secret(reply):
+            return SECRET_CORRECTION
         if re.search(r"(?i)QUESTION FOR THE ADMINISTRATOR\s*:", reply):
             return None
         if re.search(r"(?im)^\W*NO ROOT CAUSE FOUND\s*:", reply):
@@ -6612,6 +6638,9 @@ class Investigation:
                     self.messages.append({"role": "user", "content": "The tool could not use your plan: %s "
                                           "Round %d of %d." % (" ".join(prep["problems"]), rnd + 1, max_rounds)})
                     continue
+                if asks_for_secret(reply):
+                    self.emit("warn", "The AI asked for a password or other secret. Do not type it here: correct "
+                                      "the login for that check group in the tool, then collect again.")
                 question = re.search(r"(?is)QUESTION FOR THE ADMINISTRATOR\s*:\s*(.+)$", prep["translated"])
                 return self._finish("question" if question else "concluded", prep,
                                     question=question.group(1).strip() if question else "")
