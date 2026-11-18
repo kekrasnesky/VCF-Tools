@@ -198,6 +198,25 @@ list VKS / Cluster API clusters and machines, VM Service virtual machines, Super
 and errors from the Cluster API and VM operator controllers. A worker that appears both as a
 node and as a Cluster API machine gets the same placeholder in both places.
 
+### Node and pod health
+
+The Kubernetes types (management cluster, Kubernetes control plane, Supervisor) have a check group
+**Node and pod health in depth**, collected once per cluster:
+
+- nodes: every condition with its reason (Ready, MemoryPressure, DiskPressure, PIDPressure,
+  NetworkUnavailable), cordoned or tainted nodes, kubelet / kernel / container-runtime / OS
+  versions side by side (mismatches stand out), allocatable resources and running pods per node,
+  control-plane component pods, and etcd endpoint health and status (leader, database size);
+- pods: every container that is not ready, waiting (CrashLoopBackOff, ImagePullBackOff ...),
+  restarted, or whose last run ended badly, with reason, exit code and time; OOMKilled containers;
+  pending pods with their scheduling failures; evicted and failed pods; probe failures;
+  Deployments, StatefulSets and DaemonSets not fully available; volume claims not Bound; top pods
+  by memory; and the previous logs of up to five crash-looping pods.
+
+On every node, **Kubernetes certificates on this node** shows the kubelet certificate expiry (an
+expired kubelet certificate takes a node NotReady) and the control-plane certificate expiry
+(`kubeadm certs check-expiration`), next to the kubelet and containerd status.
+
 ### SSO and stale passwords
 
 Expired or out-of-sync passwords and SSO certificate problems are among the most common causes of

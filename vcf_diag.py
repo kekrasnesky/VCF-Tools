@@ -57,7 +57,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
-VERSION = "1.13.0"
+VERSION = "1.14.0"
 
 # ----------------------------------------------------------------------------
 # Diagnostic catalog
@@ -150,6 +150,15 @@ def linux_groups():
     ]
 
 
+# Output templates for kubectl: one line per pod (with each container's state) and per node.
+POD_JSONPATH = ('{range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"  node="}{.spec.nodeName}'
+                '{"  phase="}{.status.phase}{"  reason="}{.status.reason}{range .status.containerStatuses[*]}'
+                '{"  ["}{.name}{" ready="}{.ready}{" restarts="}{.restartCount}{" waiting="}{.state.waiting.reason}'
+                '{" last="}{.lastState.terminated.reason}{":"}{.lastState.terminated.exitCode}{"@"}'
+                '{.lastState.terminated.finishedAt}{"]"}{end}{"\\n"}{end}')
+NODE_COND_JSONPATH = ('{range .items[*]}{.metadata.name}{range .status.conditions[*]}{"  "}{.type}{"="}{.status}'
+                      '{"("}{.reason}{")"}{end}{"\\n"}{end}')
+
 K8S_GROUPS = [
     ("k8s-cluster", "Kubernetes API and nodes", [
         kctl("API server version", "{K} version 2>&1 | head -n 6"),
@@ -185,6 +194,56 @@ K8S_GROUPS = [
         kctl("Latest warning events",
              "{K} get events -A --field-selector type!=Normal --sort-by=.lastTimestamp 2>&1"
              " | tail -n 80", k8s="nsrows"),
+    ]),
+    ("k8s-health", "Node and pod health in depth", [
+        kctl("Node conditions with reasons",
+             "{K} get nodes -o jsonpath=%s 2>&1" % shlex.quote(NODE_COND_JSONPATH), k8s="firstnode"),
+        kctl("Cordoned or tainted nodes",
+             "{K} get nodes -o custom-columns='NAME:.metadata.name,UNSCHEDULABLE:.spec.unschedulable,"
+             "TAINTS:.spec.taints[*].key,EFFECT:.spec.taints[*].effect' 2>&1", k8s="firstnode"),
+        kctl("Node versions (kubelet, kernel, runtime, OS) - mismatches matter",
+             "{K} get nodes -o custom-columns='NAME:.metadata.name,KUBELET:.status.nodeInfo.kubeletVersion,"
+             "KERNEL:.status.nodeInfo.kernelVersion,RUNTIME:.status.nodeInfo.containerRuntimeVersion,"
+             "OS:.status.nodeInfo.osImage' 2>&1", k8s="firstnode"),
+        kctl("Pod capacity and pods per node",
+             "{K} get nodes -o custom-columns='NAME:.metadata.name,MAX_PODS:.status.allocatable.pods,"
+             "CPU:.status.allocatable.cpu,MEMORY:.status.allocatable.memory' --no-headers 2>&1 | while read n m c r; do "
+             "echo \"$n  allocatable pods=$m cpu=$c memory=$r  running pods=$({K} get pods -A --no-headers "
+             "--field-selector spec.nodeName=$n 2>/dev/null | wc -l)\"; done", k8s="firstnode", timeout=90),
+        kctl("Control-plane component pods",
+             "{K} -n kube-system get pods -l tier=control-plane -o wide 2>&1", k8s="nsrows"),
+        kctl("etcd health and status (leader, database size)",
+             "p=$({K} -n kube-system get pods -l component=etcd -o name 2>/dev/null | head -n 1); "
+             "if [ -z \"$p\" ]; then echo 'no etcd pod found in kube-system'; else "
+             "for c in 'endpoint health --cluster' 'endpoint status --cluster -w table'; do "
+             "{K} -n kube-system exec \"$p\" -- sh -c \"ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 "
+             "--cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/server.crt "
+             "--key=/etc/kubernetes/pki/etcd/server.key $c\" 2>&1; done; fi", timeout=90),
+        kctl("Problem containers (not ready, waiting, restarted, last termination)",
+             "{K} get pods -A -o jsonpath=%s 2>&1 | awk '/ready=false|waiting=[A-Za-z]|restarts=[1-9]|"
+             "phase=(Pending|Failed|Unknown)/' | head -n 150" % shlex.quote(POD_JSONPATH), k8s="nsslash", max_lines=200),
+        kctl("Containers killed for running out of memory (OOMKilled)",
+             "{K} get pods -A -o jsonpath=%s 2>&1 | grep OOMKilled | head -n 50 || echo 'none'"
+             % shlex.quote(POD_JSONPATH), k8s="nsslash"),
+        kctl("Pending pods and why they cannot be scheduled",
+             "{K} get pods -A --field-selector=status.phase=Pending -o wide 2>&1 | head -n 50; echo; "
+             "{K} get events -A --field-selector reason=FailedScheduling --sort-by=.lastTimestamp 2>&1 | tail -n 30",
+             k8s="nsrows"),
+        kctl("Evicted and failed pods",
+             "{K} get pods -A --field-selector=status.phase=Failed -o wide 2>&1 | head -n 60", k8s="nsrows"),
+        kctl("Probe failures (liveness / readiness)",
+             "{K} get events -A --field-selector reason=Unhealthy --sort-by=.lastTimestamp 2>&1 | tail -n 40",
+             k8s="nsrows"),
+        kctl("Deployments, StatefulSets and DaemonSets not fully available",
+             "{K} get deploy,sts -A --no-headers 2>&1 | awk '{split($3,a,\"/\"); if (a[1]!=a[2]) print}'; "
+             "{K} get ds -A --no-headers 2>&1 | awk '$3!=$5 || $3!=$7'", k8s="nsrows"),
+        kctl("Volume claims not Bound", "{K} get pvc -A --no-headers 2>&1 | awk '$3!=\"Bound\"' | head -n 50",
+             k8s="nsrows"),
+        kctl("Top pods by memory", "{K} top pods -A --sort-by=memory 2>&1 | head -n 25", k8s="nsrows"),
+        kctl("Previous logs of crashing containers (up to 5 pods)",
+             "{K} get pods -A --no-headers 2>/dev/null | awk '$4 ~ /CrashLoopBackOff|Error|OOMKilled/ {print $1\" \"$2}' "
+             "| head -n 5 | while read ns pod; do echo \"== $ns/$pod\"; {K} logs -n \"$ns\" \"$pod\" --all-containers "
+             "--previous --tail=40 2>&1 | tail -n 40; done", k8s="nsslash", timeout=120, max_lines=250),
     ]),
     ("k8s-vcf", "VCF services runtime objects (best effort)", [
         kctl("Components", "{K} get components -A 2>&1 | head -n 200", k8s="nsrows"),
@@ -433,6 +492,18 @@ SDDC_GROUPS = [
     ]),
 ] + linux_groups()
 
+NODE_K8S_GROUPS = [
+    ("node-certs", "Kubernetes certificates on this node", [
+        cmd("kubelet certificates",
+            "for f in /var/lib/kubelet/pki/kubelet-client-current.pem /var/lib/kubelet/pki/kubelet.crt; do "
+            "[ -f \"$f\" ] && echo \"$f: $(openssl x509 -enddate -noout -in \"$f\" 2>&1)\"; done; true", sudo=True),
+        cmd("Control-plane certificates (kubeadm)",
+            "if command -v kubeadm >/dev/null 2>&1; then kubeadm certs check-expiration 2>&1 | head -n 40; "
+            "else for f in /etc/kubernetes/pki/*.crt /etc/kubernetes/pki/etcd/*.crt; do [ -f \"$f\" ] && "
+            "echo \"$f: $(openssl x509 -enddate -noout -in \"$f\" 2>&1)\"; done; fi", sudo=True, timeout=60),
+    ]),
+]
+
 MGMT_NODE_GROUPS = [
     ("node-runtime", "Kubernetes node agents (kubelet, containerd)", [
         cmd("kubelet and containerd", "systemctl status kubelet containerd --no-pager 2>&1 | head -n 40", sudo=True),
@@ -442,7 +513,7 @@ MGMT_NODE_GROUPS = [
             "journalctl -u kubelet --since '-2h' --no-pager 2>/dev/null | grep -iE 'error|fail' | tail -n 40",
             sudo=True),
     ]),
-] + linux_groups()
+] + NODE_K8S_GROUPS + linux_groups()
 
 MGMT_CLUSTER_GROUPS = K8S_GROUPS + [
     ("k8s-nodes", "Control planes and workers (worker VMs are discovered, not listed)", [
@@ -564,12 +635,12 @@ COMPONENTS = {
                "prefix": "opsnet", "groups": OPSNET_GROUPS, "nsxcli": True, "nsxcli_wrap": "{c}"},
     "k8s": {"title": "Kubernetes control plane (VCF services runtime, Operations, Automation)",
             "user": "vmware-system-user", "prefix": "k8snode",
-            "groups": K8S_GROUPS + linux_groups(), "sudo": "auto"},
+            "groups": K8S_GROUPS + MGMT_NODE_GROUPS, "sudo": "auto"},
     "vcfmgmt": {"title": "VCF management cluster (services runtime: control planes and workers)",
                 "user": "vmware-system-user", "prefix": "vcfmgmt", "sudo": "auto",
                 "groups": MGMT_CLUSTER_GROUPS + MGMT_NODE_GROUPS, "host_label": "Control planes"},
     "supervisor": {"title": "vSphere Supervisor control plane", "user": "root", "prefix": "supervisor",
-                   "groups": SUPERVISOR_GROUPS + K8S_GROUPS + linux_groups(), "host_label": "Control-plane address"},
+                   "groups": SUPERVISOR_GROUPS + K8S_GROUPS + MGMT_NODE_GROUPS, "host_label": "Control-plane address"},
     "linux": {"title": "Generic Linux appliance", "user": "root", "prefix": "linux",
               "groups": linux_groups()},
 }
@@ -993,6 +1064,19 @@ class Scrubber:
                     role = ("-cp" if re.search(r"control-plane|master", cols[2]) else "-worker") \
                         if prefix != "k8snode" else ""
                     self.learn_host(cols[0], prefix=prefix + role)
+            elif kind == "nsslash":
+                m = re.match(r"(?:==\s+)?([a-z0-9]([a-z0-9-]*[a-z0-9])?)/([a-z0-9][a-z0-9.-]{2,})", line.strip())
+                if m:
+                    if not self.keep_ns_rx.match(m.group(1)):
+                        self.learn_term("namespace", m.group(1))
+                        self.learn_term("k8sobj", m.group(3))
+                    nm = re.search(r"\snode=(\S+)", line)
+                    if nm:
+                        self.learn_host(nm.group(1), prefix=prefix if prefix == "k8snode" else prefix + "-worker")
+            elif kind == "firstnode":
+                if cols[0] not in ("NAME",) and len(cols) > 1 and re.fullmatch(r"[a-z0-9][a-z0-9.-]+", cols[0]):
+                    if not self.m.lookup("host", cols[0].split(".")[0]):
+                        self.learn_host(cols[0], prefix=prefix if prefix == "k8snode" else prefix + "-worker")
             elif kind in ("ns", "nsrows"):
                 ns = cols[0]
                 if not re.fullmatch(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?", ns) or self.keep_ns_rx.match(ns):

@@ -445,7 +445,8 @@ class ManagementCluster(unittest.TestCase):
         self.assertEqual(len(labels), 4)     # three endpoints + the Kubernetes lookup
         self.assertNotIn("endpoints", [g[0] for g in v.groups_for("vcfmgmt", custom)])
         self.assertEqual({k for k in keys if v.is_cluster_group(k)},
-                         {"k8s-cluster", "k8s-workloads", "k8s-storage", "k8s-events", "k8s-vcf", "k8s-nodes", "endpoints"})
+                         {"k8s-cluster", "k8s-workloads", "k8s-storage", "k8s-events", "k8s-health", "k8s-vcf", "k8s-nodes",
+                          "endpoints"})
 
     def test_endpoints_need_a_cluster(self):
         with self.assertRaises(v.Fatal):
@@ -1884,6 +1885,65 @@ class SsoAndPasswords(unittest.TestCase):
                         r = subprocess.run(["bash", "-n", "-c", c["cmd"]], stderr=subprocess.PIPE)
                         self.assertEqual(r.returncode, 0, (c["label"], r.stderr))
         self.assertTrue(v.is_api_group("sddc-api-credentials"))
+
+
+class NodeAndPodHealth(unittest.TestCase):
+    def health(self, label):
+        return [c for g in v.K8S_GROUPS if g[0] == "k8s-health" for c in g[2] if c["label"].startswith(label)][0]
+
+    def test_problem_container_filter(self):
+        import stat
+        import subprocess
+        lines = [
+            "prelude/provisioning-app-5d9c-x2x9z  node=wkr-1  phase=Running  reason=  [app ready=false restarts=37 waiting=CrashLoopBackOff last=Error:1@2026-11-18T09:00:00Z]",
+            "prelude/identity-app-0  node=wkr-1  phase=Running  reason=  [app ready=true restarts=0 waiting= last=:@]",
+            "widgets-fin/ledger-7f6d-abcde  node=wkr-2  phase=Running  reason=  [api ready=true restarts=3 waiting= last=OOMKilled:137@2026-11-18T08:00:00Z]",
+            "kube-system/etcd-cp-1  node=cp-1  phase=Running  reason=  [etcd ready=true restarts=0 waiting= last=:@]",
+            "widgets-fin/batch-9  node=  phase=Pending  reason=  ",
+            "prelude/old-job-1  node=wkr-2  phase=Failed  reason=Evicted  [job ready=false restarts=0 waiting= last=:@]",
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            fake = os.path.join(d, "kubectl")
+            with open(fake, "w") as fh:
+                fh.write("#!/bin/sh\ncat <<'EOF'\n%s\nEOF\n" % "\n".join(lines))
+            os.chmod(fake, stat.S_IRWXU)
+            out = subprocess.run(["bash", "-c", self.health("Problem containers")["cmd"].replace("{K}", fake)],
+                                 stdout=subprocess.PIPE).stdout.decode()
+            oom = subprocess.run(["bash", "-c", self.health("Containers killed")["cmd"].replace("{K}", fake)],
+                                 stdout=subprocess.PIPE).stdout.decode()
+        picked = [ln.split()[0] for ln in out.splitlines()]
+        self.assertEqual(picked, ["prelude/provisioning-app-5d9c-x2x9z", "widgets-fin/ledger-7f6d-abcde",
+                                  "widgets-fin/batch-9", "prelude/old-job-1"])
+        self.assertEqual([ln.split()[0] for ln in oom.splitlines()], ["widgets-fin/ledger-7f6d-abcde"])
+
+    def test_names_in_new_outputs_are_anonymized(self):
+        sc = make()
+        text = ("widgets-fin/ledger-7f6d-abcde  node=wkr-xk2p  phase=Running  [api ready=true restarts=3 waiting= "
+                "last=OOMKilled:137@2026-11-18T08:00:00Z]\n== widgets-fin/ledger-7f6d-abcde\nNAME UNSCHEDULABLE TAINTS\n"
+                "wkr-xk2p true node.kubernetes.io/unschedulable\nprelude/provisioning-app-1 node=wkr-xk2p phase=Running\n")
+        sc.learn_k8s("nsslash", text, prefix="vcfmgmt-mgmt")
+        sc.learn_k8s("firstnode", text, prefix="vcfmgmt-mgmt")
+        out = run(sc, text)
+        for gone in ("widgets", "ledger", "wkr-xk2p"):
+            self.assertNotIn(gone, out)
+        self.assertIn("prelude/provisioning-app-1", out)      # product namespaces stay readable
+        self.assertIn("vcfmgmt-mgmt-worker-01", out)
+        self.assertIn("OOMKilled:137", out)
+
+    def test_commands_parse_and_groups_are_wired(self):
+        import subprocess
+        groups = [g for g in v.K8S_GROUPS if g[0] == "k8s-health"] + v.NODE_K8S_GROUPS
+        for key, title, cmds in groups:
+            for c in cmds:
+                r = subprocess.run(["bash", "-n", "-c", c["cmd"].replace("{K}", "kubectl")], stderr=subprocess.PIPE)
+                self.assertEqual(r.returncode, 0, (c["label"], r.stderr))
+        for typ in ("k8s", "vcfmgmt", "supervisor"):
+            keys = [g[0] for g in v.COMPONENTS[typ]["groups"]]
+            self.assertIn("k8s-health", keys)
+            self.assertIn("node-certs", keys)
+            self.assertIn("node-runtime", keys)
+        self.assertFalse(v.is_cluster_group("node-certs"))       # runs on every node
+        self.assertTrue(v.is_cluster_group("k8s-health"))        # runs once per cluster
 
 
 class GuiApi(unittest.TestCase):
