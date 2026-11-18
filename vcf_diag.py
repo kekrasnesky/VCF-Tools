@@ -2736,6 +2736,14 @@ def _detail_json(obj):
     return json.dumps(obj, indent=1, sort_keys=True)
 
 
+def _full_detail(d, healthy):
+    """The raw API answer, only for objects that are not healthy (a healthy namespace's 19-entry
+    storage_specs list adds hundreds of lines and nothing the summary does not already say)."""
+    if healthy:
+        return []
+    return ["--- full detail", _detail_json(d)]
+
+
 def api_supervisors(api):
     out, attention = [], []
     clusters = api.get("/api/vcenter/namespace-management/clusters") or []
@@ -2768,7 +2776,8 @@ def api_supervisors(api):
             out.append("capacity: CPU %s/%s MHz, memory %s/%s MiB, storage %s/%s MiB" % (
                 stats.get("cpu_used"), stats.get("cpu_capacity"), stats.get("memory_used"),
                 stats.get("memory_capacity"), stats.get("storage_used"), stats.get("storage_capacity")))
-        out += ["--- full detail", _detail_json(d)]
+        out += _full_detail(d, d.get("config_status") == "RUNNING" and d.get("kubernetes_status") in (None, "READY")
+                            and not d.get("messages") and not d.get("kubernetes_status_messages"))
     return "\n".join(out)
 
 
@@ -2807,7 +2816,7 @@ def api_namespaces(api):
             ", ".join(vm.get("vm_classes") or []) or "none", len(vm.get("content_libraries") or [])))
         if d.get("resource_spec"):
             details.append("resource limits: %s" % json.dumps(d["resource_spec"], sort_keys=True))
-        details += ["--- full detail", _detail_json(d)]
+        details += _full_detail(d, d.get("config_status", n.get("config_status")) == "RUNNING" and not msgs)
     out = (["Namespaces needing attention:"] + attention + [""] if attention else
            ["All namespaces report RUNNING without errors or warnings.", ""])
     return "\n".join(out + head + details)

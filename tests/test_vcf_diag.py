@@ -711,6 +711,10 @@ class VCenterNamespaces(unittest.TestCase):
         self.assertIn("access: USER devops@vsphere.local EDIT", ns)
         self.assertIn("VM classes: best-effort-small   content libraries: 1", ns)
         self.assertIn("velero.vsphere.vmware.com 1.5.1  config=ERROR", svc)
+        # full API detail only for objects that are not healthy
+        self.assertEqual(ns.count("--- full detail"), 1)
+        self.assertLess(ns.index("== namespace svc-velero-domain-c8"), ns.index("--- full detail"))
+        self.assertIn("--- full detail", sup)                # kubernetes=WARNING with messages
         self.assertEqual({m for m, _ in self.seen}, {"POST", "GET", "DELETE"})
         self.assertEqual([p for m, p in self.seen if m != "GET"], ["/api/session", "/api/session"])
 
