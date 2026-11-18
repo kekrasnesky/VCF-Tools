@@ -57,7 +57,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
-VERSION = "1.16.0"
+VERSION = "1.17.0"
 
 # ----------------------------------------------------------------------------
 # Diagnostic catalog
@@ -70,11 +70,13 @@ VERSION = "1.16.0"
 
 
 def cmd(label, command, timeout=30, mode="sh", harvest=(), max_lines=None, k8s=None, sudo=False, api=None,
-        post=None):
+        post=None, covered_by=None):
     # post: function(raw output) -> shorter output, applied to successful runs before anonymization
+    # covered_by: an API check (its function name) that reports the same; when that API check
+    #             succeeds on the same target, this result is left out of the report as redundant
     return {"label": label, "cmd": command, "timeout": timeout, "mode": mode,
             "harvest": tuple(harvest), "max_lines": max_lines, "k8s": k8s, "sudo": sudo, "api": api,
-            "post": post}
+            "post": post, "covered_by": covered_by}
 
 
 H_NAMESPACE = ("k8sns", r"(?m)^namespace: (\S+)", None)
@@ -354,9 +356,54 @@ def post_ntpq_peers(out):
         rest = rest[min(over, gap - 1):]
         lines.append("%s%s %s%s" % (m.group(1), remote.ljust(len(m.group(2) + m.group(3)) - 1),
                                     refid.ljust(len(m.group(4))), rest))
+    while lines and not lines[-1].strip():
+        lines.pop()
     if n:
         lines.append("(peer names are cut off by ntpq and cannot be anonymized reliably: shown as peer-N, "
                      "in the order ntpq listed them. The configured servers are under 'NTP servers'.)")
+    return "\n".join(lines)
+
+
+# NSX Manager services that are stopped unless the feature that uses them is in use
+NSX_NORMALLY_STOPPED = {"migration-coordinator", "nsx-message-bus", "snmp"}
+
+
+def post_nsx_services(out):
+    """Fold 'get services' into the state counts, services that are not running, and settings."""
+    svcs, cur = [], None
+    for ln in out.splitlines():
+        k, sep, val = ln.partition(":")
+        if not sep:
+            continue
+        k, val = k.strip(), val.strip()
+        if k == "Service name":
+            cur = {"name": val, "state": "?", "attrs": []}
+            svcs.append(cur)
+        elif cur is None:
+            continue
+        elif k == "Service state":
+            cur["state"] = val
+        elif val and not (k == "Logging level" and val == "info"):
+            cur["attrs"].append("%s %s" % (k.lower(), val))
+    if not svcs:
+        return out
+    states = {}
+    for sv in svcs:
+        states[sv["state"]] = states.get(sv["state"], 0) + 1
+    lines = ["%d services: %s" % (len(svcs), ", ".join("%d %s" % (n, st) for st, n in sorted(
+        states.items(), key=lambda kv: (kv[0] != "running", kv[0]))))]
+    down = [sv["name"] for sv in svcs if sv["state"] != "running"]
+    usual = [n for n in down if n in NSX_NORMALLY_STOPPED]
+    other = [n for n in down if n not in NSX_NORMALLY_STOPPED]
+    if usual:
+        lines.append("not running, usually stopped unless the feature is used: %s" % ", ".join(usual))
+    if other:
+        lines.append("NOT RUNNING (unexpected): %s" % ", ".join(
+            "%s (%s)" % (sv["name"], sv["state"]) for sv in svcs if sv["name"] in other))
+    settings = [sv for sv in svcs if sv["attrs"]]
+    if settings:
+        lines.append("settings:")
+        lines += ["  %s: %s" % (sv["name"], "; ".join(sv["attrs"])) for sv in settings]
     return "\n".join(lines)
 
 
@@ -679,8 +726,8 @@ NSX_NODE_CMDS = [
     ncli("NTP servers", "get ntp-servers"),
     ncli("NTP associations", "get ntp-server associations", post=post_ntpq_peers),
     ncli("DNS servers", "get name-servers"),
-    ncli("Password expiry: admin", "get user admin password-expiration"),
-    ncli("Password expiry: audit", "get user audit password-expiration"),
+    ncli("Password expiry: admin", "get user admin password-expiration", covered_by="nsx_users"),
+    ncli("Password expiry: audit", "get user audit password-expiration", covered_by="nsx_users"),
 ]
 
 NSX_GROUPS = [
@@ -690,7 +737,7 @@ NSX_GROUPS = [
         ncli("Cluster configuration", "get cluster config", timeout=60, max_lines=300,
              post=post_nsx_cluster_config),
         ncli("Managers", "get managers"),
-        ncli("Services", "get services", timeout=60, max_lines=400),
+        ncli("Services", "get services", timeout=60, max_lines=400, post=post_nsx_services),
     ]),
     ("nsx-node", "Node resources, time, DNS", NSX_NODE_CMDS),
     ("nsx-api-health", "NSX health from the NSX API (from this computer; needs an NSX API login)", [
@@ -2775,6 +2822,17 @@ def collect_api(t, groups):
         api.logout()
 
 
+def drop_covered_results(t):
+    """Leave out SSH results that a successful API check on the same target already covers."""
+    ok_api = {r["spec"].get("api"): r["label"] for r in t.results
+              if r["status"] == "ok" and r["spec"].get("api")}
+    covered = [r for r in t.results if r["status"] == "ok" and r["spec"].get("covered_by") in ok_api]
+    if covered:
+        t.results = [r for r in t.results if r not in covered]
+        t.notes.append("left out because the API check '%s' reports the same: %s" % (
+            ok_api[covered[0]["spec"]["covered_by"]], ", ".join(r["label"] for r in covered)))
+
+
 def collect_target(t, groups, progress):
     """Connect (if needed), detect, and run every selected command on one target.
     vCenter API checks run from this computer, also when SSH to the target fails."""
@@ -2797,6 +2855,7 @@ def collect_target(t, groups, progress):
                         t.results.append(t.run_catalog(g, c))
         if api_groups and not t.ctx.cancel.is_set():
             collect_api(t, api_groups)
+        drop_covered_results(t)
         if t.results or not t.errkind:
             bad = sum(1 for r in t.results if r["status"] in ("fail", "timeout"))
             skipped = sum(1 for r in t.results if r["status"] == "skipped")
@@ -3345,6 +3404,162 @@ This report is **not anonymized**: host names, domains and addresses are real. O
 the organisation."""
 
 
+# ----------------------------------------------------------------------------
+# Key facts: a short, machine-readable digest of each target, derived from the
+# (summarized) check output. Keyed by check label; each returns [(key, value)].
+# ----------------------------------------------------------------------------
+
+def _fact_df(out):
+    worst = None
+    for ln in out.splitlines():
+        m = re.match(r"^(\S+)\s+\S+\s+\S+\s+\S+\s+(\d+)%\s+(/\S*)\s*$", ln)
+        if m and not m.group(1).startswith(("tmpfs", "devtmpfs", "none", "overlay")):
+            if worst is None or int(m.group(2)) > worst[0]:
+                worst = (int(m.group(2)), m.group(3))
+    return [("fs_fullest", "%d%% %s" % worst)] if worst else []
+
+
+def _fact_uptime(out):
+    f = []
+    m = re.search(r"up\s+(\d+)\s+day", out)
+    f.append(("uptime_days", int(m.group(1)) if m else 0))
+    m = re.search(r"load average:\s*([\d.]+),\s*([\d.]+),\s*([\d.]+)", out)
+    if m:
+        f.append(("load_avg_1_5_15", "%s %s %s" % m.groups()))
+    return f
+
+
+def _fact_cluster(out):
+    f = []
+    m = re.search(r"(?i)overall(?: status)?:\s*(\S+)", out)
+    if m:
+        f.append(("cluster_overall", m.group(1)))
+    m = re.search(r"(\d+) of (\d+) groups STABLE", out)
+    if m:
+        f.append(("cluster_groups_stable", "%s/%s" % m.groups()))
+    ups = re.findall(r"(?m)^\s+(?:member: )?\S+\s+\S+\s+(UP|DOWN|\S+)$", out)
+    if ups:
+        f.append(("cluster_members_up", "%d/%d" % (ups.count("UP"), len(ups))))
+    return f
+
+
+def _fact_alarms(out):
+    if out.startswith("No open"):
+        return [("alarms_open", 0)]
+    m = re.match(r"(\d+) alarm\(s\):\s*(.*)", out)
+    return [("alarms_open", int(m.group(1))), ("alarms_by_severity", m.group(2).strip())] if m else []
+
+
+def _fact_tn(out):
+    f = []
+    m = re.match(r"(\d+) transport node", out)
+    if m:
+        f.append(("transport_nodes", int(m.group(1))))
+    bad = re.search(r"Nodes not in a good state:\n((?:  .*\n?)*)", out)
+    if bad:
+        rows = [ln for ln in bad.group(1).splitlines() if ln.strip() and ln.strip() != "none"]
+        f.append(("transport_nodes_not_good", len(rows)))
+    m = re.search(r"Tunnel / connection status: (.*)", out)
+    if m:
+        f.append(("transport_node_status", m.group(1).strip()))
+    return f
+
+
+def _fact_mem(out):
+    f = []
+    m = re.search(r"available [\d.]+ GiB \((\d+)%\)", out)
+    if m:
+        f.append(("mem_available_pct", int(m.group(1))))
+    if "swap: none" in out:
+        f.append(("swap", "none"))
+    return f
+
+
+def _fact_ntp(out):
+    m = re.search(r"(?m)^\*\S+\s+\S+\s+(\d+)\s+\w\s+\S+\s+\d+\s+\d+\s+[\d.]+\s+(-?[\d.]+)", out)
+    if m:
+        return [("ntp_synced", "yes, stratum %s" % m.group(1)), ("ntp_offset_ms", float(m.group(2)))]
+    return [("ntp_synced", "no peer selected")] if re.search(r"(?m)^=+$", out) else []
+
+
+def _fact_backups(out):
+    f = []
+    m = re.search(r"automatic backups: (.*)", out)
+    if m:
+        f.append(("backup_automatic", m.group(1).strip()))
+    for kind, last in re.findall(r"(?m)^(\w+) backup:\n\s+(.+)$", out):
+        f.append(("backup_last_%s" % kind, last.strip()))
+    return f
+
+
+def _fact_services(out):
+    m = re.match(r"(\d+) services: (.*)", out)
+    if not m:                                   # not summarized (e.g. NSX Edge): no digest
+        return []
+    f = [("services", m.group(2))]
+    m = re.search(r"NOT RUNNING \(unexpected\): (.*)", out)
+    f.append(("services_down_unexpected", m.group(1) if m else "none"))
+    m = re.search(r"(?m)^  ssh: .*root login (\w+)", out)
+    if m:
+        f.append(("ssh_root_login", m.group(1)))
+    return f
+
+
+def _fact_nsx_users(out):
+    due = []
+    for ln in out.splitlines():
+        m = re.match(r"^(\S+)\s+ACTIVE\s+(\d+)\s+(\d+)\s*$", ln)
+        if m:
+            due.append((int(m.group(2)) - int(m.group(3)), m.group(1)))
+    return [("account_expiry_soonest", "%s in %d days" % (min(due)[1], min(due)[0]))] if due else []
+
+
+KEY_FACTS = {
+    "Version": lambda o: [("version", m.group(1)) for m in [re.search(r"Version (\S+)", o)] if m],
+    "Uptime": _fact_uptime,
+    "CPU": lambda o: [("cpus", int(m.group(1))) for m in [re.match(r"(\d+) logical CPU", o)] if m],
+    "Memory": _fact_mem,
+    "Filesystems": _fact_df,
+    "Disk usage": _fact_df,
+    "Core dumps": lambda o: [("core_dumps", 0)] if o.startswith("No core dumps") else [],
+    "NTP associations": _fact_ntp,
+    "DNS servers": lambda o: [("dns_servers", n) for n in [len(set(re.findall(
+        r"(?<![\w.:])(?:\d{1,3}(?:\.\d{1,3}){3}|[0-9A-Fa-f]{0,4}(?::[0-9A-Fa-f]{0,4}){2,7})(?![\w.:])", o)))] if n],
+    "Cluster status": _fact_cluster,
+    "Cluster status (API)": _fact_cluster,
+    "Open alarms": _fact_alarms,
+    "Transport nodes": _fact_tn,
+    "Edge clusters": lambda o: [("edge_clusters", len(re.findall(r"(?m)^edge cluster: ", o)))],
+    "Backups": _fact_backups,
+    "Services": _fact_services,
+    "Local users and password expiry": _fact_nsx_users,
+}
+
+
+def key_facts(t):
+    """[(key, value)] for one target; later checks do not overwrite a key already set."""
+    facts, seen = [], set()
+    if t.clock_offset is not None:
+        facts.append(("clock_offset_s", round(t.clock_offset)))
+        seen.add("clock_offset_s")
+    for r in t.results:
+        fn = KEY_FACTS.get(r["label"])
+        if not fn or r["status"] != "ok":
+            continue
+        try:
+            got = fn(r["out"] or "")
+        except Exception:  # noqa: BLE001 - a digest must never break the report
+            continue
+        for k, val in got:
+            if k not in seen:
+                seen.add(k)
+                facts.append((k, val))
+    failed = [r["label"] for r in t.results if r["status"] in ("fail", "timeout")]
+    if failed:
+        facts.append(("checks_failed", "; ".join(failed)))
+    return facts
+
+
 def build_report(ctx, done, scrubber, started, max_lines, kind="health", title=""):
     S = scrubber.scrub
     out = []
@@ -3406,6 +3621,24 @@ def build_report(ctx, done, scrubber, started, max_lines, kind="health", title="
     w("")
     w("A non-zero exit status is not always a fault: a check for a feature that is not in use")
     w("(vSAN, NSX, a missing tool) also ends that way. Read the output before concluding.")
+    digest = [(t, key_facts(t)) for _, targets in done for t in targets]
+    if any(f for _, f in digest):
+        w("")
+        w("### Key facts")
+        w("")
+        w("Derived by the tool from the checks below (YAML, one entry per target). It is a digest,")
+        w("not a verdict: read the check output for detail.")
+        w("")
+        body = []
+        for t, facts in digest:
+            if facts:
+                body.append("%s:" % t.ph)
+                body += ["  %s: %s" % (k, json.dumps(val) if isinstance(val, str) else val) for k, val in facts]
+        body = S("\n".join(body))
+        f = fence(body)
+        w(f + "yaml")
+        w(body)
+        w(f)
     for item, targets in done:
         sec = item["sec"]
         w("")

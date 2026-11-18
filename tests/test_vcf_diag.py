@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import tempfile
+import types
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -2301,6 +2302,87 @@ class ReportReadability(unittest.TestCase):
         reply.update(rc=1, out="% Command not found\n")
         res = t.run_catalog(("g", "G"), v.ncli("X", "get x", post=lambda o: "summary"))
         self.assertEqual((res["status"], res["out"]), ("fail", "% Command not found\n"))
+
+
+class ReportDigest(unittest.TestCase):
+    """Services summary, redundant CLI checks left out, and the Key facts block."""
+
+    SERVICES = ("Service name:      http\nService state:     running\nLogging level:     info\n"
+                "Session timeout:   1800\n\nService name:      snmp\nService state:     stopped\n"
+                "Start on boot:     False\n\nService name:      manager\nService state:     stopped\n\n"
+                "Service name:      ssh\nService state:     running\nRoot login:        enabled\n\n"
+                "Service name:      controller\nService state:     running\nListen address:\n")
+
+    def test_services_summary(self):
+        out = v.post_nsx_services(self.SERVICES)
+        self.assertIn("5 services: 3 running, 2 stopped", out)
+        self.assertIn("usually stopped unless the feature is used: snmp", out)
+        self.assertIn("NOT RUNNING (unexpected): manager (stopped)", out)
+        self.assertIn("  http: session timeout 1800", out)
+        self.assertNotIn("logging level", out)
+        self.assertNotIn("controller", out)                       # empty attribute dropped
+        self.assertEqual(v.post_nsx_services("nothing"), "nothing")
+
+    def test_ntp_note_has_no_blank_line_before_it(self):
+        out = v.post_ntpq_peers("     remote   refid  st t when poll reach delay offset jitter\n=====\n"
+                                "*timesrv1.wid .GPS.  1 u  1 64 377 0.4 -0.8 0.2\n\n")
+        self.assertIn("0.2\n(peer names", out)
+
+    @staticmethod
+    def res(label, out, status="ok", **spec):
+        return {"group": ("nsx-x", "X"), "label": label, "cmd": "c", "rc": 0 if status == "ok" else 1,
+                "out": out, "dur": 0.1, "status": status, "note": "", "spec": dict({"max_lines": None}, **spec)}
+
+    def target(self):
+        t = types.SimpleNamespace(ph="nsxmgr-01", mode="nsxcli", errkind=None, errmsg="", identity=[],
+                                  user="admin", notes=[], clock_offset=0.4)
+        users = ("user   status   change every (days) last change (days ago)\n"
+                 "root   ACTIVE   90   2\nadmin   ACTIVE   90   10\nguest   NOT_ACTIVATED   90   300\n")
+        t.results = [
+            self.res("Services", v.post_nsx_services(self.SERVICES)),
+            self.res("Memory", "total 23.5 GiB, available 3.0 GiB (13%), free 0.7 GiB\nswap: none configured"),
+            self.res("Core dumps", "No core dumps generated in system"),
+            self.res("Password expiry: admin", "Password expires 90 days after last change", covered_by="nsx_users"),
+            self.res("Transport nodes", "HTTP 500 for /x", status="fail"),
+            self.res("Local users and password expiry", users, api="nsx_users"),
+        ]
+        return t
+
+    def test_covered_cli_checks_are_left_out_with_a_note(self):
+        t = self.target()
+        v.drop_covered_results(t)
+        self.assertNotIn("Password expiry: admin", [r["label"] for r in t.results])
+        self.assertIn("Local users and password expiry", t.notes[0])
+        self.assertIn("Password expiry: admin", t.notes[0])
+        t = self.target()
+        t.results[-1]["status"] = "fail"                         # API failed: keep the CLI check
+        v.drop_covered_results(t)
+        self.assertIn("Password expiry: admin", [r["label"] for r in t.results])
+
+    def test_key_facts(self):
+        facts = dict(v.key_facts(self.target()))
+        self.assertEqual(facts["clock_offset_s"], 0)
+        self.assertEqual(facts["mem_available_pct"], 13)
+        self.assertEqual(facts["services_down_unexpected"], "manager (stopped)")
+        self.assertEqual(facts["ssh_root_login"], "enabled")
+        self.assertEqual(facts["core_dumps"], 0)
+        self.assertEqual(facts["account_expiry_soonest"], "admin in 80 days")
+        self.assertEqual(facts["checks_failed"], "Transport nodes")
+        self.assertEqual(v.KEY_FACTS["Core dumps"]("total 0"), [])     # vCenter ls output: no fact
+        self.assertEqual(v.KEY_FACTS["DNS servers"]("   DNSServers: 10.1.1.1, 10.1.1.2"), [("dns_servers", 2)])
+
+    def test_report_has_anonymized_key_facts_block(self):
+        t = self.target()
+        v.drop_covered_results(t)
+        ctx = types.SimpleNamespace(ssh_banner="OpenSSH_test")
+        item = {"sec": {"name": "nsx", "type": "nsx"}}
+        rep = v.build_report(ctx, [(item, [t])], make(), v.datetime.datetime(2026, 11, 18), 400)
+        block = rep.split("### Key facts", 1)[1].split("```yaml\n", 1)[1].split("\n```", 1)[0]
+        self.assertTrue(block.startswith("nsxmgr-01:\n  clock_offset_s: 0\n"))
+        self.assertIn('  account_expiry_soonest: "admin in 80 days"', block)   # not redacted
+        self.assertIn('  checks_failed: "Transport nodes"', block)
+        self.assertIn("Note: left out because the API check", rep)
+        self.assertNotIn("**Password expiry: admin**", rep)
 
 
 if __name__ == "__main__":
