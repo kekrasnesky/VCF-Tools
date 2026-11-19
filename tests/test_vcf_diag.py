@@ -2510,6 +2510,24 @@ esac
 class Automation(unittest.TestCase):
     """VCF Automation component: wiring, namespace option and the shell checks themselves."""
 
+    def test_pasted_inventory_lines_and_skipped_groups_are_reported(self):
+        text = ("[supervisor]\nhosts = 10.1.1.70\n```\n[vcfa]\n```\n`hosts = 10.1.1.30`\n"
+                "[esxi]\nhosts =\n[k8s:automation]\nhost = 10.1.1.31\n")
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "inventory.ini")
+            with open(path, "w") as fh:
+                fh.write(text)
+            settings, sections, _ = v.load_inventory(path)
+        self.assertEqual([(x["name"], x["hosts"]) for x in sections],
+                         [("supervisor", ["10.1.1.70"]), ("vcfa", ["10.1.1.30"])])
+        self.assertEqual(settings["_empty_groups"], ["esxi", "k8s:automation"])
+        warns = settings["_warnings"]
+        self.assertTrue(any("unknown setting 'host'" in w for w in warns), warns)
+        self.assertTrue(any(w.startswith("[k8s:automation]") and "lists no hosts" in w for w in warns), warns)
+        self.assertFalse(any(w.startswith("[esxi]") for w in warns), warns)   # untouched template group: no noise
+        model = v.read_settings_model(text)
+        self.assertIn(("vcfa", ["10.1.1.30"]), [(g["type"], g["hosts"]) for g in model["groups"]])
+
     def test_component_and_inventory(self):
         c = v.COMPONENTS["vcfa"]
         self.assertEqual((c["user"], c["prefix"], c["sudo"]), ("vmware-system-user", "vcfa", "auto"))

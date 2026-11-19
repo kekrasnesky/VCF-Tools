@@ -3652,16 +3652,35 @@ def collect_target(t, groups, progress):
 # ----------------------------------------------------------------------------
 # Inventory
 # ----------------------------------------------------------------------------
+def clean_inventory_text(text):
+    """Undo formatting picked up when inventory lines are pasted from chat or Markdown:
+    drop ``` fence lines and unwrap lines quoted in backticks (`hosts = 10.0.0.1`)."""
+    out = []
+    for line in text.splitlines():
+        t = line.strip()
+        if t.startswith("```"):
+            continue
+        if len(t) > 2 and t.startswith("`") and t.endswith("`"):
+            line = t.strip("`").strip()
+        out.append(line)
+    return "\n".join(out) + "\n"
+
+
+SECTION_KEYS = {"hosts", "control_planes"}       # plus GROUP_FIELDS, defined below
+
+
 def load_inventory(path):
     cp = configparser.ConfigParser(interpolation=None, delimiters=("=",), comment_prefixes=("#", ";"))
     cp.optionxform = str
     try:
         with open(path, encoding="utf-8") as fh:
-            cp.read_file(fh)
+            cp.read_string(clean_inventory_text(fh.read()))
     except (OSError, configparser.Error) as e:
         die("cannot read inventory %s: %s" % (path, e))
     settings = dict(cp["settings"]) if cp.has_section("settings") else {}
     sections, custom, endpoints = [], {}, {}
+    # Groups that are left out, so the menus and the window can say why instead of hiding them silently.
+    warnings, empty = [], []
     if cp.has_section("ai"):
         settings["_ai"] = dict(cp["ai"])
     for name in cp.sections():
@@ -3684,8 +3703,15 @@ def load_inventory(path):
             die("inventory: unknown component type in section [%s]. Valid types: %s"
                 % (name, ", ".join(COMPONENTS)))
         s = cp[name]
+        unknown = [k for k in s if k.strip().lower() not in SECTION_KEYS and k.strip().lower() not in GROUP_FIELDS]
+        for k in unknown:
+            warnings.append("[%s]: unknown setting '%s' is ignored (expected one of: hosts, %s)"
+                            % (name, k, ", ".join(GROUP_FIELDS)))
         hosts = list(dict.fromkeys(split_list(s.get("hosts", "") + " " + s.get("control_planes", ""))))
         if not hosts:
+            empty.append(name)
+            if unknown or any((s.get(k) or "").strip() for k in s):
+                warnings.append("[%s] (%s) is skipped: it lists no hosts" % (name, COMPONENTS[typ]["title"]))
             continue
         slug = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")
         prefix = COMPONENTS[typ]["prefix"] + ("-" + slug if slug else "")
@@ -3725,6 +3751,7 @@ def load_inventory(path):
                 % ((":" + label) if label else "", (":" + label) if label else ""))
         for x in owners:
             x["endpoints"] = eps
+    settings["_warnings"], settings["_empty_groups"] = warnings, empty
     return settings, sections, custom
 
 
@@ -3752,7 +3779,7 @@ def read_settings_model(text):
     """Inventory text -> the structured form the Settings tab edits (keeps empty groups)."""
     cp = _ini_parser()
     try:
-        cp.read_string(text)
+        cp.read_string(clean_inventory_text(text))
     except configparser.Error as e:
         raise Fatal("the inventory file cannot be read: %s" % e)
     model = {"settings": {k: cp.get("settings", k, fallback=d) for k, d in SETTINGS_FIELDS},
@@ -5197,6 +5224,8 @@ def cmd_collect(args):
         args.timeout_scale = float(settings.get("timeout", 30)) / 30.0
     print("vcf_diag %s - anonymized VCF health collector" % VERSION)
     print("Inventory: %s   Private mapping: %s" % (inv, args.private_dir))
+    for w in settings["_warnings"]:
+        print("  Note: %s" % w)
     plan = build_plan(sections, custom, args.all)
     if not plan:
         die("nothing selected", 0)
@@ -7202,6 +7231,7 @@ select { margin-top: 4px; padding: 8px 10px; border: 1px solid var(--line); bord
   <div id="empty" class="note warn" hidden>
     No systems are set up yet. On the <b>Settings</b> tab, click <b>Add group</b>, enter the hosts and save.
   </div>
+  <div id="invWarn" class="note warn" hidden></div>
   <div id="setup">
     <p class="muted">Tick the groups to check, enter the SSH login for each, then run. Only read-only
       health checks are executed. Passwords stay in memory on this Mac and are never saved.</p>
@@ -7633,6 +7663,18 @@ async function loadState() {
   $("#problem").hidden = !st.error;
   $("#problem").textContent = st.error;
   $("#empty").hidden = !!st.error || sections.length > 0;
+  const iw = $("#invWarn"), warns = st.warnings || [], idle = st.empty_groups || [];
+  iw.textContent = "";
+  if (warns.length || idle.length) {
+    warns.forEach(w => { const d = document.createElement("div"); d.textContent = w; iw.append(d); });
+    if (idle.length) {
+      const d = document.createElement("div");
+      d.textContent = "Not shown because they list no hosts: " + idle.join(", ") +
+        ". Add the hosts on the Settings tab (file: " + (st.inventory || "inventory.ini") + ").";
+      iw.append(d);
+    }
+  }
+  iw.hidden = !warns.length && !idle.length;
   $("#optParallel").value = st.parallel;
   $("#optLines").value = st.max_lines;
   $("#plainMode").hidden = st.anonymize !== false;
@@ -8449,6 +8491,8 @@ class Gui:
                      "key_ready": bool(resolve_ai_key(cfg, "", self.ai_keys)),
                      "latest_report": os.path.basename(latest) if latest else None}
         out["anonymize"] = anonymize_enabled(self.args, settings)
+        out["warnings"], out["empty_groups"] = settings["_warnings"], settings["_empty_groups"]
+        out["inventory"] = os.path.abspath(inv)
         for s in sections:
             out["sections"].append({
                 "name": s["name"], "title": COMPONENTS[s["type"]]["title"], "user": s["user"],

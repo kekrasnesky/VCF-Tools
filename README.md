@@ -146,6 +146,11 @@ still asked), `--list` prints every check and the exact command behind it.
 | `[supervisor]` | vSphere Supervisor control plane | `root` | VKS / Cluster API clusters and machines, VM Service VMs, Supervisor services, controller errors |
 | `[linux]` | any other Linux appliance | `root` | generic OS health |
 
+A group that lists no hosts is not offered in the menus; the window names such groups above the list,
+and unknown settings in a section (for example `host =` instead of `hosts =`) are reported rather
+than ignored. Lines pasted from chat or Markdown (```` ``` ```` fences, `` `hosts = ...` `` in backticks)
+are read as plain inventory lines.
+
 A section name may carry a label, for example `[esxi:mgmt]`, `[esxi:wld01]`, `[k8s:runtime]`,
 `[k8s:automation]`. Each labelled section is offered separately in the menu and has its own
 credentials. The label shows up in placeholders (`esxi-mgmt-01`), so pick labels you are happy to
