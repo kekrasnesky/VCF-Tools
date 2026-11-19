@@ -2702,6 +2702,41 @@ class NoiseSummarizers(unittest.TestCase):
         self.assertNotIn("ledger", rep)
         self.assertNotIn("widgets", rep)
 
+    def test_control_plane_certs_fall_back_when_kubeadm_refuses(self):
+        import subprocess
+        c = find("supervisor", "Control-plane certificates (kubeadm)")["cmd"]
+        refuse = ("[check-expiration] Reading configuration from the \"kubeadm-config\" ConfigMap...\n"
+                  "W1119 17:01:02.967756  181247 cluster.go:105] error unmarshaling configuration\n\n"
+                  "error: kubeConfig file /etc/kubernetes/scheduler.conf does not have an embedded client certificate\n")
+        table = ("[check-expiration] Reading configuration from the cluster...\n"
+                 "CERTIFICATE   EXPIRES                  RESIDUAL TIME   CERTIFICATE AUTHORITY\n"
+                 "apiserver     Nov 19, 2027 14:19 UTC   364d            ca\n")
+        for kubeadm_out, rc in ((refuse, 1), (table, 0)):
+            with tempfile.TemporaryDirectory() as d:
+                pki, bindir = os.path.join(d, "pki"), os.path.join(d, "bin")
+                os.makedirs(os.path.join(pki, "etcd"))
+                os.makedirs(bindir)
+                for f in ("apiserver.crt", "etcd/server.crt"):
+                    open(os.path.join(pki, f), "w").close()
+                for name, body in (("kubeadm", "cat <<'EOF'\n%sEOF\nexit %d" % (kubeadm_out, rc)),
+                                   ("openssl", "echo 'notAfter=Nov 19 14:19:33 2027 GMT'")):
+                    path = os.path.join(bindir, name)
+                    with open(path, "w") as fh:
+                        fh.write("#!/bin/sh\n" + body + "\n")
+                    os.chmod(path, 0o755)
+                env = dict(os.environ, PATH=bindir + os.pathsep + os.environ["PATH"])
+                out = subprocess.run(["sh", "-c", c.replace("/etc/kubernetes/pki", pki)],
+                                     stdout=subprocess.PIPE, env=env).stdout.decode()
+            if rc:
+                self.assertIn("gave no certificate table: reading the certificate files", out)
+                self.assertIn(pki + "/apiserver.crt: notAfter=Nov 19 14:19:33 2027 GMT", out)
+                self.assertIn(pki + "/etcd/server.crt: notAfter=", out)
+                self.assertNotIn("error:", out)
+            else:
+                self.assertIn("apiserver     Nov 19, 2027", out)
+                self.assertNotIn("[check-expiration]", out)
+                self.assertNotIn("reading the certificate files", out)
+
     def test_tool_caused_failures_are_fixed(self):
         etcd = find("k8s", "etcd health and status (leader, database size)")["cmd"]
         self.assertNotIn("sh -c", etcd)

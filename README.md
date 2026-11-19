@@ -217,7 +217,8 @@ The Kubernetes types (management cluster, Kubernetes control plane, Supervisor) 
 
 On every node, **Kubernetes certificates on this node** shows the kubelet certificate expiry (an
 expired kubelet certificate takes a node NotReady) and the control-plane certificate expiry
-(`kubeadm certs check-expiration`), next to the kubelet and containerd status.
+(`kubeadm certs check-expiration`; where kubeadm refuses, as on the vSphere Supervisor, the
+certificate files under `/etc/kubernetes/pki` are read directly), next to the kubelet and containerd status.
 
 ### SSO and stale passwords
 

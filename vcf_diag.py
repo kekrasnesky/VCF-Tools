@@ -1156,8 +1156,14 @@ NODE_K8S_GROUPS = [
         cmd("Control-plane certificates (kubeadm)",
             "if [ ! -f /etc/kubernetes/pki/apiserver.crt ] && [ ! -f /etc/kubernetes/manifests/kube-apiserver.yaml ];"
             " then echo 'not a control-plane node (no /etc/kubernetes/pki/apiserver.crt): nothing to check';"
-            " elif command -v kubeadm >/dev/null 2>&1; then kubeadm certs check-expiration 2>&1 | head -n 40; "
-            "else for f in /etc/kubernetes/pki/*.crt /etc/kubernetes/pki/etcd/*.crt; do [ -f \"$f\" ] && "
+            # kubeadm refuses on some control planes (the vSphere Supervisor: scheduler.conf has no embedded
+            # client certificate). Then read the certificate files directly instead of reporting an error.
+            " elif command -v kubeadm >/dev/null 2>&1 && o=$(kubeadm certs check-expiration 2>/dev/null)"
+            " && printf '%s\\n' \"$o\" | grep -q 'EXPIRES'; then"
+            " printf '%s\\n' \"$o\" | grep -vE '^\\[check-expiration\\]|^W[0-9]{4} ' | head -n 40;"
+            " else command -v kubeadm >/dev/null 2>&1 &&"
+            " echo 'kubeadm certs check-expiration gave no certificate table: reading the certificate files';"
+            " for f in /etc/kubernetes/pki/*.crt /etc/kubernetes/pki/etcd/*.crt; do [ -f \"$f\" ] && "
             "echo \"$f: $(openssl x509 -enddate -noout -in \"$f\" 2>&1)\"; done; fi", sudo=True, timeout=60),
     ]),
 ]
