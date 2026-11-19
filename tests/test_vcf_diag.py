@@ -2497,9 +2497,21 @@ case "$a" in
   "get pvc -A --no-headers") printf 'prelude data-postgres-0 Bound pvc-1 20Gi RWO sc 5d\n';;
   get\ events*) printf 'prelude 2m Warning BackOff pod/ebs-app-5c Back-off\n';;
   get\ pods\ -n\ *jsonpath*) printf 'registry.example/vmware/ebs:9.0.1.0-123\n';;
-  get\ pods\ -n\ prelude\ --field-selector*) printf 'pod/ebs-app-5c\npod/provisioning-service-app-7f\n';;
+  get\ pods\ -n\ prelude\ --field-selector*) printf 'pod/ebs-app-5c\npod/provisioning-service-app-7f\npod/authentication-server-695678cb7f-7jcgk\npod/agent-gateway-server-7b9c977d69-5d78f\npod/ccs-vksm-eas-764dcb6877-nsrqh\n';;
+  get\ -n\ prelude\ pod/authentication-server*) printf '2026-11-03T16:21:40Z 1';;
+  get\ -n\ prelude\ pod/*) printf '2026-09-28T22:11:00Z 0';;
   get\ pods\ -n\ *) ;;
   logs\ -n\ prelude\ pod/ebs-app-5c*) printf 'INFO ok\nERROR db connection refused\njava.lang.IllegalStateException: x\n';;
+  logs\ -n\ prelude\ pod/authentication-server*) printf '%s\n' \
+    '{"grpc.code":"Unauthenticated","grpc.error":"invalid v1agent token: 1002, cause: no such valid token: no rows in result set","time":"2026-11-03T16:22:10Z"}' \
+    '{"msg":"failed to connect to {Addr: 127.0.0.1:4317} unauthenticated"}';;
+  logs\ -n\ prelude\ pod/agent-gateway-server*) printf '%s\n' \
+    '{"grpc.code":"Unauthenticated","grpc.error":"rpc error: code = Unauthenticated desc = invalid v1agent token","agent.cluster.name":"c-alpha","time":"2026-11-19T17:50:00Z"}' \
+    '{"grpc.code":"Unauthenticated","grpc.error":"rpc error: code = Unauthenticated desc = invalid v1agent token","agent.cluster.name":"c-beta","time":"2026-11-19T17:51:00Z"}' \
+    '{"grpc.code":"Unauthenticated","grpc.error":"rpc error: code = Unauthenticated desc = invalid v1agent token","agent.cluster.name":"c-alpha","time":"2026-11-19T17:52:00Z"}';;
+  logs\ -n\ prelude\ pod/ccs-vksm-eas*) printf '%s\n' \
+    '{"audit-ID":"be92","level":"error","msg":"missing auth token in request","time":"2026-11-19T17:53:45Z"}' \
+    '{"audit-ID":"9927","level":"error","msg":"missing auth token in request","time":"2026-11-19T17:53:52Z"}';;
   logs*) printf 'INFO fine\nterror-free line\n';;
   get\ ingress*) ;;
   *) echo "unhandled: $a" >&2; exit 1;;
@@ -2622,6 +2634,40 @@ class Automation(unittest.TestCase):
         self.assertIn("grep -E '^(prelude)$'", seen[0])
         self.assertNotIn("{NSRX}", seen[0])
         self.assertNotIn("{K}", seen[0])
+
+    def test_authentication_chain_is_diagnosed(self):
+        raw = self.run_checks()[v.VCFA_AUTH_LABEL]
+        self.assertIn("@@POD prelude/authentication-server-695678cb7f-7jcgk 2026-11-03T16:21:40Z 1", raw)
+        self.assertNotIn("4317", raw)                                     # telemetry noise is dropped
+        out = v.post_vcfa_auth(raw)
+        self.assertRegex(out, r"(?m)^agent token unknown to Automation\s+1  authentication-server \(1\)$")
+        self.assertRegex(out, r"(?m)^agent token rejected\s+3  agent-gateway-server \(1\)$")
+        self.assertRegex(out, r"(?m)^request without an auth token\s+2  ccs-vksm-eas \(1\)$")
+        self.assertIn("(2 distinct)", out)
+        self.assertIn("2 x agent.cluster.name=c-alpha", out)
+        self.assertIn("DIAGNOSIS (high): VCF Automation rejects cluster agent tokens (4 line(s)", out)
+        self.assertIn("2 distinct agents", out)
+        self.assertIn("2026-11-03T16:22:10Z in authentication-server-695678cb7f-7jcgk - at the start of its log", out)
+        self.assertIn("probably the same agents", out)
+        self.assertIn("authentication-server-695678cb7f-7jcgk 1 time(s)", out)
+        facts = dict(v.KEY_FACTS[v.VCFA_AUTH_LABEL](out))
+        self.assertEqual((facts["automation_agent_token_rejected_30m"], facts["automation_missing_auth_token_30m"],
+                          facts["automation_rejected_agents"]), (3, 2, 2))
+        t = types.SimpleNamespace(errkind=None, clock_offset=None, sec={"type": "vcfa"},
+                                  results=[{"status": "ok", "label": v.VCFA_AUTH_LABEL, "out": out}])
+        found = v.target_findings(t, [])
+        self.assertEqual(found[0][0], "high")
+        self.assertIn("Unable to authenticate", found[0][1])
+
+    def test_authentication_chain_quiet_and_single_agent(self):
+        quiet = v.post_vcfa_auth("@@POD prelude/authentication-server-a1b2c3d4e5-abcde 2026-11-01T00:00:00Z 0\n")
+        self.assertIn("no authentication errors in the last 30 min", quiet)
+        self.assertEqual(v.KEY_FACTS[v.VCFA_AUTH_LABEL](quiet), [("automation_auth_errors_30m", 0)])
+        one = v.post_vcfa_auth(
+            "@@POD prelude/agent-gateway-server-7b9c977d69-5d78f 2026-11-01T00:00:00Z 0\n@@COUNT agent_token_rejected 9\n"
+            '@@LINE {"error":"invalid v1agent token","cluster_id":"c-1"}\n')
+        self.assertIn("one agent (cluster_id=c-1): re-register", one)
+        self.assertEqual(v.post_vcfa_auth("no authentication-chain pods found"), "no authentication-chain pods found")
 
     def test_key_facts(self):
         K = v.KEY_FACTS

@@ -1288,6 +1288,248 @@ def _vcfa(label, body, **kw):
     return kctl(label, _VCFA_NS + body, **kw)
 
 
+# --- Authentication chain: who is rejected, by which service, since when ------------------
+# One pass over the pods that authenticate users and cluster agents. The shell side counts
+# error signatures exactly and keeps a sample of lines; post_vcfa_auth() turns that into a
+# table, the rejected agents, the oldest error still logged and DIAGNOSIS lines that become
+# findings. Example it was written for: VKS cluster "Monitor" tabs saying "Unable to
+# authenticate" while agent-gateway-server logs "invalid v1agent token".
+VCFA_AUTH_LABEL = "Automation authentication chain (users and cluster agents, last 30 min)"
+VCFA_AUTH_PODS = ("authentication-server|agent-gateway-server|api-gateway-server|ccs-vksm-eas|"
+                  "account-manager-server|cluster-sync-ingest|cluster-sync-egest|vmsp-identity|vmsp-gateway")
+# (key, awk regex on the lower-cased line, text). The first match wins, so the specific
+# signatures come before the generic ones.
+VCFA_AUTH_SIGS = (
+    ("agent_token_unknown", "no such valid token", "agent token unknown to Automation"),
+    ("agent_token_rejected", "invalid v1agent token", "agent token rejected"),
+    ("missing_token", "missing auth token|no auth token|missing (bearer|authorization)|authorization header (is )?missing",
+     "request without an auth token"),
+    ("token_expired", "token (is |has )?expired|expired token", "token expired"),
+    ("token_signature", "signature is invalid|invalid signature|jwks|unable to verify|unknown kid|key not found",
+     "token signature or signing key"),
+    ("issuer_audience", "invalid issuer|issuer mismatch|invalid audience|audience mismatch", "token issuer or audience"),
+    ("tls", "x509|certificate has expired|certificate signed by unknown|tls: ", "TLS or certificate"),
+    ("unauthenticated", "unauthenticated|unauthori[sz]ed|[^0-9]401[^0-9]", "other: unauthenticated / 401"),
+    ("forbidden", "forbidden|permission denied|[^0-9]403[^0-9]", "other: forbidden / 403"),
+)
+_AUTH_SIG_TEXT = dict((k, t) for k, _, t in VCFA_AUTH_SIGS)
+_AUTH_AWK = ("awk '{l=tolower($0); " + " else ".join(
+    "if (l ~ /%s/) c[\"%s\"]++;" % (rx, key) for key, rx, _ in VCFA_AUTH_SIGS)
+    + "} END{for (k in c) print \"@@COUNT \" k, c[k]}'")
+_AUTH_GREP = "|".join(rx for _, rx, _ in VCFA_AUTH_SIGS)
+_AUTH_FIRST = "no such valid token|invalid v1agent token|missing auth token"
+
+VCFA_AUTH_CMD = (
+    "found=0; for ns in $NS; do for p in $({K} get pods -n \"$ns\" --field-selector=status.phase=Running -o name"
+    " 2>/dev/null | grep -E '" + VCFA_AUTH_PODS + "'); do found=1;"
+    " echo \"@@POD $ns/${p#pod/} $({K} get -n \"$ns\" \"$p\" -o jsonpath='{.status.startTime}"
+    " {.status.containerStatuses[*].restartCount}' 2>/dev/null)\";"
+    " e=$({K} logs -n \"$ns\" \"$p\" --all-containers --since=30m --tail=50000 2>/dev/null"
+    " | grep -iE '" + _AUTH_GREP + "' | grep -v ':4317');"
+    " if [ -n \"$e\" ]; then printf '%s\\n' \"$e\" | " + _AUTH_AWK + ";"
+    " printf '%s\\n' \"$e\" | tail -n 200 | cut -c1-800 | sed 's/^/@@LINE /'; fi;"
+    " f=$({K} logs -n \"$ns\" \"$p\" --all-containers --tail=300000 2>/dev/null | grep -m1 -iE '" + _AUTH_FIRST + "'"
+    " | cut -c1-400); if [ -n \"$f\" ]; then echo \"@@FIRST $f\"; fi;"
+    " done; done; if [ \"$found\" = 0 ]; then echo 'no authentication-chain pods found in the Automation namespaces'; fi"
+)
+
+_RX_TS = re.compile(r"(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})")
+_RX_AGENT_KEY = re.compile(r'"([\w.\-]*(?:cluster|agent)[\w.\-]*)"\s*:\s*"([^"]{1,200})"', re.I)
+_RX_PEER = re.compile(r'"(?:grpc\.)?peer(?:\.address)?"\s*:\s*"([^"]{1,100})"')
+
+
+def _workload(pod):
+    """Deployment or StatefulSet name of a pod: 'agent-gateway-server-7b9c977d69-5d78f' -> 'agent-gateway-server'."""
+    name = pod.split("/", 1)[-1]
+    name = re.sub(r"-[a-z0-9]{6,10}-[a-z0-9]{5}$", "", name)
+    return re.sub(r"-\d+$", "", name)
+
+
+def _ts(text):
+    m = _RX_TS.search(text or "")
+    return "%sT%sZ" % m.groups() if m else None
+
+
+def _minutes_between(a, b):
+    try:
+        fmt = "%Y-%m-%dT%H:%M:%SZ"
+        return abs((datetime.datetime.strptime(a, fmt) - datetime.datetime.strptime(b, fmt)).total_seconds()) / 60.0
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_vcfa_auth(out):
+    """{'pods': {pod: {...}}, 'counts': {sig: {workload: lines}}} from the raw check output."""
+    pods, cur = {}, None
+    for ln in (out or "").splitlines():
+        if ln.startswith("@@POD "):
+            parts = ln.split()
+            cur = {"start": parts[2] if len(parts) > 2 and _ts(parts[2]) else None,
+                   "restarts": sum(int(x) for x in parts[3:] if x.isdigit()),
+                   "counts": {}, "lines": [], "first": None}
+            pods[parts[1]] = cur
+        elif cur is None:
+            continue
+        elif ln.startswith("@@COUNT "):
+            parts = ln.split()
+            if len(parts) == 3 and parts[2].isdigit():
+                cur["counts"][parts[1]] = int(parts[2])
+        elif ln.startswith("@@LINE "):
+            cur["lines"].append(ln[7:])
+        elif ln.startswith("@@FIRST "):
+            cur["first"] = ln[8:]
+    counts = {}
+    for pod, d in pods.items():
+        for sig, n in d["counts"].items():
+            counts.setdefault(sig, {}).setdefault(_workload(pod), [0, 0])
+            counts[sig][_workload(pod)][0] += n
+            counts[sig][_workload(pod)][1] += 1
+    return {"pods": pods, "counts": counts}
+
+
+def vcfa_auth_diagnosis(data):
+    """[(severity, text)] from parse_vcfa_auth(); the reasoning an analyst would do by hand."""
+    counts, pods = data["counts"], data["pods"]
+    total = lambda sig: sum(n for n, _ in counts.get(sig, {}).values())  # noqa: E731
+    where = lambda sig: ", ".join("%s (%d pod(s))" % (w, p) for w, (_, p) in sorted(counts.get(sig, {}).items()))  # noqa: E731
+    res = []
+    agents = vcfa_auth_agents(data)
+    unknown, rejected, missing = total("agent_token_unknown"), total("agent_token_rejected"), total("missing_token")
+    if unknown or rejected:
+        if len(agents) == 1:
+            scope = "one agent (%s): re-register or re-attach that cluster so it gets a new token" % agents[0][0]
+        elif len(agents) > 1:
+            scope = ("%d distinct agents: when every cluster is affected, the agent token records were lost "
+                     "(database restore or rollback, failed migration); re-register the clusters, or open a "
+                     "support case before changing anything" % len(agents))
+        else:
+            scope = ("the log lines do not name the agent: compare with which clusters' Monitor tabs fail - one "
+                     "cluster means re-register it, all clusters means the token records were lost")
+        res.append(("high", "VCF Automation rejects cluster agent tokens (%d line(s) in 30 min; Automation has no "
+                            "record of the token: %d): VKS cluster Monitor tabs show 'Unable to authenticate'. "
+                            "Seen from %s" % (unknown + rejected, unknown, scope)))
+        since = vcfa_auth_since(data)
+        if since:
+            res.append(("info", "oldest agent token error still logged: " + since))
+    if missing:
+        also = " - probably the same agents as above" if (unknown or rejected) else (
+            " - credentials are lost before this service: check api-gateway-server and how the UI or agents call it")
+        res.append(("med", "%d request(s) in 30 min arrived without an auth token at %s%s" % (missing, where("missing_token"), also)))
+    for sig, sev, hint in (("token_expired", "med", "check the clocks and the identity provider token lifetime"),
+                           ("token_signature", "med", "signing keys changed or are cached stale: a rolling restart of "
+                                                      "authentication-server reloads them"),
+                           ("issuer_audience", "med", "the Automation FQDN or identity provider settings changed"),
+                           ("tls", "med", "a certificate in the chain is expired or not trusted")):
+        if total(sig):
+            res.append((sev, "%s errors: %d line(s) at %s - %s" % (_AUTH_SIG_TEXT[sig], total(sig), where(sig), hint)))
+    restarted = sorted(p for p, d in pods.items() if d["restarts"] and _workload(p) == "authentication-server")
+    if restarted and res:
+        res.append(("info", "authentication-server restarted: " + ", ".join(
+            "%s %d time(s)" % (p.split("/")[-1], pods[p]["restarts"]) for p in restarted)))
+    return res
+
+
+def vcfa_auth_agents(data):
+    """[(agent text, rejected lines)] named in the sampled agent-token lines, most frequent first."""
+    seen = {}
+    for d in data["pods"].values():
+        for ln in d["lines"]:
+            low = ln.lower()
+            if "v1agent token" not in low and "no such valid token" not in low:
+                continue
+            keys = ["%s=%s" % m.groups() for m in _RX_AGENT_KEY.finditer(ln)]
+            for k in keys:
+                seen[k] = seen.get(k, 0) + 1
+    return sorted(seen.items(), key=lambda kv: (-kv[1], kv[0]))
+
+
+def vcfa_auth_since(data):
+    """'2026-11-03T16:22:10Z in authentication-server-x (pod started ...)' or None."""
+    best = None
+    for pod, d in data["pods"].items():
+        t = _ts(d["first"])
+        if t and (best is None or t < best[0]):
+            best = (t, pod, d["start"])
+    if not best:
+        return None
+    t, pod, start = best
+    gap = _minutes_between(t, start)
+    if gap is not None and gap <= 10:
+        how = "at the start of its log: the errors began at or before the pod started (%s)" % start
+    elif start:
+        how = "the pod started %s, so the errors began later" % start
+    else:
+        how = "pod start time unknown"
+    return "%s in %s - %s" % (t, pod.split("/")[-1], how)
+
+
+def post_vcfa_auth(out):
+    if "@@POD " not in (out or ""):
+        return out
+    data = parse_vcfa_auth(out)
+    lines = ["%d authentication-chain pod(s) checked: %s" % (len(data["pods"]), ", ".join(
+        "%s(%d)" % (w, n) for w, n in sorted(_count_by(_workload(p) for p in data["pods"]).items())))]
+    if not data["counts"]:
+        lines.append("no authentication errors in the last 30 min")
+        return "\n".join(lines) + "\n"
+    lines += ["", "%-36s %7s  %s" % ("error signature", "lines", "where (pods)")]
+    for key, _, text in VCFA_AUTH_SIGS:
+        if key in data["counts"]:
+            c = data["counts"][key]
+            lines.append("%-36s %7d  %s" % (text, sum(n for n, _ in c.values()), ", ".join(
+                "%s (%d)" % (w, p) for w, (_, p) in sorted(c.items()))))
+    agents = vcfa_auth_agents(data)
+    if agents:
+        lines += ["", "agents named in the sampled rejected lines (%d distinct):" % len(agents)]
+        lines += ["  %4d x %s" % (n, a) for a, n in agents[:15]]
+    peers = _count_by(m.group(1) for d in data["pods"].values() for ln in d["lines"]
+                      if "v1agent token" in ln.lower() for m in _RX_PEER.finditer(ln))
+    if peers:
+        lines.append("client addresses of rejected agent calls (may be a proxy): " + ", ".join(
+            "%s (%d)" % kv for kv in sorted(peers.items(), key=lambda kv: -kv[1])[:10]))
+    diag = vcfa_auth_diagnosis(data)
+    if diag:
+        lines.append("")
+        lines += ["DIAGNOSIS (%s): %s" % d for d in diag]
+    samples = []
+    for key, _, _ in VCFA_AUTH_SIGS:
+        for pod, d in sorted(data["pods"].items()):
+            if key in d["counts"]:
+                ln = next((x for x in reversed(d["lines"]) if re.search(
+                    dict((k, r) for k, r, _ in VCFA_AUTH_SIGS)[key], x.lower())), None)
+                if ln:
+                    samples.append("  [%s] %s: %s" % (key, pod.split("/")[-1], ln[:400]))
+                break
+    if samples:
+        lines += ["", "latest example per signature:"] + samples
+    return "\n".join(lines) + "\n"
+
+
+def _count_by(items):
+    c = {}
+    for x in items:
+        c[x] = c.get(x, 0) + 1
+    return c
+
+
+def _fact_vcfa_auth(out):
+    if out.startswith("No VCF Automation namespaces found"):
+        return [("automation_namespaces", "none found")]
+    f = []
+    for key, name in (("agent token unknown to Automation", "automation_agent_token_unknown_30m"),
+                      ("agent token rejected", "automation_agent_token_rejected_30m"),
+                      ("request without an auth token", "automation_missing_auth_token_30m")):
+        m = re.search(r"(?m)^%s\s+(\d+)  " % re.escape(key), out)
+        if m:
+            f.append((name, int(m.group(1))))
+    m = re.search(r"(?m)^agents named in the sampled rejected lines \((\d+) distinct\)", out)
+    if m:
+        f.append(("automation_rejected_agents", int(m.group(1))))
+    if "no authentication errors in the last 30 min" in out:
+        f.append(("automation_auth_errors_30m", 0))
+    return f
+
+
 AUTOMATION_GROUPS = [
     ("vcfa-services", "VCF Automation services (pods in the Automation namespaces only)", [
         _vcfa("Automation namespaces and pod states",
@@ -1338,6 +1580,10 @@ AUTOMATION_GROUPS = [
         cmd("vracli status (if installed)",
             "if command -v vracli >/dev/null 2>&1; then vracli version 2>&1 | head -n 5; vracli status 2>&1"
             " | head -n 120; else echo 'vracli is not installed on this node'; fi", timeout=90, sudo=True),
+    ]),    ("vcfa-auth", "VCF Automation authentication chain (login, API and cluster agent tokens)", [
+        _vcfa(VCFA_AUTH_LABEL, VCFA_AUTH_CMD, timeout=300, max_lines=120, post=post_vcfa_auth,
+              # cluster names in agent log fields are anonymized like any other cluster name
+              harvest=[("cluster", r'"[\w.\-]*(?:cluster|agent)[\w.\-]*name"\s*:\s*"([^"]{1,200})"', None)]),
     ]),
 ]
 
@@ -4545,6 +4791,7 @@ KEY_FACTS = {
     "Errors in Automation pod logs (last 30 min)": _vcfa_fact(
         "automation_pods_with_log_errors", lambda o: len(re.findall(r"(?m)^== ", o))),
     "Automation ingress hosts and certificates": _fact_vcfa_certs,
+    VCFA_AUTH_LABEL: _fact_vcfa_auth,
     "Version": lambda o: [("version", m.group(1)) for m in [re.search(r"Version (\S+)", o)] if m],
     "Uptime": _fact_uptime,
     "CPU": lambda o: [("cpus", int(m.group(1))) for m in [re.match(r"(\d+) logical CPU", o)] if m],
@@ -4628,6 +4875,9 @@ def target_findings(t, facts):
                                                    "Cluster API machines (worker VM lifecycle)"):
             for sev, text in capi_problems(r["out"]):
                 res.append((sev, "cluster " + text, r["label"]))
+        if r["status"] == "ok" and r["label"] == VCFA_AUTH_LABEL:
+            for sev, text in re.findall(r"(?m)^DIAGNOSIS \((high|med|low|info)\): (.+)$", r["out"]):
+                res.append((sev, text, r["label"]))
         if r["status"] == "ok" and r["label"] == "Transport zones, node profiles and cluster attachments":
             for p in merge_tz_problems(re.findall(r"(?m)^PROBLEM: (.+)$", r["out"])):
                 res.append(("high", "NSX " + p, r["label"]))
