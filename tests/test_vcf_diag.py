@@ -2510,6 +2510,19 @@ esac
 class Automation(unittest.TestCase):
     """VCF Automation component: wiring, namespace option and the shell checks themselves."""
 
+    def test_automation_listed_only_as_endpoint_is_flagged(self):
+        base = ("[vcfmgmt:mgmt]\ncontrol_planes = 10.1.1.110\n[endpoints:mgmt]\n"
+                "VCF Operations = ops.example.internal\nVCF Automation = 10.1.1.30\n")
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "inventory.ini")
+            for extra, expect in (("", [{"type": "vcfa", "title": "VCF Automation nodes", "hosts": ["10.1.1.30"]}]),
+                                  ("[vcfa]\nhosts = 10.1.1.30\n", [])):
+                with open(path, "w") as fh:
+                    fh.write(base + extra)
+                settings, _, _ = v.load_inventory(path)
+                self.assertEqual(settings["_suggest"], expect)
+                self.assertEqual(any("only listed as an endpoint" in w for w in settings["_warnings"]), bool(expect))
+
     def test_pasted_inventory_lines_and_skipped_groups_are_reported(self):
         text = ("[supervisor]\nhosts = 10.1.1.70\n```\n[vcfa]\n```\n`hosts = 10.1.1.30`\n"
                 "[esxi]\nhosts =\n[k8s:automation]\nhost = 10.1.1.31\n")

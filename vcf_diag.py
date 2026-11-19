@@ -3751,7 +3751,18 @@ def load_inventory(path):
                 % ((":" + label) if label else "", (":" + label) if label else ""))
         for x in owners:
             x["endpoints"] = eps
-    settings["_warnings"], settings["_empty_groups"] = warnings, empty
+    # VCF Automation listed only as a management endpoint: that checks DNS, HTTPS and the certificate,
+    # not Automation itself. Say so and offer the matching group.
+    suggest = []
+    if not any(x["type"] == "vcfa" for x in sections):
+        for x in mgmt:
+            hosts = [h for h, svcs in x["endpoints"].items() if any("automation" in v.lower() for v in svcs)]
+            if hosts:
+                warnings.append("VCF Automation is only listed as an endpoint of [%s] (%s). That checks DNS, HTTPS "
+                                "and the certificate, not Automation itself. To run the Automation checks, add a "
+                                "'VCF Automation nodes' group with that address." % (x["name"], ", ".join(hosts)))
+                suggest.append({"type": "vcfa", "title": COMPONENTS["vcfa"]["title"], "hosts": hosts})
+    settings["_warnings"], settings["_empty_groups"], settings["_suggest"] = warnings, empty, suggest
     return settings, sections, custom
 
 
@@ -7682,7 +7693,22 @@ async function loadState() {
       iw.append(d);
     }
   }
-  iw.hidden = !warns.length && !idle.length;
+  for (const g of st.suggest || []) {
+    const b = el("button", { className: "btn primary", type: "button",
+      textContent: "Add a " + g.title + " group for " + g.hosts.join(", ") });
+    b.onclick = async () => {
+      b.disabled = true;
+      try {
+        const r = await api("settings");
+        r.model.groups.push({ type: g.type, label: "", hosts: g.hosts, endpoints: [] });
+        await api("settings", { model: r.model });
+        if (settingsLoaded) await loadSettings();
+        await loadState();
+      } catch (e) { b.disabled = false; alert(e.message); }
+    };
+    iw.append(el("div", { className: "actions" }, b));
+  }
+  iw.hidden = !warns.length && !idle.length && !(st.suggest || []).length;
   $("#optParallel").value = st.parallel;
   $("#optLines").value = st.max_lines;
   $("#plainMode").hidden = st.anonymize !== false;
@@ -8524,6 +8550,7 @@ class Gui:
                      "latest_report": os.path.basename(latest) if latest else None}
         out["anonymize"] = anonymize_enabled(self.args, settings)
         out["warnings"], out["empty_groups"] = settings["_warnings"], settings["_empty_groups"]
+        out["suggest"] = settings["_suggest"]
         out["inventory"] = os.path.abspath(inv)
         for s in sections:
             out["sections"].append({
