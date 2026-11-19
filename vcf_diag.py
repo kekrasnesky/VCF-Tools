@@ -6795,6 +6795,17 @@ def asks_for_secret(reply):
     return bool(m and SECRET_REQUEST.search(m.group(1)))
 
 
+FINAL_CORRECTION = (
+    "No more data can be collected: the round limit is reached. Do not ask for more diagnostics. Reply now "
+    "with 'ROOT CAUSE: <one sentence>' and the evidence, followed by a vcf-plan block of [fix] steps, or with "
+    "'NO ROOT CAUSE FOUND: <why>' naming the most likely causes in order and what would tell them apart.")
+
+
+def is_conclusion(reply):
+    return bool(re.search(r"(?im)^\W*(?:NO )?ROOT CAUSE(?: FOUND)?\s*:", reply or "")
+                or re.search(r"(?i)QUESTION FOR THE ADMINISTRATOR\s*:", reply or ""))
+
+
 def investigator_prompt(max_rounds, anonymized):
     names = ("Hosts, domains and addresses are anonymized placeholders; use them exactly as written."
              if anonymized else "Hosts are named as in the inventory; use those names exactly.")
@@ -6834,6 +6845,9 @@ The administrator may also run your commands in a terminal and paste the output 
 what happened after applying a fix. Continue from there.
 
 Rules:
+- Stay on the problem the administrator reported. A report always holds unrelated warnings (a
+  failed metric, an old failed job, a policy event); do not spend rounds on one unless evidence
+  ties it to the reported problem. Say in one line which warnings you set aside and why.
 - Base conclusions on evidence in the reports, not on assumptions. Do not conclude early when one
   more targeted check would confirm or rule out the cause; do not ask again for data you have:
   read the report first (the API sections already list NSX transport zones, profiles, transport
@@ -7093,8 +7107,9 @@ class Investigation:
         self.emit("you", text)
         return self._loop()
 
-    def _format_problem(self, reply):
-        """What is wrong with a reply that does not follow the required format, or None."""
+    def _format_problem(self, reply, final=False):
+        """What is wrong with a reply that does not follow the required format, or None.
+        final: no more data can be collected, so only a conclusion or a question is accepted."""
         has_plan = bool(PLAN_FENCE.search(reply))
         if asks_for_secret(reply):
             return SECRET_CORRECTION
@@ -7102,6 +7117,8 @@ class Investigation:
             return None
         if re.search(r"(?im)^\W*NO ROOT CAUSE FOUND\s*:", reply):
             return None
+        if final and not re.search(r"(?im)^\W*ROOT CAUSE\s*:", reply):
+            return FINAL_CORRECTION
         if re.search(r"(?im)^\W*ROOT CAUSE\s*:", reply):
             steps = parse_plan(reply)["steps"] if has_plan else []
             if any(st["kind"] == "fix" and st["run"].strip() for st in steps):
@@ -7119,10 +7136,10 @@ class Investigation:
                 "steps that are exact commands, not general advice. If you need information only the administrator "
                 "has, end with 'QUESTION FOR THE ADMINISTRATOR: <question>'.")
 
-    def _ask_ai_checked(self):
+    def _ask_ai_checked(self, final=False):
         reply = self._ask_ai()
         for _ in range(2):
-            problem = self._format_problem(reply)
+            problem = self._format_problem(reply, final)
             if not problem:
                 break
             self.emit("status", "The AI's answer did not follow the format; asking it again ...")
@@ -7136,7 +7153,7 @@ class Investigation:
         for rnd in range(1, max_rounds + 1):
             if self.stopped():
                 return self._finish("stopped", prep)
-            reply = self._ask_ai_checked()
+            reply = self._ask_ai_checked(final=rnd == max_rounds)
             prep = prepare_plan(self.args, reply, require_mapping=False)
             self.emit("ai", prep["translated"])
             if not prep["collect"]:
@@ -7183,9 +7200,14 @@ class Investigation:
             self.messages.append({"role": "user", "content": "\n".join(msg), "_report": True})
         self.messages.append({"role": "user", "content": "The round limit is reached. Conclude now with the "
                               "evidence you have, in the conclusion format."})
-        reply = self._ask_ai_checked()
+        reply = self._ask_ai_checked(final=True)
         prep = prepare_plan(self.args, reply, require_mapping=False)
         self.emit("ai", prep["translated"])
+        if not is_conclusion(reply):
+            self.emit("warn", "The AI did not conclude within %d rounds although it was asked to. Its last plan "
+                              "is shown above but was not run. Start a new investigation with a more specific "
+                              "problem description, or raise max_rounds." % max_rounds)
+            return self._finish("no-conclusion", prep)
         return self._finish("concluded", prep)
 
     def _finish(self, how, prep, question=""):
@@ -7337,7 +7359,8 @@ def cmd_investigate(args):
             print("\n" + "=" * 78)
             print({"concluded": "The AI has concluded.", "declined": "Stopped: you declined a round.",
                    "stopped": "Investigation stopped.", "question": "The AI has a question for you:",
-                   "manual": "Run these commands yourself, then paste their output below."}[result["how"]])
+                   "manual": "Run these commands yourself, then paste their output below.",
+                   "no-conclusion": "The AI did not conclude within the round limit."}[result["how"]])
             if result["how"] == "question":
                 print(result["question"])
             if result["how"] == "manual":
@@ -8628,7 +8651,8 @@ async function invPoll() {
   if (inv.state === "error") { $("#invTitle").textContent = "Stopped: " + inv.error; return; }
   const f = inv.final;
   $("#invTitle").textContent = { concluded: "The AI has concluded", declined: "Stopped by you", stopped: "Investigation stopped",
-    question: "The AI has a question for you", manual: "Waiting for the output of the commands" }[f.how] || "Finished";
+    question: "The AI has a question for you", manual: "Waiting for the output of the commands",
+    "no-conclusion": "The AI did not conclude within the round limit" }[f.how] || "Finished";
   $("#invFinal").hidden = false;
   $("#invQuestion").hidden = f.how !== "question";
   $("#invQuestion").textContent = f.question || "";

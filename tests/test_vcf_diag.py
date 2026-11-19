@@ -904,6 +904,17 @@ class Investigations(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
 
+    def test_last_round_accepts_only_a_conclusion(self):
+        inv = v.Investigation.__new__(v.Investigation)
+        plan = "More data please.\n```vcf-plan\nplan: p\n[collect] target=h\nlabel: l\nrun: uptime\n```\n"
+        self.assertIsNone(inv._format_problem(plan))                       # fine in an ordinary round
+        self.assertEqual(inv._format_problem(plan, final=True), v.FINAL_CORRECTION)
+        self.assertIsNone(inv._format_problem("NO ROOT CAUSE FOUND: logs rotated", final=True))
+        self.assertIsNone(inv._format_problem("QUESTION FOR THE ADMINISTRATOR: which tenant?", final=True))
+        self.assertTrue(v.is_conclusion("ROOT CAUSE: x"))
+        self.assertFalse(v.is_conclusion(plan))
+        self.assertIn("Stay on the problem the administrator reported", v.investigator_prompt(5, False))
+
     def test_errors_are_explained(self):
         with self.assertRaises(v.AiError):
             v.AiClient("", "m", "k")
