@@ -2494,6 +2494,88 @@ class ReportDigest(unittest.TestCase):
         self.assertNotIn("**Password expiry: admin**", rep)
 
 
+class ReportSize(unittest.TestCase):
+    """Long lists of healthy things are summarized; problems stay listed in full."""
+
+    def test_interfaces_drop_pod_veths(self):
+        out = ("lo               UNKNOWN        127.0.0.1/8 ::1/128\neth0             UP             10.1.0.88/24\n"
+               + "".join("pod-%02d@if2 UP             fe80::%d/64\n" % (i, i) for i in range(20)))
+        short = v.post_interfaces(out)
+        self.assertIn("eth0", short)
+        self.assertNotIn("pod-03", short)
+        self.assertIn("(20 pod network interface(s) left out: 20 UP, 0 other)", short)
+        self.assertEqual(v.post_interfaces("lo UNKNOWN 127.0.0.1/8\n"), "lo UNKNOWN 127.0.0.1/8\n")
+
+    def test_workloads_list_only_the_short_ones(self):
+        out = ("NAMESPACE NAME READY UP-TO-DATE AVAILABLE AGE\n"
+               "prelude deployment.apps/abx-service-app 3/3 3 3 51d\n"
+               "prelude deployment.apps/blueprints-ui-app 0/0 0 0 112d\n"
+               "prelude deployment.apps/ebs-app 2/3 3 2 51d\n\n"
+               "NAMESPACE NAME READY AGE\nprelude statefulset.apps/vcfapostgres 3/3 51d\n\n"
+               "NAMESPACE NAME DESIRED CURRENT READY UP-TO-DATE AVAILABLE NODE SELECTOR AGE\n"
+               "kube-system daemonset.apps/kube-proxy 3 3 3 3 3 kubernetes.io/os=linux 147d\n"
+               "kube-system daemonset.apps/antrea-agent 3 3 2 3 2 kubernetes.io/os=linux 147d\n")
+        short = v.post_workloads(out)
+        self.assertTrue(short.startswith("2 daemonset(s), 3 deployment(s), 1 statefulset(s); 2 below"), short)
+        self.assertIn("deployment.apps/ebs-app 2/3", short)
+        self.assertIn("daemonset.apps/antrea-agent", short)
+        self.assertNotIn("abx-service-app", short)
+        healthy = "NAMESPACE NAME READY AGE\nprelude statefulset.apps/vcfapostgres 3/3 51d\n"
+        self.assertEqual(v.post_workloads(healthy), "1 statefulset(s): all at their desired replicas.")
+
+    def test_pvc_summary(self):
+        out = ("NAMESPACE NAME STATUS VOLUME CAPACITY ACCESS MODES STORAGECLASS VOLUMEATTRIBUTESCLASS AGE\n"
+               "prelude pgdata-0 Bound pvc-1 50Gi RWO sc <unset> 112d\n"
+               "prelude pgdata-1 Bound pvc-2 50Gi RWO sc <unset> 112d\n"
+               "vmsp-platform zot-1 Pending   sc <unset> 1d\n")
+        short = v.post_pvc(out)
+        self.assertIn("3 volume claim(s), 2 Bound; per namespace: prelude 2 (100 GiB), vmsp-platform 1 (0 GiB)", short)
+        self.assertIn("zot-1 Pending", short)
+        self.assertNotIn("pgdata-0", short)
+
+    def test_old_exited_containers_are_counted(self):
+        head = "CONTAINER IMAGE CREATED STATE NAME ATTEMPT POD ID POD NAMESPACE\n"
+        out = head + "924ffe5b 34d0 4 minutes ago Exited cert-update 0 c99 cert-update-cron-1 vmsp\n" + "".join(
+            "a%d 34d0 7 weeks ago Exited init-%d 0 p%d pod-%d prelude\n" % (i, i, i, i) for i in range(10))
+        short = v.post_exited_containers(out)
+        self.assertIn("4 minutes ago", short)
+        self.assertNotIn("init-3", short)
+        self.assertIn("(10 container(s) that exited more than a day ago left out", short)
+
+    def test_finished_job_pods_are_counted(self):
+        out = "\n".join(["ns/web-1  node=n1  phase=Running  reason=  [web ready=false restarts=4 waiting=CrashLoopBackOff]"]
+                        + ["ns/job-%d  node=n1  phase=Succeeded  reason=  [job ready=false restarts=0]" % i for i in range(4)])
+        short = v.post_problem_containers(out)
+        self.assertIn("web-1", short)
+        self.assertNotIn("job-2", short)
+        self.assertIn("(4 pod(s) of finished jobs (phase=Succeeded) left out)", short)
+
+    def test_log_errors_merge_pods_of_one_workload(self):
+        out = ("== prelude/account-manager-server-6846b8698b-g5ngc: 174 error line(s)\n   ctx canceled 1\n   ctx canceled 2\n"
+               "== prelude/account-manager-server-6846b8698b-hjmcl: 182 error line(s)\n   ctx canceled 3\n"
+               "== prelude/vcfapostgres-1: 11 error line(s)\n   duplicate key\n")
+        short = v.post_pod_log_errors(out)
+        self.assertTrue(short.startswith("== prelude/account-manager-server (2 pods): 356 error line(s)\n   ctx canceled 1\n"), short)
+        self.assertEqual(short.count("ctx canceled"), 1)                  # same message, other numbers
+        self.assertIn("== prelude/vcfapostgres: 11 error line(s)", short)
+        self.assertEqual(v.KEY_FACTS["Errors in Automation pod logs (last 30 min)"](short),
+                         [("automation_pods_with_log_errors", 3)])
+        self.assertIn("ConcatFilter::TimeoutError", v.LOG_NOISE)
+
+    def test_same_output_on_one_host_is_printed_once(self):
+        res = ReportDigest.res
+        pods = "vmsp rotate-a 0/1 Error 0 49d\nvmsp rotate-b 0/1 Error 0 49d\nvmsp rotate-c 0/1 Error 0 49d"
+        t = types.SimpleNamespace(ph="vcfa-01", mode="sh", errkind=None, errmsg="", identity=[], user="u",
+                                  notes=[], clock_offset=None,
+                                  results=[res("Automation pods not Running or not Ready", pods),
+                                           res("Pods not Running or not Ready", pods)])
+        rep = v.build_report(types.SimpleNamespace(ssh_banner="x"), [({"sec": {"name": "vcfa", "type": "vcfa"}}, [t])],
+                             make(), v.datetime.datetime(2026, 11, 19), 400)
+        self.assertEqual(rep.count("rotate-b"), 1)
+        self.assertIn("**Pods not Running or not Ready** (ok) - same output as "
+                      "**Automation pods not Running or not Ready** above.", rep)
+
+
 FAKE_KUBECTL = r"""#!/bin/sh
 a="$*"
 case "$a" in

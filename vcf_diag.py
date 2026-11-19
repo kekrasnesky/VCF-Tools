@@ -697,6 +697,126 @@ def post_all_pods(out):
     return "\n".join(lines)
 
 
+def post_interfaces(out):
+    """ip -br addr: keep the node's own interfaces; pod network ends (veth pairs, 'name@ifN') are counted."""
+    lines = out.splitlines()
+    if not lines or not all(len(ln.split()) >= 2 for ln in lines if ln.strip()):
+        return out
+    pods = [ln for ln in lines if re.match(r"\S+@if\d+\s", ln)]
+    if len(pods) < 5:
+        return out
+    keep = [ln for ln in lines if ln not in pods]
+    up = sum(1 for ln in pods if ln.split()[1] == "UP")
+    return "\n".join(keep + ["(%d pod network interface(s) left out: %d UP, %d other)" % (len(pods), up, len(pods) - up)])
+
+
+def post_workloads(out):
+    """kubectl get deploy,sts,ds -A: counts per kind; only rows below their desired replicas are listed."""
+    kinds, bad, header = {}, [], {}
+    for ln in out.splitlines():
+        cols = ln.split()
+        if not cols:
+            continue
+        if cols[0] == "NAMESPACE":
+            header["ds" if "DESIRED" in cols else "x"] = ln
+            continue
+        if len(cols) < 4 or "/" not in cols[1]:
+            return out
+        kind = cols[1].split("/")[0].split(".")[0]
+        kinds[kind] = kinds.get(kind, 0) + 1
+        if kind == "daemonset":
+            if len(cols) < 7 or not (cols[2] == cols[4] == cols[6]):
+                bad.append(ln)
+        else:
+            m = re.fullmatch(r"(\d+)/(\d+)", cols[2])
+            if not m:
+                return out
+            if m.group(1) != m.group(2):
+                bad.append(ln)
+    if not kinds:
+        return out
+    head = ", ".join("%d %s(s)" % (n, k) for k, n in sorted(kinds.items()))
+    if not bad:
+        return head + ": all at their desired replicas."
+    return "\n".join([head + "; %d below their desired replicas:" % len(bad)] + bad)
+
+
+def post_pvc(out):
+    """kubectl get pvc -A: claims and capacity per namespace; only claims that are not Bound are listed."""
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    if not lines or not lines[0].startswith("NAMESPACE"):
+        return out
+    per, bad = {}, []
+    for ln in lines[1:]:
+        cols = ln.split()
+        if len(cols) < 3:
+            return out
+        n, gi = per.get(cols[0], (0, 0.0))
+        m = re.fullmatch(r"(\d+(?:\.\d+)?)(Mi|Gi|Ti)", cols[4]) if len(cols) > 4 else None
+        size = float(m.group(1)) * {"Mi": 1 / 1024.0, "Gi": 1, "Ti": 1024}[m.group(2)] if m else 0
+        per[cols[0]] = (n + 1, gi + size)
+        if cols[2] != "Bound":
+            bad.append(ln)
+    total = sum(n for n, _ in per.values())
+    res = ["%d volume claim(s), %d Bound; per namespace: %s" % (total, total - len(bad), ", ".join(
+        "%s %d (%.0f GiB)" % (ns, n, gi) for ns, (n, gi) in per.items()))]
+    return "\n".join(res + ([lines[0]] + bad if bad else []))
+
+
+def post_exited_containers(out):
+    """crictl ps -a (not Running): containers that exited in the last day are listed; older ones
+    (init containers, finished jobs) are counted."""
+    lines = out.splitlines()
+    if not lines or not lines[0].startswith("CONTAINER"):
+        return out
+    recent = [ln for ln in lines[1:] if re.search(r"\b(?:seconds?|minutes?|hours?|About an hour) ago\b", ln)]
+    old = len(lines) - 1 - len(recent)
+    if old < 5:
+        return out
+    return "\n".join([lines[0]] + recent + ["(%d container(s) that exited more than a day ago left out: init "
+                                            "containers and finished jobs)" % old])
+
+
+def post_problem_containers(out):
+    """Problem containers: pods of finished jobs (phase=Succeeded) are counted, not listed."""
+    lines = out.splitlines()
+    done = [ln for ln in lines if "  phase=Succeeded  " in ln]
+    if len(done) < 3:
+        return out
+    return "\n".join([ln for ln in lines if ln not in done] +
+                     ["(%d pod(s) of finished jobs (phase=Succeeded) left out)" % len(done)])
+
+
+def post_pod_log_errors(out):
+    """Errors in pod logs: pods of the same workload are merged into one entry with the total."""
+    blocks, order = {}, []
+    cur = None
+    for ln in out.splitlines():
+        m = re.match(r"== (\S+?)/(\S+): (\d+) error line\(s\)$", ln)
+        if m:
+            key = (m.group(1), RX_POD_SUFFIX.sub("", m.group(2)) or m.group(2))
+            cur = blocks.get(key)
+            if cur is None:
+                cur = blocks[key] = {"pods": 0, "n": 0, "lines": []}
+                order.append(key)
+            cur["pods"] += 1
+            cur["n"] += int(m.group(3))
+        elif cur is not None and ln.startswith("   "):
+            sample = re.sub(r"\d", "#", ln)
+            if sample not in [re.sub(r"\d", "#", x) for x in cur["lines"]] and len(cur["lines"]) < 2:
+                cur["lines"].append(ln)
+        elif ln.strip():
+            return out
+    if not order or len(order) == sum(b["pods"] for b in blocks.values()):
+        return out
+    res = []
+    for ns, wl in sorted(order, key=lambda k: -blocks[k]["n"]):
+        b = blocks[(ns, wl)]
+        res.append("== %s/%s%s: %d error line(s)" % (ns, wl, " (%d pods)" % b["pods"] if b["pods"] > 1 else "", b["n"]))
+        res += b["lines"]
+    return "\n".join(res)
+
+
 def post_esxi_policy(out):
     """esxcli advanced settings for the password and lockout policy, one line per option."""
     vals, cur, errs = [], None, {}
@@ -764,7 +884,7 @@ def linux_groups(cert=True):
             cmd("Resolver configuration", "grep -v '^#' /etc/resolv.conf 2>&1", harvest=[H_SEARCH]),
         ]),
         ("network", "Interfaces and routes", [
-            cmd("Interfaces", "ip -br addr 2>/dev/null || ifconfig -a 2>&1"),
+            cmd("Interfaces", "ip -br addr 2>/dev/null || ifconfig -a 2>&1", post=post_interfaces),
             cmd("Routes", "ip route 2>&1 | head -n 60"),
         ]),
         ("accounts", "Password expiry", [
@@ -811,10 +931,10 @@ K8S_GROUPS = [
         kctl("All pods (per namespace)", "{K} get pods -A -o wide 2>&1", k8s="nsrows", max_lines=300,
              post=post_all_pods),
         kctl("Deployments, StatefulSets, DaemonSets", "{K} get deploy,sts,ds -A 2>&1",
-             k8s="nsrows", max_lines=500),
+             k8s="nsrows", max_lines=500, post=post_workloads),
     ]),
     ("k8s-storage", "Persistent storage", [
-        kctl("Persistent volume claims", "{K} get pvc -A 2>&1", k8s="nsrows", max_lines=300),
+        kctl("Persistent volume claims", "{K} get pvc -A 2>&1", k8s="nsrows", max_lines=300, post=post_pvc),
         kctl("Persistent volumes not Bound", "{K} get pv 2>&1", max_lines=300, post=post_pv),
     ]),
     ("k8s-events", "Warning events", [
@@ -845,7 +965,8 @@ K8S_GROUPS = [
              "--key=/etc/kubernetes/pki/etcd/server.key $c 2>&1; done; fi", timeout=90),
         kctl("Problem containers (not ready, waiting, restarted, last termination)",
              "{K} get pods -A -o jsonpath=%s 2>&1 | awk '/ready=false|waiting=[A-Za-z]|restarts=[1-9]|"
-             "phase=(Pending|Failed|Unknown)/' | head -n 150" % shlex.quote(POD_JSONPATH), k8s="nsslash", max_lines=200),
+             "phase=(Pending|Failed|Unknown)/' | head -n 150" % shlex.quote(POD_JSONPATH), k8s="nsslash", max_lines=200,
+             post=post_problem_containers),
         kctl("Containers killed for running out of memory (OOMKilled)",
              "{K} get pods -A -o jsonpath=%s 2>&1 | grep OOMKilled | head -n 50 || echo 'none'"
              % shlex.quote(POD_JSONPATH), k8s="nsslash"),
@@ -1173,7 +1294,8 @@ MGMT_NODE_GROUPS = [
         cmd("kubelet and containerd", "systemctl status kubelet containerd --no-pager --lines=0 2>&1 | head -n 200",
             sudo=True, post=post_systemctl_status, max_lines=60),
         cmd("Containers not running",
-            "crictl ps -a 2>/dev/null | awk 'NR==1 || $0 !~ /Running/' | head -n 60", sudo=True),
+            "crictl ps -a 2>/dev/null | awk 'NR==1 || $0 !~ /Running/' | head -n 150", sudo=True,
+            post=post_exited_containers, max_lines=60),
         cmd("Recent kubelet errors",
             "journalctl -u kubelet --since '-2h' --no-pager 2>/dev/null | grep -iE 'error|fail' | tail -n 150",
             sudo=True, post=post_kubelet_errors, max_lines=80),
@@ -1281,6 +1403,12 @@ _VCFA_NS = ("NS=$({K} get ns --no-headers -o custom-columns=:metadata.name 2>/de
 # keep only rows whose first column (the namespace) is one of $NS
 _VCFA_IN = "awk -v ns=\" $NS\" 'index(ns, \" \"$1\" \")"
 _NONE = "out=$(%s); if [ -n \"$out\" ]; then echo \"$out\"; else echo none; fi"
+
+
+# Log lines that match "error" but are known not to be faults: the services' OpenTelemetry exporter
+# finding no collector on :4317, fluentd's multi-line joiner flushing on time, squid noting health
+# probes that close the connection early.
+LOG_NOISE = r":4317|ConcatFilter::TimeoutError|transaction-end-before-headers"
 
 
 def _vcfa(label, body, **kw):
@@ -1558,15 +1686,17 @@ AUTOMATION_GROUPS = [
         _vcfa("Automation databases and volumes",
               "echo 'database pods:'; " + _NONE % (
                   "{K} get pods -A -o wide --no-headers 2>&1 | " + _VCFA_IN +
-                  " && $2 ~ /postgres|pgsql|-db-|database/'") + "; echo; echo 'volume claims:'; " + _NONE % (
-                  "{K} get pvc -A --no-headers 2>&1 | " + _VCFA_IN + "'"), k8s="nsrows", max_lines=150),
+                  " && $2 ~ /postgres|pgsql|-db-|database/'") + "; echo; {K} get pvc -A --no-headers 2>&1 | " + _VCFA_IN + " {n++; if ($3!=\"Bound\") {b++; print}}"
+              " END{print \"volume claims: \" n+0 \", not Bound: \" b+0 \" (all claims: Persistent volume claims)\"}'",
+              k8s="nsrows", max_lines=150),
         _vcfa("Errors in Automation pod logs (last 30 min)", _NONE % (
               "for ns in $NS; do for p in $({K} get pods -n \"$ns\" --field-selector=status.phase=Running -o name"
               " 2>/dev/null); do e=$({K} logs -n \"$ns\" \"$p\" --all-containers --since=30m --tail=5000 2>/dev/null"
-              " | grep -iE '(^|[^a-z])(error|fatal|severe)([^a-z]|$)|exception'); n=$(printf '%s\\n' \"$e\" | grep -c .);"
+              " | grep -iE '(^|[^a-z])(error|fatal|severe)([^a-z]|$)|exception' | grep -vE '" + LOG_NOISE + "');"
+              " n=$(printf '%s\\n' \"$e\" | grep -c .);"
               " if [ \"$n\" -gt 0 ]; then echo \"== $ns/${p#pod/}: $n error line(s)\"; printf '%s\\n' \"$e\""
               " | tail -n 2 | cut -c1-300 | sed 's/^/   /'; fi; done; done"),
-              k8s="nsslash", timeout=300, max_lines=300),
+              k8s="nsslash", timeout=300, max_lines=300, post=post_pod_log_errors),
         _vcfa("Automation ingress hosts and certificates",
               "hosts=$(for ns in $NS; do {K} get ingress -n \"$ns\" -o jsonpath='{range .items[*]}"
               "{range .spec.rules[*]}{.host}{\"\\n\"}{end}{end}' 2>/dev/null; done | grep . | sort -u | head -n 5);"
@@ -4789,7 +4919,8 @@ KEY_FACTS = {
     "Automation pods not Running or not Ready": _vcfa_fact("automation_pods_not_ready", _rows),
     "Automation workloads below desired replicas": _vcfa_fact("automation_workloads_below_desired", _rows),
     "Errors in Automation pod logs (last 30 min)": _vcfa_fact(
-        "automation_pods_with_log_errors", lambda o: len(re.findall(r"(?m)^== ", o))),
+        "automation_pods_with_log_errors", lambda o: sum(int(m.group(1) or 1) for m in re.finditer(
+            r"(?m)^== \S+?(?: \((\d+) pods\))?: \d+ error line", o))),
     "Automation ingress hosts and certificates": _fact_vcfa_certs,
     VCFA_AUTH_LABEL: _fact_vcfa_auth,
     "Version": lambda o: [("version", m.group(1)) for m in [re.search(r"Version (\S+)", o)] if m],
@@ -5246,13 +5377,21 @@ def build_report(ctx, done, scrubber, started, max_lines, kind="health", title="
                 w("")
                 w("%d check(s) with the same output as the other hosts are in the 'Identical on' section above; "
                   "the checks below differ." % (len(t.results) - len(left)))
-            gkey = None
+            gkey, first_with = None, {}
             for i, r in left:
                 if r["group"][0] != gkey:
                     gkey = r["group"][0]
                     w("")
                     w("#### %s - %s" % (gkey, r["group"][1]))
-                write_check(r, shown[id(t)][i])
+                body = shown[id(t)][i]
+                same = first_with.get(body) if r["status"] == "ok" else None
+                if same:
+                    w("")
+                    w("**%s** (%s) - same output as **%s** above." % (S(r["label"]), _status_text(r), S(same)))
+                    continue
+                if r["status"] == "ok" and body.count("\n") >= 2:
+                    first_with[body] = r["label"]
+                write_check(r, body)
     if long_cmds:
         w("")
         w("## Appendix: long commands")

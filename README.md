@@ -347,7 +347,13 @@ The report is built for an analyst (human or AI) who has to find the real proble
   **Identical on all N hosts**; each host then shows only what differs.
 - Noisy output is summarized before anonymizing: repeated log lines are grouped with a count and
   first/last time stamp, warning events are aggregated, container and pod mounts are left out of
-  `df`, all pods are counted per namespace. The anonymizer still reads the full output.
+  `df`, all pods are counted per namespace. Healthy lists are counted and only problems listed:
+  deployments, StatefulSets and DaemonSets below their desired replicas, volume claims not Bound,
+  containers that exited in the last day (older init containers and finished jobs are counted),
+  pod network interfaces. Pods of one workload are merged in the log-error check, and known noise
+  (the telemetry exporter on :4317, fluentd flush timeouts, squid probe lines) is not counted.
+  The anonymizer still reads the full output.
+- On one host, a check with the same output as an earlier check is printed once and referenced.
 - Commands longer than 120 characters are printed once, in **Appendix: long commands**.
 - When a report is too long for the AI, the lowest-value detail is left out first (identical
   sections, inventory-like lists, long successful outputs), never the findings, the summary,
