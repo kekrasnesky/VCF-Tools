@@ -787,6 +787,31 @@ def post_problem_containers(out):
                      ["(%d pod(s) of finished jobs (phase=Succeeded) left out)" % len(done)])
 
 
+_RX_OLD_FAILED = re.compile(r"^(\S+)\s+(\S+)\s+\d+/\d+\s+(?:Error|Failed|ContainerStatusUnknown)\s+\d+"
+                            r"(?:\s+\([^)]*\))?\s+(\d+d\S*)(?:\s|$)")
+
+
+def post_not_ready(out):
+    """Pods not Running or not Ready: failed pods older than a day (left behind by finished job
+    runs) are counted per job, not listed and not counted as not ready."""
+    keep, old = [], {}
+    for ln in out.splitlines():
+        m = _RX_OLD_FAILED.match(ln)
+        if m:
+            key = "%s/%s" % (m.group(1), RX_POD_SUFFIX.sub("", m.group(2)) or m.group(2))
+            old[key] = old.get(key, 0) + 1
+        else:
+            keep.append(ln)
+    if not old:
+        return out
+    if not [ln for ln in keep if ln.strip() and ln.strip() != "none"]:
+        keep = ["none"]
+    return "\n".join(keep + ["(%d failed pod(s) older than a day left out - leftovers of finished job runs, not "
+                             "running workloads: %s. They can be removed with: kubectl delete pod -n <namespace> "
+                             "--field-selector=status.phase=Failed)" % (sum(old.values()), ", ".join(
+                                 "%s x%d" % kv for kv in sorted(old.items())))])
+
+
 def post_pod_log_errors(out):
     """Errors in pod logs: pods of the same workload are merged into one entry with the total."""
     blocks, order = {}, []
@@ -923,7 +948,7 @@ K8S_GROUPS = [
         kctl("Pods not Running or not Ready",
              "{K} get pods -A -o wide --no-headers 2>&1 | awk '{split($3,a,\"/\");"
              " if ($4!=\"Completed\" && ($4!=\"Running\" || a[1]!=a[2])) print}'",
-             k8s="nsrows", max_lines=300),
+             k8s="nsrows", max_lines=300, post=post_not_ready),
         kctl("Pods with most restarts",
              "{K} get pods -A --no-headers 2>&1 | awk '$5+0>0' | sort -k5 -n -r | head -n 30",
              k8s="nsrows"),
@@ -1420,8 +1445,8 @@ def _vcfa(label, body, **kw):
 # One pass over the pods that authenticate users and cluster agents. The shell side counts
 # error signatures exactly and keeps a sample of lines; post_vcfa_auth() turns that into a
 # table, the rejected agents, the oldest error still logged and DIAGNOSIS lines that become
-# findings. Example it was written for: VKS cluster "Monitor" tabs saying "Unable to
-# authenticate" while agent-gateway-server logs "invalid v1agent token".
+# findings. Example it was written for: agent-gateway-server logging "invalid v1agent token"
+# for callers holding tokens Automation no longer has a record of.
 VCFA_AUTH_LABEL = "Automation authentication chain (users and cluster agents, last 30 min)"
 VCFA_AUTH_PODS = ("authentication-server|agent-gateway-server|api-gateway-server|ccs-vksm-eas|"
                   "account-manager-server|cluster-sync-ingest|cluster-sync-egest|vmsp-identity|vmsp-gateway")
@@ -1450,7 +1475,7 @@ _AUTH_FIRST = "no such valid token|invalid v1agent token|missing auth token"
 VCFA_AUTH_CMD = (
     # pod addresses first, so that the client address of a rejected call can be named as a pod
     "{K} get pods -A -o jsonpath='{range .items[*]}{\"@@PODIP \"}{.metadata.namespace}/{.metadata.name}"
-    " {.status.podIP}{\"\\n\"}{end}' 2>/dev/null;"
+    " {.status.podIP} {.status.startTime}{\"\\n\"}{end}' 2>/dev/null;"
     " found=0; for ns in $NS; do for p in $({K} get pods -n \"$ns\" --field-selector=status.phase=Running -o name"
     " 2>/dev/null | grep -E '" + VCFA_AUTH_PODS + "'); do found=1;"
     " echo \"@@POD $ns/${p#pod/} $({K} get -n \"$ns\" \"$p\" -o jsonpath='{.status.startTime}"
@@ -1495,8 +1520,8 @@ def parse_vcfa_auth(out):
     for ln in (out or "").splitlines():
         if ln.startswith("@@PODIP "):
             parts = ln.split()
-            if len(parts) == 3:
-                ips[parts[2]] = parts[1]
+            if len(parts) >= 3:
+                ips[parts[2]] = (parts[1], _ts(parts[3]) if len(parts) > 3 else None)
             continue
         if ln.startswith("@@POD "):
             parts = ln.split()
@@ -1524,10 +1549,13 @@ def parse_vcfa_auth(out):
 
 
 def vcfa_auth_clients(data):
-    """[(address, pod or None, calls)]: who calls agent-gateway-server with a rejected agent token.
-    Only the gateway's own server-side lines count: there the peer is the real caller (in the
-    authentication-server lines it is just the gateway)."""
+    """[(address, pod or None, calls, last seen)]: who calls agent-gateway-server with a rejected
+    agent token. Only the gateway's own server-side lines count: there the peer is the real caller
+    (in the authentication-server lines it is just the gateway). Pod addresses are reused, so a
+    call older than the pod now holding the address came from an earlier pod: that one is named
+    'an earlier pod (address now used by ...)' instead."""
     seen = {}
+    ips = data.get("ips", {})
     for pod, d in data["pods"].items():
         if _workload(pod) != "agent-gateway-server":
             continue
@@ -1535,8 +1563,14 @@ def vcfa_auth_clients(data):
             if "v1agent token" in ln.lower() and "server-serve-grpc" in ln:
                 for m in _RX_PEER.finditer(ln):
                     addr = m.group(1).rsplit(":", 1)[0] if m.group(1).count(":") == 1 else m.group(1)
-                    seen[addr] = seen.get(addr, 0) + 1
-    return sorted(((a, data.get("ips", {}).get(a), n) for a, n in seen.items()), key=lambda x: -x[2])
+                    t = _ts(ln)
+                    owner, start = ips.get(addr, (None, None))
+                    if owner and t and start and t < start:
+                        owner = "an earlier pod (the address is now used by %s)" % owner
+                    key = (addr, owner)
+                    n, last = seen.get(key, (0, None))
+                    seen[key] = (n + 1, max(last or "", t or "") or None)
+    return sorted(((a, p, n, last) for (a, p), (n, last) in seen.items()), key=lambda x: (-x[2], x[0]))
 
 
 def vcfa_auth_diagnosis(data):
@@ -1555,12 +1589,21 @@ def vcfa_auth_diagnosis(data):
                      "(database restore or rollback, failed migration); re-register the clusters, or open a "
                      "support case before changing anything" % len(agents))
         else:
-            scope = ("the log lines do not name the agent: compare with which clusters' Monitor tabs fail - one "
-                     "cluster means re-register it, all clusters means the token records were lost")
+            scope = ("the log lines do not name the agent: one affected cluster means re-register it, all "
+                     "clusters means the token records were lost")
         clients = vcfa_auth_clients(data)
+        current = [c for c in clients if c[1] and not c[1].startswith("an earlier pod")]
+        if len(clients) > 1 and not agents and current:
+            scope = ("%d clients; the ones still running are Automation pods: %s. Restart their workloads so they "
+                     "fetch new tokens (kubectl -n <namespace> rollout restart <deployment>); a client listed as "
+                     "an earlier pod is already gone. If a freshly started pod is rejected again, its token comes "
+                     "from stored configuration Automation no longer accepts: open a support case"
+                     % (len(clients), ", ".join(sorted(set(c[1] for c in current)))))
         if len(clients) == 1 and not agents:
-            addr, pod, _ = clients[0]
-            if pod and re.search(r"envoy|gateway|proxy|ingress|haproxy|nginx", pod.split("/")[-1]):
+            addr, pod = clients[0][:2]
+            if pod and pod.startswith("an earlier pod"):
+                scope = ("one client, %s (%s), which no longer exists: check that the errors have stopped" % (pod, addr))
+            elif pod and re.search(r"envoy|gateway|proxy|ingress|haproxy|nginx", pod.split("/")[-1]):
                 scope = ("one client, %s (%s), a proxy in the Automation cluster: the agent is behind it - its "
                          "access log names the agent" % (pod, addr))
             elif pod:
@@ -1570,13 +1613,19 @@ def vcfa_auth_diagnosis(data):
             else:
                 scope = ("one client at %s, which is not a pod address: an agent outside the Automation cluster "
                          "(a VKS cluster or its load balancer) - re-register that cluster" % addr)
-        res.append(("high", "VCF Automation rejects cluster agent tokens (%d line(s) in 30 min; Automation has no "
-                            "record of the token: %d): VKS cluster Monitor tabs show 'Unable to authenticate'. "
-                            "Seen from %s" % (unknown + rejected, unknown, scope)))
+        res.append(("high", "VCF Automation rejects cluster agent tokens (%d line(s) in 30 min, %d of them for "
+                            "tokens Automation has no record of): the affected agents cannot sync with Automation. "
+                            "Source: %s" % (unknown + rejected, unknown, scope)))
         since = vcfa_auth_since(data)
         if since:
             res.append(("info", "oldest agent token error still logged: " + since))
-    if missing:
+    k3s = [ln for pod, d in pods.items() if _workload(pod) == "ccs-vksm-eas" for ln in d["lines"]
+           if "metadata-informers" in ln and "k3s/" in ln]
+    if missing and k3s and set(counts.get("missing_token", {})) == {"ccs-vksm-eas"}:
+        res.append(("info", "%d request(s) in 30 min without an auth token at ccs-vksm-eas come from Automation's own "
+                            "ccs-k3s metadata informers (user agent k3s .../metadata-informers): internal background "
+                            "calls, normally harmless and not related to the agent token errors" % missing))
+    elif missing:
         also = " - probably the same agents as above" if (unknown or rejected) else (
             " - credentials are lost before this service: check api-gateway-server and how the UI or agents call it")
         res.append(("med", "%d request(s) in 30 min arrived without an auth token at %s%s" % (missing, where("missing_token"), also)))
@@ -1649,8 +1698,9 @@ def post_vcfa_auth(out):
         lines += ["  %4d x %s" % (n, a) for a, n in agents[:15]]
     clients = vcfa_auth_clients(data)
     if clients:
-        lines.append("callers of agent-gateway-server with a rejected token: " + ", ".join(
-            "%s = %s (%d)" % (a, p or "not a pod in this cluster", n) for a, p, n in clients[:10]))
+        lines.append("callers of agent-gateway-server whose agent tokens were rejected:")
+        lines += ["  %s = %s (%d call(s), last %s)" % (a, p or "not a pod in this cluster", n, last or "?")
+                  for a, p, n, last in clients[:10]]
     diag = vcfa_auth_diagnosis(data)
     if diag:
         lines.append("")
@@ -1680,9 +1730,9 @@ def _fact_vcfa_auth(out):
     if out.startswith("No VCF Automation namespaces found"):
         return [("automation_namespaces", "none found")]
     f = []
-    for key, name in (("agent token unknown to Automation", "automation_agent_token_unknown_30m"),
-                      ("agent token rejected", "automation_agent_token_rejected_30m"),
-                      ("request without an auth token", "automation_missing_auth_token_30m")):
+    for key, name in (("agent token unknown to Automation", "automation_agent_auth_unknown_30m"),
+                      ("agent token rejected", "automation_agent_auth_rejected_30m"),
+                      ("request without an auth token", "automation_requests_without_auth_30m")):
         m = re.search(r"(?m)^%s\s+(\d+)  " % re.escape(key), out)
         if m:
             f.append((name, int(m.group(1))))
@@ -1702,7 +1752,7 @@ AUTOMATION_GROUPS = [
         _vcfa("Automation pods not Running or not Ready", _NONE % (
               "{K} get pods -A -o wide --no-headers 2>&1 | " + _VCFA_IN +
               " {split($3,a,\"/\"); if ($4!=\"Completed\" && ($4!=\"Running\" || a[1]!=a[2])) print}'"),
-              k8s="nsrows", max_lines=200),
+              k8s="nsrows", max_lines=200, post=post_not_ready),
         _vcfa("Automation workloads below desired replicas", _NONE % (
               "{K} get deploy,sts -A --no-headers 2>&1 | " + _VCFA_IN +
               " {split($3,a,\"/\"); if (a[1]!=a[2]) print}'"), k8s="nsrows"),
@@ -4764,7 +4814,8 @@ def _vcfa_fact(key, count):
 
 
 def _rows(out):
-    return 0 if out.strip() == "none" else len([ln for ln in out.splitlines() if ln.strip()])
+    return 0 if out.strip() == "none" else len([ln for ln in out.splitlines()
+                                                if ln.strip() and ln.strip() != "none" and not ln.startswith("(")])
 
 
 def _fact_vcfa_certs(out):
@@ -4972,7 +5023,8 @@ KEY_FACTS = {
     "Password ageing": _fact_chage,
     "Local account password ageing": _fact_chage,
     "Nodes": _fact_nodes,
-    "Pods not Running or not Ready": lambda o: [("pods_not_ready", len(_data_rows(o)))],
+    "Pods not Running or not Ready": lambda o: [("pods_not_ready", len([
+        ln for ln in _data_rows(o) if not ln.startswith("(") and ln.strip() != "none"]))],
     "Pods with most restarts": _fact_top_restarts,
     "VKS / Cluster API clusters": _fact_capi,
     "Cluster API machines (worker VM lifecycle)": _fact_capi,

@@ -2745,13 +2745,13 @@ class Automation(unittest.TestCase):
         self.assertIn("probably the same agents", out)
         self.assertIn("authentication-server-695678cb7f-7jcgk 1 time(s)", out)
         facts = dict(v.KEY_FACTS[v.VCFA_AUTH_LABEL](out))
-        self.assertEqual((facts["automation_agent_token_rejected_30m"], facts["automation_missing_auth_token_30m"],
+        self.assertEqual((facts["automation_agent_auth_rejected_30m"], facts["automation_requests_without_auth_30m"],
                           facts["automation_rejected_agents"]), (3, 2, 2))
         t = types.SimpleNamespace(errkind=None, clock_offset=None, sec={"type": "vcfa"},
                                   results=[{"status": "ok", "label": v.VCFA_AUTH_LABEL, "out": out}])
         found = v.target_findings(t, [])
         self.assertEqual(found[0][0], "high")
-        self.assertIn("Unable to authenticate", found[0][1])
+        self.assertIn("cannot sync with Automation", found[0][1])
 
     def test_authentication_chain_names_the_calling_pod(self):
         line = ('{"component":"server-serve-grpc","grpc.code":"Unauthenticated","grpc.error":"rpc error: code = '
@@ -2761,13 +2761,56 @@ class Automation(unittest.TestCase):
                "@@POD prelude/agent-gateway-server-7876649b8b-b4hct 2026-11-19T18:36:00Z 0\n"
                "@@COUNT agent_token_rejected 4\n@@LINE %s\n@@LINE %s\n")
         out = v.post_vcfa_auth(raw % (line % "198.18.4.50", line % "198.18.4.50"))
-        self.assertIn("198.18.4.50 = vmsp-platform/vmsp-agent-7ccb5bbd97-4hbr4 (2)", out)
+        self.assertIn("198.18.4.50 = vmsp-platform/vmsp-agent-7ccb5bbd97-4hbr4 (2 call(s), last ?)", out)
         self.assertIn("one client, the Automation pod vmsp-platform/vmsp-agent-7ccb5bbd97-4hbr4", out)
         self.assertIn("kubectl -n vmsp-platform rollout restart", out)
         out = v.post_vcfa_auth(raw % (line % "198.18.4.60", line % "198.18.4.60"))
         self.assertIn("a proxy in the Automation cluster", out)
         out = v.post_vcfa_auth(raw % (line % "10.231.0.200", line % "10.231.0.200"))
         self.assertIn("not a pod address", out)
+
+    def test_authentication_chain_reused_address_and_redaction(self):
+        line = ('{"component":"server-serve-grpc","grpc.code":"Unauthenticated","grpc.error":"invalid v1agent token",'
+                '"grpc.start_time":"%s","peer.address":"%s:47838"}')
+        raw = ("@@PODIP vmsp-platform/vcfa-gateway-configuration-867c796d5d-t4wq9 198.18.4.70 2026-11-19T18:40:00Z\n"
+               "@@PODIP vmsp-platform/platform-trust-cronjob-29918580hx8sq 198.18.4.50 2026-11-19T19:00:00Z\n"
+               "@@POD prelude/agent-gateway-server-7876649b8b-b4hct 2026-11-19T18:36:00Z 0\n"
+               "@@COUNT agent_token_rejected 3\n@@LINE %s\n@@LINE %s\n@@LINE %s\n"
+               % (line % ("2026-11-19T18:45:00Z", "198.18.4.50"), line % ("2026-11-19T19:10:00Z", "198.18.4.70"),
+                  line % ("2026-11-19T19:11:00Z", "198.18.4.70")))
+        out = v.post_vcfa_auth(raw)
+        self.assertIn("198.18.4.70 = vmsp-platform/vcfa-gateway-configuration-867c796d5d-t4wq9 (2 call(s), "
+                      "last 2026-11-19T19:11:00Z)", out)
+        self.assertIn("198.18.4.50 = an earlier pod (the address is now used by "
+                      "vmsp-platform/platform-trust-cronjob-29918580hx8sq)", out)
+        self.assertIn("the ones still running are Automation pods: "
+                      "vmsp-platform/vcfa-gateway-configuration-867c796d5d-t4wq9", out)
+        scrubbed = v.Scrubber(v.Mapping(None)).scrub(out)
+        self.assertNotIn("REDACTED", scrubbed)
+        facts = v.KEY_FACTS[v.VCFA_AUTH_LABEL](out)
+        self.assertNotIn("REDACTED", v.Scrubber(v.Mapping(None)).scrub("\n".join("%s: %s" % f for f in facts)))
+
+    def test_k3s_informer_calls_without_token_are_internal(self):
+        raw = ("@@POD prelude/ccs-vksm-eas-764dcb6877-nsrqh 2026-11-04T20:00:03Z 0\n@@COUNT missing_token 480\n"
+               "@@COUNT unauthenticated 492\n"
+               '@@LINE {"level":"error","msg":"missing auth token in request"}\n'
+               '@@LINE {"msg":"HTTP","resp":401,"userAgent":"k3s/v1.35.5+k3s (linux/amd64) kubernetes/unknown/metadata-informers"}\n')
+        out = v.post_vcfa_auth(raw)
+        self.assertIn("DIAGNOSIS (info): 480 request(s)", out)
+        self.assertIn("ccs-k3s metadata informers", out)
+        self.assertNotIn("(med)", out)
+
+    def test_old_failed_job_pods_are_not_counted_as_not_ready(self):
+        out = ("vmsp-platform   rotate-zot-bcrypt-secret-29846940-56d6h   0/1   Error   0   49d   198.18.4.215   n1   <none>   <none>\n"
+               "vmsp-platform   rotate-zot-bcrypt-secret-29846940-9hcvx   0/1   Error   0   49d   198.18.4.182   n1   <none>   <none>\n")
+        res = v.post_not_ready(out)
+        self.assertTrue(res.startswith("none\n(2 failed pod(s) older than a day"))
+        self.assertIn("vmsp-platform/rotate-zot-bcrypt-secret x2", res)
+        self.assertEqual(v.KEY_FACTS["Automation pods not Running or not Ready"](res), [("automation_pods_not_ready", 0)])
+        fresh = "prelude   x-7b9c977d69-mh49z   0/1   Running   0   5m   1.2.3.4   n1   <none>   <none>"
+        self.assertEqual(v.post_not_ready(fresh), fresh)
+        mixed = v.post_not_ready(fresh + "\n" + out)
+        self.assertEqual(v.KEY_FACTS["Automation pods not Running or not Ready"](mixed), [("automation_pods_not_ready", 1)])
 
     def test_authentication_chain_quiet_and_single_agent(self):
         quiet = v.post_vcfa_auth("@@POD prelude/authentication-server-a1b2c3d4e5-abcde 2026-11-01T00:00:00Z 0\n")
