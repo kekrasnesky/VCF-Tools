@@ -1448,7 +1448,10 @@ _AUTH_GREP = "|".join(rx for _, rx, _ in VCFA_AUTH_SIGS)
 _AUTH_FIRST = "no such valid token|invalid v1agent token|missing auth token"
 
 VCFA_AUTH_CMD = (
-    "found=0; for ns in $NS; do for p in $({K} get pods -n \"$ns\" --field-selector=status.phase=Running -o name"
+    # pod addresses first, so that the client address of a rejected call can be named as a pod
+    "{K} get pods -A -o jsonpath='{range .items[*]}{\"@@PODIP \"}{.metadata.namespace}/{.metadata.name}"
+    " {.status.podIP}{\"\\n\"}{end}' 2>/dev/null;"
+    " found=0; for ns in $NS; do for p in $({K} get pods -n \"$ns\" --field-selector=status.phase=Running -o name"
     " 2>/dev/null | grep -E '" + VCFA_AUTH_PODS + "'); do found=1;"
     " echo \"@@POD $ns/${p#pod/} $({K} get -n \"$ns\" \"$p\" -o jsonpath='{.status.startTime}"
     " {.status.containerStatuses[*].restartCount}' 2>/dev/null)\";"
@@ -1488,8 +1491,13 @@ def _minutes_between(a, b):
 
 def parse_vcfa_auth(out):
     """{'pods': {pod: {...}}, 'counts': {sig: {workload: lines}}} from the raw check output."""
-    pods, cur = {}, None
+    pods, cur, ips = {}, None, {}
     for ln in (out or "").splitlines():
+        if ln.startswith("@@PODIP "):
+            parts = ln.split()
+            if len(parts) == 3:
+                ips[parts[2]] = parts[1]
+            continue
         if ln.startswith("@@POD "):
             parts = ln.split()
             cur = {"start": parts[2] if len(parts) > 2 and _ts(parts[2]) else None,
@@ -1512,7 +1520,23 @@ def parse_vcfa_auth(out):
             counts.setdefault(sig, {}).setdefault(_workload(pod), [0, 0])
             counts[sig][_workload(pod)][0] += n
             counts[sig][_workload(pod)][1] += 1
-    return {"pods": pods, "counts": counts}
+    return {"pods": pods, "counts": counts, "ips": ips}
+
+
+def vcfa_auth_clients(data):
+    """[(address, pod or None, calls)]: who calls agent-gateway-server with a rejected agent token.
+    Only the gateway's own server-side lines count: there the peer is the real caller (in the
+    authentication-server lines it is just the gateway)."""
+    seen = {}
+    for pod, d in data["pods"].items():
+        if _workload(pod) != "agent-gateway-server":
+            continue
+        for ln in d["lines"]:
+            if "v1agent token" in ln.lower() and "server-serve-grpc" in ln:
+                for m in _RX_PEER.finditer(ln):
+                    addr = m.group(1).rsplit(":", 1)[0] if m.group(1).count(":") == 1 else m.group(1)
+                    seen[addr] = seen.get(addr, 0) + 1
+    return sorted(((a, data.get("ips", {}).get(a), n) for a, n in seen.items()), key=lambda x: -x[2])
 
 
 def vcfa_auth_diagnosis(data):
@@ -1533,6 +1557,19 @@ def vcfa_auth_diagnosis(data):
         else:
             scope = ("the log lines do not name the agent: compare with which clusters' Monitor tabs fail - one "
                      "cluster means re-register it, all clusters means the token records were lost")
+        clients = vcfa_auth_clients(data)
+        if len(clients) == 1 and not agents:
+            addr, pod, _ = clients[0]
+            if pod and re.search(r"envoy|gateway|proxy|ingress|haproxy|nginx", pod.split("/")[-1]):
+                scope = ("one client, %s (%s), a proxy in the Automation cluster: the agent is behind it - its "
+                         "access log names the agent" % (pod, addr))
+            elif pod:
+                scope = ("one client, the Automation pod %s (%s): it holds a token Automation no longer knows. "
+                         "Restart that pod's workload so it fetches a new token: kubectl -n %s rollout restart "
+                         "<its deployment or statefulset>" % (pod, addr, pod.split("/")[0]))
+            else:
+                scope = ("one client at %s, which is not a pod address: an agent outside the Automation cluster "
+                         "(a VKS cluster or its load balancer) - re-register that cluster" % addr)
         res.append(("high", "VCF Automation rejects cluster agent tokens (%d line(s) in 30 min; Automation has no "
                             "record of the token: %d): VKS cluster Monitor tabs show 'Unable to authenticate'. "
                             "Seen from %s" % (unknown + rejected, unknown, scope)))
@@ -1610,11 +1647,10 @@ def post_vcfa_auth(out):
     if agents:
         lines += ["", "agents named in the sampled rejected lines (%d distinct):" % len(agents)]
         lines += ["  %4d x %s" % (n, a) for a, n in agents[:15]]
-    peers = _count_by(m.group(1) for d in data["pods"].values() for ln in d["lines"]
-                      if "v1agent token" in ln.lower() for m in _RX_PEER.finditer(ln))
-    if peers:
-        lines.append("client addresses of rejected agent calls (may be a proxy): " + ", ".join(
-            "%s (%d)" % kv for kv in sorted(peers.items(), key=lambda kv: -kv[1])[:10]))
+    clients = vcfa_auth_clients(data)
+    if clients:
+        lines.append("callers of agent-gateway-server with a rejected token: " + ", ".join(
+            "%s = %s (%d)" % (a, p or "not a pod in this cluster", n) for a, p, n in clients[:10]))
     diag = vcfa_auth_diagnosis(data)
     if diag:
         lines.append("")

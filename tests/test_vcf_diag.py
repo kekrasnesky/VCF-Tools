@@ -2590,6 +2590,7 @@ case "$a" in
   "get pvc -A --no-headers") printf 'prelude data-postgres-0 Bound pvc-1 20Gi RWO sc 5d\n';;
   get\ events*) printf 'prelude 2m Warning BackOff pod/ebs-app-5c Back-off\n';;
   get\ pods\ -n\ *jsonpath*) printf 'registry.example/vmware/ebs:9.0.1.0-123\n';;
+  get\ pods\ -A\ -o\ jsonpath*) printf '@@PODIP vmsp-platform/vmsp-agent-7ccb5bbd97-4hbr4 198.18.4.50\n@@PODIP prelude/ebs-app-5c 10.0.0.3\n';;
   get\ pods\ -n\ prelude\ --field-selector*) printf 'pod/ebs-app-5c\npod/provisioning-service-app-7f\npod/authentication-server-695678cb7f-7jcgk\npod/agent-gateway-server-7b9c977d69-5d78f\npod/ccs-vksm-eas-764dcb6877-nsrqh\n';;
   get\ -n\ prelude\ pod/authentication-server*) printf '2026-11-03T16:21:40Z 1';;
   get\ -n\ prelude\ pod/*) printf '2026-09-28T22:11:00Z 0';;
@@ -2751,6 +2752,22 @@ class Automation(unittest.TestCase):
         found = v.target_findings(t, [])
         self.assertEqual(found[0][0], "high")
         self.assertIn("Unable to authenticate", found[0][1])
+
+    def test_authentication_chain_names_the_calling_pod(self):
+        line = ('{"component":"server-serve-grpc","grpc.code":"Unauthenticated","grpc.error":"rpc error: code = '
+                'Unauthenticated desc = invalid v1agent token","peer.address":"%s:47838"}')
+        raw = ("@@PODIP vmsp-platform/vmsp-agent-7ccb5bbd97-4hbr4 198.18.4.50\n"
+               "@@PODIP vmsp-platform/envoy-gw-6f7d8c9b5d-abcde 198.18.4.60\n"
+               "@@POD prelude/agent-gateway-server-7876649b8b-b4hct 2026-11-19T18:36:00Z 0\n"
+               "@@COUNT agent_token_rejected 4\n@@LINE %s\n@@LINE %s\n")
+        out = v.post_vcfa_auth(raw % (line % "198.18.4.50", line % "198.18.4.50"))
+        self.assertIn("198.18.4.50 = vmsp-platform/vmsp-agent-7ccb5bbd97-4hbr4 (2)", out)
+        self.assertIn("one client, the Automation pod vmsp-platform/vmsp-agent-7ccb5bbd97-4hbr4", out)
+        self.assertIn("kubectl -n vmsp-platform rollout restart", out)
+        out = v.post_vcfa_auth(raw % (line % "198.18.4.60", line % "198.18.4.60"))
+        self.assertIn("a proxy in the Automation cluster", out)
+        out = v.post_vcfa_auth(raw % (line % "10.231.0.200", line % "10.231.0.200"))
+        self.assertIn("not a pod address", out)
 
     def test_authentication_chain_quiet_and_single_agent(self):
         quiet = v.post_vcfa_auth("@@POD prelude/authentication-server-a1b2c3d4e5-abcde 2026-11-01T00:00:00Z 0\n")
