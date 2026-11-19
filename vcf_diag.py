@@ -7199,6 +7199,14 @@ select { margin-top: 4px; padding: 8px 10px; border: 1px solid var(--line); bord
 @media (max-width: 640px) { .eprow, .cmdrow { grid-template-columns: 1fr; } }
 .grouphead { display: flex; gap: 10px; align-items: end; flex-wrap: wrap; }
 .grouphead label.f { flex: 1; min-width: 160px; }
+.gtoggle { align-items: center; cursor: pointer; user-select: none; }
+.gtoggle:focus-visible { outline: 2px solid var(--accent, #2563eb); outline-offset: 4px; border-radius: 6px; }
+.gtoggle .caret { display: inline-block; width: 1em; transition: transform .15s; }
+.card.open .gtoggle .caret { transform: rotate(90deg); }
+.gtoggle .gtitle { flex: 1; min-width: 180px; }
+.gtoggle .gsum { overflow-wrap: anywhere; }
+.gtoggle .gsum.bad { color: var(--bad, #b91c1c); }
+.gbody { margin-top: 12px; }
 .spin { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--line);
   border-top-color: var(--accent); border-radius: 50%; animation: sp 0.9s linear infinite; vertical-align: -2px; }
 @keyframes sp { to { transform: rotate(360deg); } }
@@ -7853,16 +7861,29 @@ function groupCard(g) {
   const card = el("div", { className: "card" });
   card.dataset.type = g.type;
   card._extra = { api_base: g.api_base || "", ssh_options: g.ssh_options || "" };
+  // Collapsed to one line (type, label, hosts) until clicked; groups without hosts start open.
+  const body = el("div", { className: "gbody" });
   const label = inp("text", g.label, { placeholder: "optional, e.g. mgmt", className: "glabel" });
-  card.append(el("div", { className: "grouphead" },
-    el("div", {}, el("b", { textContent: info.title }), el("div", { className: "muted", textContent: "type: " + g.type })),
-    el("label", { className: "f" }, "Label", label),
+  const sub = el("div", { className: "muted" }), summary = el("span", { className: "gsum muted" });
+  const caret = el("span", { className: "caret", textContent: "\u25B8" });
+  caret.setAttribute("aria-hidden", "true");
+  const head = el("div", { className: "grouphead gtoggle", tabIndex: 0 },
+    caret,
+    el("div", { className: "gtitle" }, el("b", { textContent: info.title }), sub),
+    summary,
     el("button", { className: "btn", type: "button", textContent: "Remove group",
-      onclick: () => { if (confirm("Remove this group from the settings?")) card.remove(); } })));
+      onclick: () => { if (confirm("Remove this group from the settings?")) card.remove(); } }));
+  head.setAttribute("role", "button");
+  const setOpen = open => { card.classList.toggle("open", open); body.hidden = !open; head.setAttribute("aria-expanded", String(open)); };
+  head.addEventListener("click", e => { if (!e.target.closest("button, input, select, textarea")) setOpen(body.hidden); });
+  head.addEventListener("keydown", e => {
+    if ((e.key === "Enter" || e.key === " ") && e.target === head) { e.preventDefault(); setOpen(body.hidden); } });
+  card.append(head, body);
+  body.append(el("div", { className: "fields" }, el("label", { className: "f" }, "Label", label)));
   const hosts = el("textarea", { className: "ghosts", value: (g.hosts || []).join("\n"), spellcheck: false,
     placeholder: "one per line: FQDN, short name or IP" });
   hosts.style.minHeight = "80px";
-  card.append(el("label", { className: "f" }, info.host_label + (g.type === "vcfmgmt" ? " (workers are found automatically)" : "") +
+  body.append(el("label", { className: "f" }, info.host_label + (g.type === "vcfmgmt" ? " (workers are found automatically)" : "") +
     " - one per line", hosts));
   const f = el("div", { className: "fields" },
     el("label", { className: "f" }, "Default SSH user", inp("text", g.user, { placeholder: info.default_user, className: "guser" })),
@@ -7871,35 +7892,35 @@ function groupCard(g) {
       ["yes", "always"], ["no", "never"]], g.sudo || ""), { className: "gsudo" })),
     el("label", { className: "f" }, "After login", Object.assign(sel([["", "use the login as is"],
       ["su", "switch to root with su (asks for the root password)"]], g.escalate || ""), { className: "gesc" })));
-  card.append(f);
+  body.append(f);
   if (g.type === "k8s" || g.type === "vcfmgmt" || g.type === "supervisor" || g.type === "vcfa")
-    card.append(el("div", { className: "fields" },
+    body.append(el("div", { className: "fields" },
       el("label", { className: "f" }, "kubeconfig path (empty = find automatically)", inp("text", g.kubeconfig, { className: "gkcfg" })),
       el("label", { className: "f" }, "kubectl command", inp("text", g.kubectl, { placeholder: "kubectl", className: "gkctl" }))));
   if (g.type === "vcfa")
-    card.append(el("div", { className: "fields" },
+    body.append(el("div", { className: "fields" },
       el("label", { className: "f" }, "Automation namespaces (empty = find automatically; * allowed)",
         inp("text", g.namespaces, { placeholder: "prelude, vmsp-*", className: "gns" }))),
       el("p", { className: "muted", textContent: "Log in as vmware-system-user (sudo is used for kubectl when needed)." }));
   if (g.type === "vcenter" || g.type === "nsx" || g.type === "sddc") {
     const nsx = g.type !== "vcenter";
-    card.append(el("div", { className: "fields" },
+    body.append(el("div", { className: "fields" },
       el("label", { className: "f" }, g.type === "nsx" ? "NSX API user (API health checks)" : g.type === "sddc" ?
         "SDDC Manager API user (SSO, credential checks)" : "vCenter SSO user (SSO and namespace checks)",
         inp("text", g.sso_user, { placeholder: g.type === "nsx" ? "admin" : "administrator@vsphere.local", className: "gsso" })),
       el("label", { className: "f" }, "Trust this " + (nsx ? "NSX" : "vCenter") + " CA file (path)",
         inp("text", g.ca_file, { placeholder: nsx ? "~/nsx-ca.pem" : "~/vcenter-ca.pem", className: "gca" }))));
-    card.append(el("label", { className: "chk" }, el("input", { type: "checkbox", className: "gtls", checked: yes(g.tls_verify || "yes") }),
+    body.append(el("label", { className: "chk" }, el("input", { type: "checkbox", className: "gtls", checked: yes(g.tls_verify || "yes") }),
       "Check the " + (nsx ? "NSX Manager" : "vCenter") + " certificate"));
   }
   if (g.type === "opsnet")
-    card.append(el("p", { className: "muted", textContent: "Log in as support for the full health check; consoleuser runs the CLI checks only." }));
+    body.append(el("p", { className: "muted", textContent: "Log in as support for the full health check; consoleuser runs the CLI checks only." }));
   if (g.type === "vcfmgmt") {
-    card.append(el("label", { className: "chk" }, el("input", { type: "checkbox", className: "gworkers", checked: yes(g.ssh_workers || "no") }),
+    body.append(el("label", { className: "chk" }, el("input", { type: "checkbox", className: "gworkers", checked: yes(g.ssh_workers || "no") }),
       "Also log in to the worker nodes (same login as the control planes)"));
     const eps = el("div", { className: "geps" });
     (g.endpoints || []).forEach(e => eps.append(endpointRow(e)));
-    card.append(el("p", { innerHTML: "<b>Management service endpoints</b>" }),
+    body.append(el("p", { innerHTML: "<b>Management service endpoints</b>" }),
       el("p", { className: "muted", textContent: "Each service and the name or IP it answers on. Services that share an endpoint are checked once." }),
       eps, el("div", { className: "actions" },
         el("button", { className: "btn", type: "button", textContent: "Add endpoint", onclick: () => eps.append(endpointRow({})) }),
@@ -7907,6 +7928,17 @@ function groupCard(g) {
           onclick: () => { const have = $$(".epsvc", eps).map(i => i.value);
             setMeta.standard_services.filter(n => !have.includes(n)).forEach(n => eps.append(endpointRow({ service: n }))); } })));
   }
+  const refresh = () => {
+    const hs = hosts.value.split(/[\s,]+/).filter(Boolean);
+    sub.textContent = "type: " + g.type + (label.value.trim() ? " \u00B7 label: " + label.value.trim() : "");
+    summary.textContent = hs.length ? hs.length + " host" + (hs.length === 1 ? "" : "s") + ": " +
+      hs.slice(0, 3).join(", ") + (hs.length > 3 ? ", \u2026" : "") : "no hosts yet";
+    summary.classList.toggle("bad", !hs.length);
+  };
+  hosts.addEventListener("input", refresh);
+  label.addEventListener("input", refresh);
+  refresh();
+  setOpen(!(g.hosts || []).length);
   return card;
 }
 function cmdRow(c) {
