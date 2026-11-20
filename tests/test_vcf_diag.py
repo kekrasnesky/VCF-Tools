@@ -3488,3 +3488,180 @@ run: systemctl is-active domainmanager.service
         self.assertEqual((verify["changes"], verify["warnings"]), ("", []))
         script = v.plan_as_script(fixes)
         self.assertIn("#    WARNING: It is labelled as a verification", script)
+
+
+# Raw output of the VKS add-on check, shaped like a real incident: the depot's domain resolution
+# entry was stuck in deletion, the newest repository had no depot-backed copy, and the clusters
+# built afterwards could not install their add-ons. Names are invented.
+_OFF_OLD = ('{"repositoryVersion":"3.7.0+20260618","packages":{"helm-controller.kubernetes.vmware.com":'
+            '{"versions":["1.5.4+v4.01.04-vmware.1-vks.1"]},"telegraf.kubernetes.vmware.com":'
+            '{"versions":["1.38.4+vmware.1-vks.1"]}}}')
+_OFF_NEW = ('{"repositoryVersion":"3.7.0+20260924","packages":{"helm-controller.kubernetes.vmware.com":'
+            '{"versions":["1.5.5+v4.02.00-vmware.2-vks.1"]},"telegraf.kubernetes.vmware.com":'
+            '{"versions":["1.39.3+vmware.1-vks.1"]}}}')
+_PUB = "projects.packages.broadcom.com/vsphere/supervisor/vks-standard-packages/"
+_P = "vmware-system-vks-public/"
+VKS_RAW = "\n".join([
+    "@@REPO %sbuiltin-addonrepository-3.7.0 version=3.7.0+20260618 url=%s3.7.0-20260618/vks-addons:3.7.0-20260618 "
+    "created=2026-07-29T14:01:00Z deleting=" % (_P, _PUB),
+    "@@REPO %sbuiltin-addonrepository-3.7.0-20260924 version=3.7.0+20260924 url=%s3.7.0-20260924/vks-addons:"
+    "3.7.0-20260924 created=2026-10-28T18:45:29Z deleting=" % (_P, _PUB),
+    "@@REPO %sbuiltin-addonrepository-3.7.0-depot.kube-system.svc version=3.7.0+20260618 url=depot.kube-system.svc"
+    "/vcf/vks-standard-packages/ga/3.7.0-20260618/vks-addons:3.7.0-20260618 created=2026-09-22T10:00:00Z deleting=" % _P,
+    "@@REPO %sdefault-addonrepository-3.5.1 version=3.5.0+20251218 url=vsphere-docker-dev-local.packages.vcfd.broadcom"
+    ".net/vks-standard-packages/bora-1/packages/vks-standard-packages:3.5.0-20251218 created=2026-06-30T10:00:00Z "
+    "deleting=" % _P,
+    "@@OFFER %sbuiltin-addonrepository-3.7.0 %s" % (_P, _OFF_OLD),
+    "@@OFFER %sbuiltin-addonrepository-3.7.0-20260924 %s" % (_P, _OFF_NEW),
+    "@@OFFER %sbuiltin-addonrepository-3.7.0-depot.kube-system.svc %s" % (_P, _OFF_OLD),
+    "@@OFFER %sdefault-addonrepository-3.5.1 " % _P,
+    "@@ARI %sbuiltin-3.7.0-depot created=2026-09-22T10:00:00Z deleting= Ready=True msg=" % _P,
+    "@@ARI %sbuiltin-3.7.0-20260924 created=2026-10-28T18:45:29Z deleting= Ready=False msg=* Fetch: failed" % _P,
+    "imgpkg: dial tcp: i/o timeout",
+    "@@CA widgets-old-ns/widgets-old-helm-controller cluster=widgets-old addon=helm-controller "
+    "install=builtin-helm-controller-addoninstall release=helm-controller.kubernetes.vmware.com.1.5.4-v4.01.04-vmware.1"
+    "-vks.1 created=2026-08-27T10:00:00Z ready=True since=2026-08-27T10:00:00Z msg=",
+    "@@CA widgets-dev-ns/widgets-dev-helm-controller cluster=widgets-dev addon=helm-controller "
+    "install=builtin-helm-controller-addoninstall release=helm-controller.kubernetes.vmware.com.1.5.5-v4.02.00-vmware.2"
+    "-vks.1 created=2026-11-06T14:28:53Z ready=False since=2026-11-06T14:36:31Z msg=* Reconciled: ReconcileFailed",
+    "@@CA widgets-dev-ns/widgets-dev-telegraf cluster=widgets-dev addon=telegraf install=vcfops-telegraf-addoninstall "
+    "release=telegraf.kubernetes.vmware.com.1.39.3-vmware.1-vks.1 created=2026-11-06T14:28:53Z ready=False "
+    "since=2026-11-06T14:36:31Z msg=* Reconciled: ReconcileFailed",
+    "@@CLUSTER widgets-dev-ns/widgets-dev addons=False msg=* ClusterAddons widgets-dev-helm-controller: ReconcileFailed",
+    "@@CLUSTER widgets-old-ns/widgets-old addons=True msg=",
+    '@@CDRE depot.kube-system.svc created=2026-09-22T09:00:00Z deleting=2026-10-28T18:40:00Z '
+    'finalizers=["clusterdomainresolutionentry.vmware.com/finalizer"] Reconciled=True DefaultAddonRepositoryCreation=True',
+    "@@CRC depot deleting=",
+    '@@CRCKV "registryHost": "depot.kube-system.svc"',
+    "@@RESOLVE depot.kube-system.svc 10.96.40.12",
+    "@@RESOLVE projects.packages.broadcom.com ",
+    "@@VERIFY projects.packages.broadcom.com 20",
+]) + "\n"
+NOW = v.datetime.datetime(2026, 11, 19, 20, 0)
+
+
+class VksAddons(unittest.TestCase):
+    def test_check_is_part_of_the_supervisor(self):
+        c = find("supervisor", v.VKS_ADDON_LABEL)
+        self.assertIn("addonrepositories.addons.kubernetes.vmware.com", c["cmd"])
+        self.assertIn("clusterdomainresolutionentries", c["cmd"])
+        # registry configs are read for their addresses only, never certificates or credentials
+        self.assertNotIn("{K} get clusterregistryconfigs -o json 2>/dev/null;", c["cmd"])
+        self.assertIn("(host|server|registry|url|endpoint|mirror)", c["cmd"])
+        self.assertIn(find("supervisor", v.STUCK_DELETE_LABEL), [
+            x for _, _, cmds in v.K8S_GROUPS for x in cmds])
+
+    def test_parse_reads_offers_and_multi_line_messages(self):
+        d = v.parse_vks_addons(VKS_RAW)
+        self.assertEqual(len(d["repos"]), 4)
+        depot = d["repos"][_P + "builtin-addonrepository-3.7.0-depot.kube-system.svc"]
+        self.assertTrue(depot["inside"])
+        self.assertEqual(depot["host"], "depot.kube-system.svc")
+        self.assertFalse(d["repos"][_P + "builtin-addonrepository-3.7.0-20260924"]["inside"])
+        self.assertEqual(d["aris"][1]["msg"], "* Fetch: failed imgpkg: dial tcp: i/o timeout")
+        src = v.addon_release_sources(d, "telegraf.kubernetes.vmware.com.1.39.3-vmware.1-vks.1")
+        self.assertEqual([r["name"] for r in src], [_P + "builtin-addonrepository-3.7.0-20260924"])
+        self.assertEqual(len(v.addon_release_sources(d, "helm-controller.kubernetes.vmware.com.1.5.4-v4.01.04-"
+                                                        "vmware.1-vks.1")), 2)
+
+    def test_summary_and_diagnosis_name_the_stuck_entry(self):
+        out = v.post_vks_addons(VKS_RAW, now=NOW)
+        self.assertIn("add-on repositories: 4 (1 served from inside the Supervisor, 3 fetched from outside)", out)
+        self.assertIn("cluster add-ons not Ready: 2 of 3, on 1 cluster(s):", out)
+        self.assertIn("offered by: builtin-addonrepository-3.7.0-20260924 (outside: projects.packages.broadcom.com)", out)
+        self.assertIn("cluster widgets-dev-ns/widgets-dev: AddonsReconciled=False", out)
+        diag = re.findall(r"(?m)^DIAGNOSIS \((\w+)\): (.+)$", out)
+        self.assertEqual(diag[0][0], "high")
+        self.assertTrue(diag[0][1].startswith("ClusterDomainResolutionEntry depot.kube-system.svc has been deleting "
+                                              "for 22d01h"))
+        self.assertIn("remove the finalizer", diag[0][1])
+        self.assertIn(("high", "2 cluster add-on(s) not Ready on 1 cluster(s): widgets-dev-ns/widgets-dev "
+                               "(helm-controller, telegraf). VKS refuses to upgrade a cluster while its add-ons are "
+                               "not reconciled (AddonsReconciled is not True)"), diag)
+        gap = [t for s_, t in diag if t.startswith("The add-on versions these clusters want")][0]
+        self.assertIn("the missing depot-backed copy of version 3.7.0+20260924", gap)
+        self.assertIn("before repointing anything", gap)
+        texts = " ".join(t for _, t in diag)
+        self.assertIn("AddonRepositoryInstall builtin-3.7.0-20260924 is not Ready", texts)
+        self.assertIn("Broadcom build-system registry", texts)
+        self.assertIn("cannot reach projects.packages.broadcom.com (20 event(s))", texts)
+        self.assertNotIn("does not resolve with getent", texts)          # the depot name resolved
+        self.assertEqual(v._fact_vks_addons(out), [
+            ("addon_repositories", "4 (1 inside the Supervisor)"), ("vks_addons_not_ready", "2/3 on 1 cluster(s)"),
+            ("domain_resolution_entries_deleting", 1)])
+
+    def test_newest_repository_without_a_depot_copy_warns_before_clusters_fail(self):
+        raw = "\n".join(ln for ln in VKS_RAW.splitlines() if not ln.startswith(("@@CA widgets-dev", "@@CDRE")))
+        diag = v.vks_addon_diagnosis(v.parse_vks_addons(raw), NOW)
+        gap = [t for s_, t in diag if t.startswith("New VKS clusters take add-on versions")]
+        self.assertEqual(len(gap), 1)
+        self.assertIn("builtin-addonrepository-3.7.0-20260924 (version 3.7.0+20260924)", gap[0])
+        self.assertFalse(any(s_ == "high" for s_, _ in diag))
+
+    def test_healthy_supervisor_has_no_add_on_findings(self):
+        raw = "\n".join([
+            "@@REPO %sa-depot version=3.7.0+20260924 url=depot.kube-system.svc/x:1 created=2026-10-28T00:00:00Z "
+            "deleting=" % _P,
+            "@@OFFER %sa-depot %s" % (_P, _OFF_NEW),
+            "@@CA widgets-dev-ns/widgets-dev-telegraf cluster=widgets-dev addon=telegraf install=i "
+            "release=telegraf.kubernetes.vmware.com.1.39.3-vmware.1-vks.1 created=x ready=True since=x msg=",
+            "@@CDRE depot.kube-system.svc created=x deleting= finalizers=[\"f\"] Reconciled=True",
+            "@@RESOLVE depot.kube-system.svc 10.96.40.12"])
+        out = v.post_vks_addons(raw, now=NOW)
+        self.assertIn("cluster add-ons: 1, all Ready", out)
+        self.assertNotIn("DIAGNOSIS", out)
+        self.assertEqual(v.post_vks_addons("no VKS add-on objects (addons.kubernetes.vmware.com) on this Supervisor\n"),
+                         "no VKS add-on objects (addons.kubernetes.vmware.com) on this Supervisor\n")
+
+    def test_names_are_learned_for_anonymization(self):
+        sc = make()
+        harvest(sc, find("supervisor", v.VKS_ADDON_LABEL), VKS_RAW)
+        out = run(sc, v.post_vks_addons(VKS_RAW, now=NOW))
+        self.assertNotIn("widgets-dev", out)
+        self.assertIn("depot.kube-system.svc", out)
+        self.assertIn("builtin-addonrepository-3.7.0-20260924", out)   # system objects keep their names
+
+
+STUCK_RAW = ("@@DEL Pod widgets-ns/web-1 2026-11-20T13:10:00Z []\n"
+             '@@DEL ClusterDomainResolutionEntry /depot.kube-system.svc 2026-10-28T18:40:00Z '
+             '["clusterdomainresolutionentry.vmware.com/finalizer"]\n'
+             '@@DEL Namespace /widgets-old 2026-11-18T09:00:00Z ["kubernetes"]\n'
+             "@@TYPES 212\n")
+
+
+class StuckInDeletion(unittest.TestCase):
+    def test_old_deletions_are_listed_and_recent_ones_counted(self):
+        out = v.post_stuck_deleting(STUCK_RAW, now=v.datetime.datetime(2026, 11, 20, 13, 30))
+        self.assertIn("212 resource type(s) searched", out)
+        self.assertIn("2 object(s) stuck in deletion for 30 min or more; 1 more deleting for less than that", out)
+        lines = out.splitlines()
+        self.assertTrue(lines[2].startswith("  ClusterDomainResolutionEntry depot.kube-system.svc  deleting for "
+                                            "22d18h"))                 # oldest first, no leading slash
+        self.assertNotIn("web-1", out)
+        self.assertIn("DIAGNOSIS (med): Namespace widgets-old stuck in deletion for 2d04h (finalizer kubernetes): "
+                      "a namespace stuck terminating", out)
+        self.assertEqual(v._fact_stuck_deleting(out), [("objects_stuck_deleting", 2)])
+        none = v.post_stuck_deleting("@@TYPES 12\n")
+        self.assertIn("no object is waiting for deletion", none)
+        self.assertEqual(v._fact_stuck_deleting(none), [("objects_stuck_deleting", 0)])
+
+    def test_finding_is_reported_once_when_the_add_on_check_explains_it(self):
+        sup = _tgt("supervisor-01", [
+            _res(("vks-addons", "V"), v.VKS_ADDON_LABEL, v.post_vks_addons(VKS_RAW, now=NOW)),
+            _res(("k8s-health", "H"), v.STUCK_DELETE_LABEL,
+                 v.post_stuck_deleting(STUCK_RAW, now=v.datetime.datetime(2026, 11, 20, 13, 30)))])
+        done = [({"sec": {"name": "supervisor", "type": "supervisor"}}, [sup])]
+        rows = v.report_findings(done, [(sup, v.key_facts(sup))])
+        cdre = [r for r in rows if "ClusterDomainResolutionEntry depot.kube-system.svc" in r[2]]
+        self.assertEqual(len(cdre), 1)
+        self.assertEqual((cdre[0][0], cdre[0][3]), ("high", v.VKS_ADDON_LABEL))
+        self.assertEqual(rows[0][0], "high")
+        self.assertTrue(any(r[2].startswith("Namespace widgets-old stuck in deletion") for r in rows))
+        facts = dict(v.key_facts(sup))
+        self.assertEqual(facts["vks_addons_not_ready"], "2/3 on 1 cluster(s)")
+        self.assertEqual(facts["objects_stuck_deleting"], 2)
+
+    def test_investigator_knows_the_chains(self):
+        p = v.investigator_prompt(6, True)
+        self.assertIn("ClusterDomainResolutionEntry", p)
+        self.assertIn("deletionTimestamp", p)

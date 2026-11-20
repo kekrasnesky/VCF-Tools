@@ -201,8 +201,37 @@ To look inside the Supervisor itself, add its control-plane address (from that c
 `/usr/lib/vmware-wcp/decryptK8Pwd.py` on vCenter; run that yourself; the tool keeps only the
 cluster and address lines of its output and never shows the password. The Supervisor checks
 list VKS / Cluster API clusters and machines, VM Service virtual machines, Supervisor services
-and errors from the Cluster API and VM operator controllers. A worker that appears both as a
+and errors from the Cluster API and VM operator controllers, and follow the VKS add-on delivery
+chain (see below). A worker that appears both as a
 node and as a Cluster API machine gets the same placeholder in both places.
+
+### VKS add-ons fail: "Expected to find at least one version"
+
+A VKS cluster's add-ons (helm-controller, prometheus, telegraf ...) are chosen and delivered by the
+Supervisor, so a failure that shows in the cluster usually starts there. When add-ons fail, the
+cluster's `AddonsReconciled` condition turns False and VKS refuses to upgrade the cluster
+(*upgrade cannot be initiated as cluster's AddonsReconciled condition is not True*).
+
+The Supervisor check **VKS add-on delivery (repositories, cluster add-ons, depot)** follows the
+whole chain in one pass:
+
+- every add-on repository with its version and fetch address, marked `inside` (served from the
+  Supervisor, such as the VCF software depot at `depot.kube-system.svc`) or `outside` (a public
+  registry such as `projects.packages.broadcom.com`);
+- the repository installs that are not Ready, with their message;
+- every cluster add-on that is not Ready, the release it wants and which repository offers that
+  release (read from each repository's package offerings);
+- clusters whose `AddonsReconciled` condition is not True;
+- the `ClusterDomainResolutionEntry` objects (flagged when one is stuck in deletion), the
+  `ClusterRegistryConfig` registry addresses (never credentials or certificates), whether each
+  repository registry resolves on the control plane, and the Supervisor's package image checks
+  that cannot reach a registry.
+
+Its findings put this together. For example: a `ClusterDomainResolutionEntry` for
+`depot.kube-system.svc` stuck in deletion (high); clusters with add-ons not Ready (high); add-on
+versions offered only by a repository fetched from outside the Supervisor while older versions are
+depot-backed, meaning a depot-backed copy was never created (high); or a newest repository with no
+depot-backed copy, which only clusters built later will run into (med).
 
 ### Node and pod health
 
@@ -218,7 +247,10 @@ The Kubernetes types (management cluster, Kubernetes control plane, Supervisor) 
   restarted, or whose last run ended badly, with reason, exit code and time; OOMKilled containers;
   pending pods with their scheduling failures; evicted and failed pods; probe failures;
   Deployments, StatefulSets and DaemonSets not fully available; volume claims not Bound; top pods
-  by memory; and the previous logs of up to five crash-looping pods.
+  by memory; and the previous logs of up to five crash-looping pods;
+- objects stuck in deletion: every object of any type whose deletion has waited 30 minutes or
+  more for its finalizers, with how long and which finalizers. A controller-managed object held
+  this way blocks whatever depends on it, often while its conditions still read True.
 
 On every node, **Kubernetes certificates on this node** shows the kubelet certificate expiry (an
 expired kubelet certificate takes a node NotReady) and the control-plane certificate expiry

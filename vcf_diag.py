@@ -57,7 +57,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
-VERSION = "1.21.0"
+VERSION = "1.22.0"
 
 # ----------------------------------------------------------------------------
 # Diagnostic catalog
@@ -923,6 +923,131 @@ def linux_groups(cert=True):
     return groups
 
 
+# Object names in namespaces that belong to the organisation (not vmware-system-*, kube-* ...), from
+# lines "<marker><namespace>/<name>": registered as names to anonymize.
+_SYS_NS = r"(?!(?:vmware-|kube-|svc-|tkg-|tanzu-|default/|cert-manager/))"
+
+
+def h_user_obj(marker):
+    return ("k8sobj", r"(?m)^" + marker + _SYS_NS + r"[a-z0-9-]+/([a-z0-9][a-z0-9.-]{2,})", None)
+
+
+# --- Objects stuck in deletion ----------------------------------------------------------------
+# An object with a deletionTimestamp waits for its finalizers. When the controller that owns a
+# finalizer cannot finish, the object stays forever and whatever depends on it stops. Example it
+# was written for: a Supervisor ClusterDomainResolutionEntry for depot.kube-system.svc held by
+# its finalizer kept the Supervisor from creating depot-backed add-on repositories, so new VKS
+# clusters could not install their add-ons ("Expected to find at least one version").
+STUCK_DELETE_LABEL = "Objects stuck in deletion (held by finalizers)"
+STUCK_DELETE_MINUTES = 30
+_JP_DELETING = ('{range .items[?(@.metadata.deletionTimestamp)]}{"@@DEL "}{.kind}{" "}{.metadata.namespace}{"/"}'
+                '{.metadata.name}{" "}{.metadata.deletionTimestamp}{" "}{.metadata.finalizers}{"\\n"}{end}')
+# One request for every listable type (events and the metrics API left out: events are never held,
+# and an unavailable metrics API would only add an error). The last echo keeps the exit code at 0
+# when a single type cannot be listed; @@TYPES shows how many types were searched.
+STUCK_DELETE_CMD = (
+    "res=$({K} api-resources --verbs=list,delete -o name 2>/dev/null"
+    " | grep -vE '^events(\\.events\\.k8s\\.io)?$|metrics\\.k8s\\.io' | paste -sd, -);"
+    " if [ -z \"$res\" ]; then echo 'could not list the API resource types'; else"
+    " {K} get \"$res\" -A --ignore-not-found -o jsonpath=" + shlex.quote(_JP_DELETING) + " 2>/dev/null;"
+    " echo \"@@TYPES $(echo \"$res\" | tr ',' '\\n' | wc -l)\"; fi")
+
+
+def _utc(ts):
+    try:
+        return datetime.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError, ValueError):
+        return None
+
+
+def _age_text(minutes):
+    if minutes is None:
+        return "an unknown time"
+    m = int(minutes)
+    if m < 60:
+        return "%d min" % m
+    if m < 48 * 60:
+        return "%dh%02dm" % (m // 60, m % 60)
+    return "%dd%02dh" % (m // 1440, (m % 1440) // 60)
+
+
+def _minutes_since(ts, now):
+    t = _utc(ts)
+    return None if t is None else max(0.0, (now - t).total_seconds() / 60.0)
+
+
+def _now(now):
+    return now or datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+
+
+_STUCK_HINTS = {
+    "Pod": "a pod stuck terminating usually means its node is gone or its kubelet cannot be reached",
+    "Namespace": "a namespace stuck terminating waits for objects inside it, or for an API service that is "
+                 "not available (kubectl get apiservices | grep False)",
+    "PersistentVolumeClaim": "a claim stays while a pod still uses it (kubernetes.io/pvc-protection)",
+    "PersistentVolume": "a volume stays while it is bound or its storage backend has not released it",
+}
+
+
+def parse_deleting(out, now=None):
+    """[(minutes or None, kind, ns/name, deletion time, [finalizers])], oldest first."""
+    now = _now(now)
+    rows = []
+    for ln in (out or "").splitlines():
+        m = re.match(r"^@@DEL (\S+) (\S*/\S+) (\S+) ?(.*)$", ln.strip())
+        if not m:
+            continue
+        kind, name, ts, fin = m.groups()
+        fins = re.findall(r'"([^"]+)"', fin) or [f for f in re.split(r"[\[\], ]+", fin) if f]
+        rows.append((_minutes_since(ts, now), kind, name[1:] if name.startswith("/") else name, ts, fins))
+    rows.sort(key=lambda r: -(r[0] if r[0] is not None else 1e12))
+    return rows
+
+
+def post_stuck_deleting(out, now=None):
+    if "@@TYPES" not in (out or ""):
+        return out
+    types_ = re.search(r"@@TYPES\s+(\d+)", out).group(1)
+    rows = parse_deleting(out, now)
+    stuck = [r for r in rows if r[0] is None or r[0] >= STUCK_DELETE_MINUTES]
+    recent = len(rows) - len(stuck)
+    lines = ["%s resource type(s) searched" % types_]
+    if not rows:
+        return "\n".join(lines + ["no object is waiting for deletion"]) + "\n"
+    lines.append("%d object(s) stuck in deletion for %d min or more%s" % (
+        len(stuck), STUCK_DELETE_MINUTES,
+        ("; %d more deleting for less than that (normal while a deletion runs)" % recent) if recent else ""))
+    for mins, kind, name, ts, fins in stuck[:40]:
+        lines.append("  %s %s  deleting for %s (since %s)  finalizers: %s" % (
+            kind, name, _age_text(mins), ts, ", ".join(fins) or "none"))
+    if len(stuck) > 40:
+        lines.append("  ... %d more" % (len(stuck) - 40))
+    by_kind = {}
+    for r in stuck:
+        by_kind.setdefault(r[1], []).append(r)
+    diag = []
+    for kind, rs in sorted(by_kind.items(), key=lambda kv: -len(kv[1])):
+        names = ", ".join(r[2] for r in rs[:3]) + (" and %d more" % (len(rs) - 3) if len(rs) > 3 else "")
+        fins = sorted(set(f for r in rs for f in r[4]))
+        hint = _STUCK_HINTS.get(kind, "the controller that owns the finalizer is not finishing, and whatever "
+                                      "depends on this object is blocked until it does. Find out why (that "
+                                      "controller's logs and the object's conditions) before removing a "
+                                      "finalizer by hand")
+        diag.append(("med", "%s %s stuck in deletion for %s%s: %s" % (
+            kind, names, _age_text(rs[0][0]), (" (finalizer %s)" % ", ".join(fins)) if fins else
+            " (no finalizer left: the API server should remove it; check for an unavailable API service)", hint)))
+    lines.append("")
+    lines += ["DIAGNOSIS (%s): %s" % d for d in diag]
+    return "\n".join(lines) + "\n"
+
+
+def _fact_stuck_deleting(out):
+    m = re.search(r"(?m)^(\d+) object\(s\) stuck in deletion", out)
+    if m:
+        return [("objects_stuck_deleting", int(m.group(1)))]
+    return [("objects_stuck_deleting", 0)] if "no object is waiting for deletion" in out else []
+
+
 # Output templates for kubectl: one line per pod (with each container's state) and per node.
 POD_JSONPATH = ('{range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"  node="}{.spec.nodeName}'
                 '{"  phase="}{.status.phase}{"  reason="}{.status.reason}{range .status.containerStatuses[*]}'
@@ -1014,6 +1139,8 @@ K8S_GROUPS = [
              "{K} get pods -A --no-headers 2>/dev/null | awk '$4 ~ /CrashLoopBackOff|Error|OOMKilled/ {print $1\" \"$2}' "
              "| head -n 5 | while read ns pod; do echo \"== $ns/$pod\"; {K} logs -n \"$ns\" \"$pod\" --all-containers "
              "--previous --tail=40 2>&1 | tail -n 40; done", k8s="nsslash", timeout=120, max_lines=250),
+        kctl(STUCK_DELETE_LABEL, STUCK_DELETE_CMD, timeout=120, max_lines=120, post=post_stuck_deleting,
+             harvest=[("k8sns", r"(?m)^@@DEL \S+ ([a-z0-9-]+)/", None), h_user_obj(r"@@DEL \S+ ")]),
     ]),
     ("k8s-vcf", "VCF services runtime objects (best effort)", [
         kctl("Components", "{K} get components -A 2>&1 | head -n 200", k8s="nsrows"),
@@ -1379,6 +1506,374 @@ SUPERVISOR_GROUPS.append(("k8s-namespaces", "vSphere Namespaces as seen inside t
     kctl("Pods not Running, per namespace",
          "{K} get pods -A --no-headers 2>&1 | awk '$4!=\"Running\" && $4!=\"Completed\"' | head -n 150",
          k8s="nsrows"),
+]))
+
+
+# --- VKS add-on delivery: from the Supervisor's repositories to each cluster's add-ons ------------
+# A VKS cluster's add-ons (helm-controller, prometheus, telegraf ...) are chosen on the Supervisor:
+# ClusterAddon (one per cluster and add-on) -> AddonInstall (shared rule) -> AddonRelease ->
+# AddonRepository (where the package bundle is fetched from) -> AddonRepositoryInstall. On a
+# Supervisor that uses the VCF software depot, repositories are served from depot.kube-system.svc,
+# which only resolves through a ClusterDomainResolutionEntry; ClusterRegistryConfig names the
+# registry. Example it was written for: that entry was stuck in deletion, no depot-backed copy of
+# the newest repository was created, the newest one pointed at projects.packages.broadcom.com, and
+# every cluster built afterwards failed its add-ons with "Expected to find at least one version".
+VKS_ADDON_LABEL = "VKS add-on delivery (repositories, cluster add-ons, depot)"
+_ADG = "addons.kubernetes.vmware.com"
+_JP_REPO = ('{range .items[*]}{"@@REPO "}{.metadata.namespace}/{.metadata.name}{" version="}{.spec.version}'
+            '{" url="}{.spec.fetch.imgpkgBundle.imageURL}{" created="}{.metadata.creationTimestamp}'
+            '{" deleting="}{.metadata.deletionTimestamp}{"\\n"}{end}')
+_JP_ARI = ('{range .items[*]}{"@@ARI "}{.metadata.namespace}/{.metadata.name}{" created="}'
+           '{.metadata.creationTimestamp}{" deleting="}{.metadata.deletionTimestamp}'
+           '{range .status.conditions[*]}{" "}{.type}{"="}{.status}{end}'
+           '{range .status.conditions[?(@.type=="Ready")]}{" msg="}{.message}{end}{"\\n"}{end}')
+_JP_CA = ('{range .items[*]}{"@@CA "}{.metadata.namespace}/{.metadata.name}{" cluster="}{.spec.clusterName}'
+          '{" addon="}{.spec.addonRef.name}{" install="}{.status.activeAddonInstall.name}'
+          '{" release="}{.status.releaseRef.name}{" created="}{.metadata.creationTimestamp}'
+          '{range .status.conditions[?(@.type=="Ready")]}{" ready="}{.status}{" since="}{.lastTransitionTime}'
+          '{" msg="}{.message}{end}{"\\n"}{end}')
+_JP_CLUSTER = ('{range .items[*]}{"@@CLUSTER "}{.metadata.namespace}/{.metadata.name}'
+               '{range .status.conditions[?(@.type=="AddonsReconciled")]}{" addons="}{.status}'
+               '{" msg="}{.message}{end}{"\\n"}{end}')
+_JP_CDRE = ('{range .items[*]}{"@@CDRE "}{.metadata.name}{" created="}{.metadata.creationTimestamp}'
+            '{" deleting="}{.metadata.deletionTimestamp}{" finalizers="}{.metadata.finalizers}'
+            '{range .status.conditions[*]}{" "}{.type}{"="}{.status}{end}{"\\n"}{end}')
+_JP_CRC = ('{range .items[*]}{"@@CRC "}{.metadata.name}{" deleting="}{.metadata.deletionTimestamp}'
+           '{"\\n"}{end}')
+_JP_REPO_KEYS = '{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\\n"}{end}'
+_JP_REPO_URLS = '{range .items[*]}{.spec.fetch.imgpkgBundle.imageURL}{"\\n"}{end}'
+_JP_OFFERS = "{.metadata.annotations.addons\\.kubernetes\\.vmware\\.com/package-offerings}"
+_JP_VERIFY = '{range .items[*]}{.count}{" "}{.message}{"\\n"}{end}'
+_q = shlex.quote
+VKS_ADDON_CMD = (
+    "if ! {K} get addonrepositories." + _ADG + " -A -o name >/dev/null 2>&1; then"
+    " echo 'no VKS add-on objects (" + _ADG + ") on this Supervisor'; else"
+    " {K} get addonrepositories." + _ADG + " -A -o jsonpath=" + _q(_JP_REPO) + " 2>/dev/null;"
+    # the package offerings of each repository: which add-on versions it carries (JSON, one line)
+    " for r in $({K} get addonrepositories." + _ADG + " -A -o jsonpath=" + _q(_JP_REPO_KEYS) + " 2>/dev/null); do"
+    " printf '@@OFFER %s ' \"$r\"; {K} get addonrepositories." + _ADG + " -n \"${r%%/*}\" \"${r#*/}\""
+    " -o jsonpath=" + _q(_JP_OFFERS) + " 2>/dev/null | tr -d ' \\n\\r\\t'; echo; done;"
+    " {K} get addonrepositoryinstalls." + _ADG + " -A -o jsonpath=" + _q(_JP_ARI) + " 2>/dev/null;"
+    " {K} get clusteraddons." + _ADG + " -A -o jsonpath=" + _q(_JP_CA) + " 2>/dev/null;"
+    " for t in clusters.cluster.x-k8s.io tanzukubernetesclusters; do"
+    " {K} get \"$t\" -A -o jsonpath=" + _q(_JP_CLUSTER) + " 2>/dev/null; done;"
+    " {K} get clusterdomainresolutionentries -o jsonpath=" + _q(_JP_CDRE) + " 2>/dev/null;"
+    " {K} get clusterregistryconfigs -o jsonpath=" + _q(_JP_CRC) + " 2>/dev/null;"
+    # registry addresses only (no credentials or certificates): keys that name a host or URL
+    " {K} get clusterregistryconfigs -o json 2>/dev/null | grep -oiE "
+    + _q('"[a-z]*(host|server|registry|url|endpoint|mirror)[a-z]*" *: *"[^"]{1,200}"')
+    + " | sort -u | head -n 20 | sed 's/^/@@CRCKV /';"
+    # does each repository's registry resolve on this control plane?
+    " for h in $({K} get addonrepositories." + _ADG + " -A -o jsonpath=" + _q(_JP_REPO_URLS) + " 2>/dev/null"
+    " | cut -d/ -f1 | sort -u); do echo \"@@RESOLVE $h $(timeout 5 getent hosts \"$h\" 2>/dev/null"
+    " | awk '{print $1}' | head -n 1)\"; done;"
+    # Supervisor package image checks that cannot reach a registry, counted per registry
+    " {K} get events -A --field-selector reason=VerificationError -o jsonpath=" + _q(_JP_VERIFY) + " 2>/dev/null"
+    " | sed -n 's/^\\([0-9]*\\) .*Connectivity to image \\([^/ ]*\\).*/\\2 \\1/p'"
+    " | awk '{c[$1]+=($2>0?$2:1)} END{for (h in c) print \"@@VERIFY \" h, c[h]}'; fi"
+)
+
+
+def _rec_fields(rest):
+    """'ns/name k=v k=v ... msg=free text' -> (name, {k: v}, msg)."""
+    head, sep, msg = rest.partition(" msg=")
+    parts = head.split()
+    if not parts:
+        return "", {}, ""
+    kv = {}
+    for p in parts[1:]:
+        k, eq, val = p.partition("=")
+        if eq:
+            kv[k] = val
+    return parts[0], kv, msg.strip() if sep else ""
+
+
+def parse_vks_addons(out):
+    d = {"repos": {}, "aris": [], "cas": [], "clusters": {}, "cdres": [], "crcs": [], "crckv": [],
+         "resolve": {}, "verify": {}}
+    last = None
+    for raw in (out or "").splitlines():
+        ln = raw.rstrip()
+        m = re.match(r"^@@([A-Z]+) ?(.*)$", ln)
+        if not m:
+            if last is not None and ln.strip():           # a multi-line condition message
+                last["msg"] = (last.get("msg", "") + " " + ln.strip()).strip()
+            continue
+        tag, rest = m.groups()
+        last = None
+        if tag == "OFFER":
+            key, _, js = rest.partition(" ")
+            try:
+                pk = json.loads(js).get("packages", {}) if js.strip() else {}
+            except ValueError:
+                pk = {}
+            d["repos"].setdefault(key, {"name": key})["offers"] = dict(
+                (p, list(o.get("versions", []))) for p, o in pk.items() if isinstance(o, dict))
+            continue
+        if tag == "CRCKV":
+            d["crckv"].append(rest.strip())
+            continue
+        if tag == "RESOLVE":
+            parts = rest.split()
+            if parts:
+                d["resolve"][parts[0]] = parts[1] if len(parts) > 1 else ""
+            continue
+        if tag == "VERIFY":
+            parts = rest.split()
+            if len(parts) == 2 and parts[1].isdigit():
+                d["verify"][parts[0]] = int(parts[1])
+            continue
+        name, kv, msg = _rec_fields(rest)
+        rec = dict(kv, name=name, msg=msg)
+        if tag == "REPO":
+            d["repos"].setdefault(name, {}).update(rec)
+        elif tag == "ARI":
+            d["aris"].append(rec)
+        elif tag == "CA":
+            d["cas"].append(rec)
+        elif tag == "CLUSTER":
+            if "addons" in kv or name not in d["clusters"]:
+                d["clusters"][name] = rec
+        elif tag == "CDRE":
+            d["cdres"].append(rec)
+        elif tag == "CRC":
+            d["crcs"].append(rec)
+        else:
+            continue
+        last = rec
+    for r in d["repos"].values():
+        r.setdefault("offers", {})
+        r["host"] = (r.get("url") or "").split("/", 1)[0]
+        r["inside"] = _registry_inside(r["host"])
+    return d
+
+
+def _registry_inside(host):
+    """True for a registry served from inside the Supervisor (a cluster service name)."""
+    h = (host or "").split(":", 1)[0].lower()
+    return bool(h) and (h.endswith((".svc", ".svc.cluster.local", ".cluster.local")) or "." not in h)
+
+
+def _version_key(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v or ""))
+
+
+def _short(name):
+    return name.split("/", 1)[-1]
+
+
+def addon_release_sources(d, release):
+    """Repositories (dicts) that offer an AddonRelease name such as
+    'helm-controller.kubernetes.vmware.com.1.5.5-v4.02.00-vmware.2-vks.1'."""
+    found = []
+    for r in d["repos"].values():
+        for pkg, versions in r["offers"].items():
+            if release.startswith(pkg + ".") and any(
+                    v.replace("+", "-") == release[len(pkg) + 1:] for v in versions):
+                found.append(r)
+                break
+    return found
+
+
+def _source_text(r):
+    return "%s (%s: %s)" % (_short(r["name"]), "inside the Supervisor" if r["inside"] else "outside",
+                           r["host"] or "no address")
+
+
+def vks_addon_diagnosis(d, now=None):
+    """[(severity, text)]: the reasoning an analyst would do by hand along the add-on chain."""
+    now = _now(now)
+    res = []
+    repos = sorted(d["repos"].values(), key=lambda r: _version_key(r.get("version")))
+    inside = [r for r in repos if r["inside"]]
+    for e in d["cdres"]:
+        if e.get("deleting"):
+            mins = _minutes_since(e["deleting"], now)
+            users = [r for r in repos if r["host"].split(":", 1)[0] == e["name"]]
+            fins = re.findall(r'"([^"]+)"', e.get("finalizers", "")) or [
+                f for f in re.split(r"[\[\], ]+", e.get("finalizers", "")) if f]
+            res.append(("high" if mins is None or mins >= 15 else "med",
+                        "ClusterDomainResolutionEntry %s has been deleting for %s and is still held by its "
+                        "finalizer(s) %s%s. While it is stuck, the Supervisor does not finish the lifecycle of "
+                        "that address and creates no new depot-backed add-on repositories. Known recovery: "
+                        "confirm no Supervisor upgrade or depot change is in progress, remove the finalizer so "
+                        "the deletion completes, then watch the Supervisor recreate the entry "
+                        "(Reconciled=True, DefaultAddonRepositoryCreation=True) and a new depot-backed "
+                        "repository appear" % (
+                            e["name"], _age_text(mins), ", ".join(fins) or "(none listed)",
+                            ("; %d add-on repositor(ies) fetch from this address" % len(users)) if users else "")))
+        bad = sorted(k for k, val in e.items() if k[:1].isupper() and val == "False")
+        if bad and not e.get("deleting"):
+            res.append(("med", "ClusterDomainResolutionEntry %s reports %s" % (
+                e["name"], ", ".join("%s=False" % k for k in bad))))
+    for kind, items in (("AddonRepository", repos), ("AddonRepositoryInstall", d["aris"]),
+                        ("ClusterRegistryConfig", d["crcs"])):
+        for it in items:
+            if it.get("deleting"):
+                res.append(("med", "%s %s has been deleting for %s" % (
+                    kind, _short(it["name"]), _age_text(_minutes_since(it["deleting"], now)))))
+    failing = [c for c in d["cas"] if c.get("ready") != "True"]
+    if failing:
+        by_cluster = {}
+        for c in failing:
+            ns = c["name"].split("/", 1)[0]
+            by_cluster.setdefault("%s/%s" % (ns, c.get("cluster") or "?"), []).append(c.get("addon") or "?")
+        res.append(("high", "%d cluster add-on(s) not Ready on %d cluster(s): %s. VKS refuses to upgrade a "
+                            "cluster while its add-ons are not reconciled (AddonsReconciled is not True)" % (
+                                len(failing), len(by_cluster), "; ".join(
+                                    "%s (%s)" % (k, ", ".join(sorted(set(v)))) for k, v in sorted(by_cluster.items())))))
+        outside_only, unoffered, inside_offered = {}, set(), {}
+        for c in failing:
+            rel = c.get("release") or ""
+            if not rel:
+                continue
+            src = addon_release_sources(d, rel)
+            if not src:
+                unoffered.add(rel)
+            elif all(not r["inside"] for r in src):
+                for r in src:
+                    outside_only.setdefault(r["name"], set()).add(rel)
+            else:
+                inside_offered.setdefault(rel, [r for r in src if r["inside"]])
+        newest_in = inside[-1] if inside else None
+        for repo, rels in sorted(outside_only.items()):
+            r = d["repos"][repo]
+            if newest_in:
+                res.append(("high", "The add-on versions these clusters want (%s) are offered only by %s, which is "
+                                    "fetched from outside the Supervisor. The newest repository served from inside "
+                                    "the Supervisor is %s (version %s). On a Supervisor that uses the software "
+                                    "depot, the fault is the missing depot-backed copy of version %s: find out why "
+                                    "it was not created (repository installs, domain resolution entries, objects "
+                                    "stuck in deletion) before repointing anything" % (
+                                        ", ".join(sorted(rels)), _source_text(r), _short(newest_in["name"]),
+                                        newest_in.get("version", "?"), r.get("version", "?"))))
+            else:
+                res.append(("med", "The add-on versions these clusters want (%s) come from %s: the clusters need a "
+                                   "route to that registry (proxy or firewall), or the repository must be served "
+                                   "from inside the Supervisor" % (", ".join(sorted(rels)), _source_text(r))))
+        if unoffered:
+            res.append(("med", "No add-on repository on the Supervisor offers %s: the repository that carried it "
+                               "is gone or was never created" % ", ".join(sorted(unoffered))))
+        for rel, src in sorted(inside_offered.items()):
+            res.append(("med", "%s is offered from inside the Supervisor (%s), yet the add-on is not Ready: look at "
+                               "the cluster side (kubectl get packagerepositories,packageinstalls -A in that VKS "
+                               "cluster) for the full error" % (rel, ", ".join(_short(r["name"]) for r in src))))
+    elif repos and inside and not repos[-1]["inside"] and \
+            _version_key(repos[-1].get("version")) > _version_key(inside[-1].get("version")):
+        res.append(("med", "New VKS clusters take add-on versions from the newest repository, %s (version %s), "
+                           "which is fetched from outside the Supervisor; the newest depot-backed one is %s (version "
+                           "%s). A cluster built now will fail its add-ons unless it can reach %s" % (
+                               _short(repos[-1]["name"]), repos[-1].get("version", "?"), _short(inside[-1]["name"]),
+                               inside[-1].get("version", "?"), repos[-1]["host"])))
+    for a in d["aris"]:
+        if a.get("Ready") not in (None, "True") and not a.get("deleting"):
+            res.append(("med", "AddonRepositoryInstall %s is not Ready%s" % (
+                _short(a["name"]), (": " + a["msg"][:300]) if a.get("msg") else "")))
+    for host, ip in sorted(d["resolve"].items()):
+        if _registry_inside(host) and not ip:
+            # a cluster service name may resolve only inside pods: a hint, not a finding of its own
+            res.append(("info", "%s, the in-Supervisor registry of %d add-on repositor(ies), does not resolve with "
+                                "getent on this control plane (it may resolve only inside pods); if add-ons fail, "
+                                "look at its ClusterDomainResolutionEntry" % (
+                                    host, sum(1 for r in repos if r["host"] == host))))
+    for r in repos:
+        if re.search(r"vcfd\.broadcom\.net|-dev-local\.", r["host"]):
+            res.append(("info", "AddonRepository %s points at %s, a Broadcom build-system registry that customer "
+                                "sites cannot reach: a leftover from a pre-release build, not used unless a cluster "
+                                "selects its version" % (_short(r["name"]), r["host"])))
+    for host, n in sorted(d["verify"].items()):
+        res.append(("info", "The Supervisor's package image checks cannot reach %s (%d event(s)): it has no route "
+                            "to that registry, so anything that must be fetched from there fails on this "
+                            "Supervisor" % (host, n)))
+    return res
+
+
+def post_vks_addons(out, now=None):
+    if "@@REPO " not in (out or "") and "@@CA " not in (out or ""):
+        return out
+    d = parse_vks_addons(out)
+    repos = sorted(d["repos"].values(), key=lambda r: (_version_key(r.get("version")), r["name"]))
+    n_in = sum(1 for r in repos if r["inside"])
+    lines = ["add-on repositories: %d (%d served from inside the Supervisor, %d fetched from outside)" % (
+        len(repos), n_in, len(repos) - n_in)]
+    for r in repos:
+        lines.append("  %-54s %-16s %-10s %s%s" % (
+            _short(r["name"]), r.get("version", "?"), (r.get("created") or "?")[:10],
+            "inside: " if r["inside"] else "outside: ", r["host"] or "?")
+            + ("  DELETING" if r.get("deleting") else ""))
+    if d["aris"]:
+        bad = [a for a in d["aris"] if a.get("Ready") != "True"]
+        lines.append("repository installs: %d, %s" % (len(d["aris"]), "all Ready" if not bad else
+                                                       "%d not Ready:" % len(bad)))
+        for a in bad:
+            lines.append("  %s  Ready=%s%s" % (_short(a["name"]), a.get("Ready", "?"),
+                                               ("  " + a["msg"][:200]) if a.get("msg") else ""))
+    cas = d["cas"]
+    failing = [c for c in cas if c.get("ready") != "True"]
+    if cas:
+        if failing:
+            lines.append("cluster add-ons not Ready: %d of %d, on %d cluster(s):" % (
+                len(failing), len(cas), len(set((c["name"].split("/")[0], c.get("cluster")) for c in failing))))
+            for c in failing:
+                src = addon_release_sources(d, c.get("release") or "")
+                lines.append("  %s  release %s  not Ready since %s  offered by: %s" % (
+                    c["name"], c.get("release") or "?", c.get("since") or "?",
+                    ", ".join(_source_text(r) for r in src) or "no repository"))
+                if c.get("msg"):
+                    lines.append("      %s" % c["msg"][:200])
+            ok = len(cas) - len(failing)
+            if ok:
+                lines.append("  (%d other cluster add-on(s) Ready)" % ok)
+        else:
+            lines.append("cluster add-ons: %d, all Ready" % len(cas))
+    blocked = [c for c in d["clusters"].values() if c.get("addons") and c["addons"] != "True"]
+    for c in blocked:
+        lines.append("cluster %s: AddonsReconciled=%s%s" % (c["name"], c["addons"],
+                                                            ("  " + c["msg"][:200]) if c.get("msg") else ""))
+    if d["cdres"]:
+        lines.append("domain resolution entries (ClusterDomainResolutionEntry):")
+        for e in d["cdres"]:
+            conds = " ".join("%s=%s" % (k, val) for k, val in sorted(e.items()) if k[:1].isupper())
+            lines.append("  %s  %s%s" % (e["name"], ("DELETING since %s, finalizers %s  " % (
+                e["deleting"], e.get("finalizers") or "none")) if e.get("deleting") else "", conds or "no conditions"))
+    if d["crcs"] or d["crckv"]:
+        lines.append("registry configs (ClusterRegistryConfig): %s" % (", ".join(
+            c["name"] + (" DELETING" if c.get("deleting") else "") for c in d["crcs"]) or "?"))
+        lines += ["  " + kv for kv in d["crckv"]]
+    if d["resolve"]:
+        lines.append("repository registries resolved on this control plane: " + ", ".join(
+            "%s -> %s" % (h, ip or "does not resolve") for h, ip in sorted(d["resolve"].items())))
+    if d["verify"]:
+        lines.append("Supervisor package image checks that cannot reach a registry: " + ", ".join(
+            "%s %d event(s)" % kv for kv in sorted(d["verify"].items())))
+    diag = vks_addon_diagnosis(d, now)
+    if diag:
+        lines.append("")
+        lines += ["DIAGNOSIS (%s): %s" % x for x in diag]
+    return "\n".join(lines) + "\n"
+
+
+def _fact_vks_addons(out):
+    f = []
+    m = re.search(r"(?m)^add-on repositories: (\d+) \((\d+) served from inside", out)
+    if m:
+        f.append(("addon_repositories", "%s (%s inside the Supervisor)" % m.groups()))
+    m = re.search(r"(?m)^cluster add-ons not Ready: (\d+) of (\d+), on (\d+) cluster", out)
+    if m:
+        f.append(("vks_addons_not_ready", "%s/%s on %s cluster(s)" % m.groups()))
+    m = re.search(r"(?m)^cluster add-ons: (\d+), all Ready", out)
+    if m:
+        f.append(("vks_addons_not_ready", "0/%s" % m.group(1)))
+    n = len(re.findall(r"(?m)^  \S+  DELETING since ", out))
+    if n:
+        f.append(("domain_resolution_entries_deleting", n))
+    return f
+
+
+SUPERVISOR_GROUPS.append(("vks-addons", "VKS add-on delivery: repositories, cluster add-ons, software depot", [
+    kctl(VKS_ADDON_LABEL, VKS_ADDON_CMD, timeout=120, max_lines=160, post=post_vks_addons,
+         harvest=[("k8sns", r"(?m)^@@(?:CA|CLUSTER) ([a-z0-9-]+)/", None), h_user_obj("@@(?:CA|CLUSTER) "),
+                  ("k8sobj", r"(?m)^@@CA " + _SYS_NS + r"\S+ cluster=([a-z0-9][a-z0-9.-]{2,})", None)]),
 ]))
 
 
@@ -5010,6 +5505,8 @@ KEY_FACTS = {
             r"(?m)^== \S+?(?: \((\d+) pods\))?: \d+ error line", o))),
     "Automation ingress hosts and certificates": _fact_vcfa_certs,
     VCFA_AUTH_LABEL: _fact_vcfa_auth,
+    VKS_ADDON_LABEL: _fact_vks_addons,
+    STUCK_DELETE_LABEL: _fact_stuck_deleting,
     "Version": lambda o: [("version", m.group(1)) for m in [re.search(r"Version (\S+)", o)] if m],
     "Uptime": _fact_uptime,
     "CPU": lambda o: [("cpus", int(m.group(1))) for m in [re.match(r"(\d+) logical CPU", o)] if m],
@@ -5074,6 +5571,8 @@ def key_facts(t):
 # Findings: rule-based one-liners derived from the key facts, most severe first.
 # ----------------------------------------------------------------------------
 SEVERITIES = ("high", "med", "low", "info")
+# checks whose summarizer ends with "DIAGNOSIS (<severity>): <text>" lines: each becomes a finding
+DIAGNOSING_CHECKS = (VCFA_AUTH_LABEL, VKS_ADDON_LABEL, STUCK_DELETE_LABEL)
 
 
 def _pct(s):
@@ -5094,7 +5593,7 @@ def target_findings(t, facts):
                                                    "Cluster API machines (worker VM lifecycle)"):
             for sev, text in capi_problems(r["out"]):
                 res.append((sev, "cluster " + text, r["label"]))
-        if r["status"] == "ok" and r["label"] == VCFA_AUTH_LABEL:
+        if r["status"] == "ok" and r["label"] in DIAGNOSING_CHECKS:
             for sev, text in re.findall(r"(?m)^DIAGNOSIS \((high|med|low|info)\): (.+)$", r["out"]):
                 res.append((sev, text, r["label"]))
         if r["status"] == "ok" and r["label"] == "Transport zones, node profiles and cluster attachments":
@@ -5113,6 +5612,10 @@ def target_findings(t, facts):
                     res.append(("med", "failed SDDC Manager task '%s' (%s)%s%s" % (
                         head.group(2), head.group(1)[:10], (": " + err.group(1)) if err else "",
                         (" - cause: " + cause.group(1)) if cause else ""), r["label"]))
+    # an object stuck in deletion that a specific check already explains is reported once, there
+    named = [text for _, text, ev in res if ev != STUCK_DELETE_LABEL]
+    res = [x for x in res if x[2] != STUCK_DELETE_LABEL or not any(
+        x[1].split(" stuck in deletion", 1)[0] in other for other in named)]
     if "nodes_ready" in f:
         a, b = f["nodes_ready"].split("/")
         if a != b:
@@ -7067,6 +7570,22 @@ than recreate a deleted object under its old ID (a recreated object is empty, an
 touch every host that uses it). Do not restart services unless the evidence shows a restart is
 needed; when one is, say in note: what it interrupts (running tasks, workflows marked IN_PROGRESS).
 Never write "No rollback needed" for a change that has an effect.
+
+Follow a failure up its dependency chain to the first object that is unhealthy, and treat what
+the user sees as a symptom of that object. Chains that are easy to stop at too early:
+- VKS add-ons ("Expected to find at least one version", AddonsReconciled not True, an upgrade
+  refused): the add-on versions are chosen on the Supervisor, not in the VKS cluster. ClusterAddon
+  -> AddonInstall -> AddonRelease -> AddonRepository (its fetch address) -> AddonRepositoryInstall;
+  on a Supervisor that uses the VCF software depot, repositories are served from
+  depot.kube-system.svc, which depends on a ClusterDomainResolutionEntry and a
+  ClusterRegistryConfig. A repository that points at a public registry while older ones are
+  depot-backed is a symptom: ask why its depot-backed copy is missing before suggesting a proxy,
+  a firewall change or repointing a system-managed object. The check "VKS add-on delivery"
+  lays this chain out.
+- Any controller-managed object with a deletionTimestamp and a finalizer that never completes
+  blocks whatever depends on it, often silently: its conditions can still read True. The check
+  "Objects stuck in deletion" lists them on every Kubernetes cluster. Removing a finalizer by hand
+  is a last resort: say what owns it, what depends on the object, and what should recreate it.
 
 The administrator may also run your commands in a terminal and paste the output back, or tell you
 what happened after applying a fix. Continue from there.
