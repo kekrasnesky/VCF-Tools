@@ -139,7 +139,7 @@ still asked), `--list` prints every check and the exact command behind it.
 | `[nsx]` | NSX Manager | `admin` | `admin` runs NSX CLI checks; `root` adds OS-level checks |
 | `[nsxedge]` | NSX Edge | `admin` | same model as NSX Manager, plus interfaces, tunnel ports, BFD sessions and datapath CPU |
 | `[opsnet]` | VCF Operations for networks platform and collector nodes | `support` | version, service status and SSH service (CLI), service health script, recent application-log errors, OS health; `consoleuser` runs the CLI checks only |
-| `[vcfa]` | VCF Automation nodes | `vmware-system-user` | pods, workloads, restarts and warning events in the Automation namespaces; container image versions; database pods and volumes; error lines in pod logs (last 30 min); certificates on the ingress hosts; the authentication chain (agent token rejections, requests without a token, expired or unverifiable tokens, which agents are rejected and since when, with a diagnosis); `vracli status` where installed; plus the Kubernetes and node checks. Namespaces are found by name; set `namespaces = prelude, vmsp-*` to choose them |
+| `[vcfa]` | VCF Automation nodes | `vmware-system-user` | pods, workloads, restarts and warning events in the Automation namespaces; container image versions; database pods and volumes; error lines in pod logs (last 30 min); certificates on the ingress, Gateway and HTTPRoute hosts; the authentication chain (agent token rejections counted once per call, requests without a token, expired or unverifiable tokens, which agents are rejected and since when, the access log of an in-cluster proxy the agent calls through, with a diagnosis); `vracli status` where installed (8.x only); plus the Kubernetes and node checks. Namespaces are found by name; set `namespaces = prelude, vmsp-*` to choose them |
 | `[sddc]` | SDDC Manager | `vcf` | add `escalate = su` to also run the checks that need root |
 | `[k8s]` | Kubernetes control-plane nodes: VCF services runtime, Operations, Automation, Supervisor | `vmware-system-user` | finds a working `kubectl` on its own (plain, `KUBECONFIG=/etc/kubernetes/admin.conf`, with `sudo`) |
 | `[vcfmgmt]` | VCF management cluster (VCF services runtime) | `vmware-system-user` | list the control-plane IPs; workers are discovered; service endpoints are checked (see below) |
@@ -242,12 +242,16 @@ The Kubernetes types (management cluster, Kubernetes control plane, Supervisor) 
   NetworkUnavailable), cordoned or tainted nodes, kubelet / kernel / container-runtime / OS
   versions side by side in the wide node list (mismatches stand out), allocatable resources and
   running pods per node,
-  control-plane component pods, and etcd endpoint health and status (leader, database size);
+  control-plane component pods, and etcd endpoint health and status (leader, database size; a
+  finding when the database nears its quota or is mostly unused space that a defragment returns);
 - pods: every container that is not ready, waiting (CrashLoopBackOff, ImagePullBackOff ...),
-  restarted, or whose last run ended badly, with reason, exit code and time; OOMKilled containers;
-  pending pods with their scheduling failures; evicted and failed pods; probe failures;
-  Deployments, StatefulSets and DaemonSets not fully available; volume claims not Bound; top pods
-  by memory; and the previous logs of up to five crash-looping pods;
+  restarted, or whose last run ended badly, with reason, exit code and time (containers whose last
+  run ended within five minutes of each other are named as one event: a node restart or a
+  cluster-wide stall); OOMKilled containers; pending pods with their scheduling failures; evicted
+  and failed pods; probe failures (a finding per probe type); Deployments, StatefulSets and
+  DaemonSets not fully available; volume claims not Bound; top pods by memory and by CPU; Flux
+  HelmReleases that are not Ready, with the full Helm error; and the previous logs of up to five
+  crash-looping pods;
 - objects stuck in deletion: every object of any type whose deletion has waited 30 minutes or
   more for its finalizers, with how long and which finalizers. A controller-managed object held
   this way blocks whatever depends on it, often while its conditions still read True.
@@ -400,13 +404,16 @@ The report is built for an analyst (human or AI) who has to find the real proble
 | `domain-01` | a DNS domain; `esxi-01.domain-01` is an FQDN |
 | `ip-n3-h7` | IPv4 address: 7th address seen in the 3rd distinct /24. Hosts in the same subnet keep the same `n` |
 | `ip6-0001`, `mac-0001`, `wwn-0001`, `uuid-0001`, `serial-0001`, `thumbprint-0001`, `license-0001`, `naa.device-0001`, `iqn-0001` | addresses and hardware/software identifiers |
-| `datastore-0001`, `portgroup-0001`, `dvs-0001`, `lrouter-0001`, `ns-0001`, `k8sobj-0001`, `dn-0001`, `term-0001` | object names, certificate name parts, your own scrub terms |
+| `endpoint-01` | a VCF management service endpoint from the inventory |
+| `datastore-0001`, `portgroup-0001`, `dvs-0001`, `vm-0001`, `lrouter-0001`, `ns-0001`, `k8sobj-0001`, `cluster-0001`, `vcluster-0001`, `edgecluster-0001`, `nsxobj-0001`, `dn-0001`, `term-0001` | object names, certificate name parts, your own scrub terms |
 | `[REDACTED]` | passwords, tokens, keys, certificate bodies |
 
 The same real value always gets the same placeholder, also in later runs, so reports can be
 compared over time. Product names that matter for diagnosis stay readable: version numbers,
 service and pod names, product namespaces such as `prelude` or `kube-system`, `vsphere.local`,
-netmasks, loopback addresses.
+netmasks, loopback addresses. Ordinary words and product names (`database`, `volume`,
+`provisioning`, `vcfa` ...) are never treated as object names, even when a namespace or a
+cluster-scoped object carries one, and placeholders already in the report are never replaced again.
 
 Things the tool cannot know by itself go in `[settings]`:
 

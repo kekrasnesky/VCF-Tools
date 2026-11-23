@@ -2739,7 +2739,8 @@ class Automation(unittest.TestCase):
         self.assertRegex(out, r"(?m)^request without an auth token\s+2  ccs-vksm-eas \(1\)$")
         self.assertIn("(2 distinct)", out)
         self.assertIn("2 x agent.cluster.name=c-alpha", out)
-        self.assertIn("DIAGNOSIS (high): VCF Automation rejects cluster agent tokens (4 line(s)", out)
+        self.assertIn("DIAGNOSIS (high): VCF Automation rejects cluster agent tokens (3 rejected agent call(s) in 30 min, "
+                      "1 of them for a token Automation has no record of)", out)
         self.assertIn("2 distinct agents", out)
         self.assertIn("2026-11-03T16:22:10Z in authentication-server-695678cb7f-7jcgk - at the start of its log", out)
         self.assertIn("probably the same agents", out)
@@ -3665,3 +3666,154 @@ class StuckInDeletion(unittest.TestCase):
         p = v.investigator_prompt(6, True)
         self.assertIn("ClusterDomainResolutionEntry", p)
         self.assertIn("deletionTimestamp", p)
+
+
+class ReportReviewFixes(unittest.TestCase):
+    """Problems found by reading a real (anonymized) VCF Automation report."""
+
+    def test_status_codes_need_a_status_field(self):
+        rx = dict((k, r) for k, r, _ in v.VCFA_AUTH_SIGS)
+        hit = lambda key, ln: bool(re.search(rx[key], ln.lower()))  # noqa: E731
+        self.assertFalse(hit("forbidden", '{"http.time_ms":177.403,"http.response.status":200}'))
+        self.assertFalse(hit("unauthenticated", '{"resp":200,"audit-ID":"1c2d6e00-401a-4b5c-9f00-000000000000"}'))
+        self.assertTrue(hit("unauthenticated", '{"msg":"HTTP","resp":401}'))
+        self.assertTrue(hit("forbidden", '"http.response.status":403,'))
+        self.assertTrue(hit("unauthenticated", '"GET /v1 HTTP/1.1" 401 512'))
+
+    def test_relayed_agent_calls_are_counted_once(self):
+        lines = ('{"component":"client-grpc","grpc.error":"rpc error: desc = invalid v1agent token"}\n'
+                 '{"component":"server-serve-grpc","grpc.error":"rpc error: desc = invalid v1agent token"}\n')
+        r = v.subprocess.run(["sh", "-c", v._AUTH_AWK], input=lines, capture_output=True, text=True)
+        self.assertEqual(r.stdout.strip(), "@@COUNT agent_token_rejected 1")
+        self.assertNotIn("grep -m1", v.VCFA_AUTH_CMD)        # reading on to the end keeps kubelet quiet
+        out = v.post_vcfa_auth("@@POD prelude/agent-gateway-server-7b9c977d69-5d78f 2026-11-01T00:00:00Z 0\n"
+                               "@@COUNT agent_token_rejected 92\n"
+                               "@@POD prelude/authentication-server-78c85747c8-nwv8m 2026-11-01T00:00:00Z 0\n"
+                               "@@COUNT agent_token_unknown 91\n")
+        self.assertIn("(92 rejected agent call(s) in 30 min; Automation has no record of the token (91 line(s)", out)
+
+    def test_proxy_access_log_is_shown(self):
+        line = ('{"component":"server-serve-grpc","grpc.error":"invalid v1agent token","peer.address":"198.18.4.79:5"}')
+        raw = ("@@PODIP vmsp-platform/vcfa-gateway-configuration-585f796cf5-7spcx 198.18.4.79\n"
+               "@@POD prelude/agent-gateway-server-7876649b8b-b4hct 2026-11-19T18:36:00Z 0\n"
+               "@@COUNT agent_token_rejected 2\n@@LINE %s\n@@LINE %s\n"
+               "@@PROXY vmsp-platform/vcfa-gateway-configuration-585f796cf5-7spcx 198.18.4.79\n"
+               '@@PLINE {"path":"/vksm.agent.v1alpha1.feature.FeatureResourceService/List","x-forwarded-for":"10.9.9.9"}\n'
+               % (line, line))
+        out = v.post_vcfa_auth(raw)
+        self.assertIn("agent requests in the access log of vmsp-platform/vcfa-gateway-configuration", out)
+        self.assertIn("x-forwarded-for=10.9.9.9 (1)", out)
+        self.assertIn("see 'agent requests in the access log of", out)
+        quiet = v.post_vcfa_auth(raw.split("@@PLINE")[0])
+        self.assertIn("access logging may be off", quiet)
+
+    def test_shell_side_names_the_proxy(self):
+        fake = FAKE_KUBECTL.replace(
+            "  logs*) printf 'INFO fine",
+            "  logs\\ -n\\ vmsp-platform\\ vcfa-gateway-1*) printf '%s\\n' '{\"path\":\"/vksm.agent.v1/List\"}';;\n"
+            "  logs*) printf 'INFO fine").replace(
+            "@@PODIP prelude/ebs-app-5c 10.0.0.3\\n",
+            "@@PODIP prelude/ebs-app-5c 10.0.0.3\\n@@PODIP vmsp-platform/vcfa-gateway-1 10.0.0.9\\n").replace(
+            '"agent.cluster.name":"c-alpha","time":"2026-11-19T17:50:00Z"}',
+            '"component":"server-serve-grpc","peer.address":"10.0.0.9:443","time":"2026-11-19T17:50:00Z"}')
+        with tempfile.TemporaryDirectory() as d:
+            k = os.path.join(d, "kubectl")
+            with open(k, "w") as fh:
+                fh.write(fake)
+            os.chmod(k, 0o755)
+            cmd = (v._VCFA_NS + v.VCFA_AUTH_CMD).replace("{K}", k).replace("{NSRX}", v.shlex.quote(v.AUTOMATION_NS_DEFAULT))
+            r = v.subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.stderr, "")
+        self.assertIn("@@PROXY vmsp-platform/vcfa-gateway-1 10.0.0.9", r.stdout)
+        self.assertIn('@@PLINE {"path":"/vksm.agent.v1/List"}', r.stdout)
+
+    def test_redaction_stays_on_one_line_and_skips_prose(self):
+        sc = v.Scrubber(v.Mapping(None))
+        text = "x.k8smanagedsecret.KubernetesManagedSecr\n== prelude/ccs-vksm-eas: 476 error line(s)"
+        self.assertEqual(sc.scrub(text), text)
+        self.assertEqual(sc.scrub("invalid v1agent token: id 1002"), "invalid v1agent token: id 1002")
+        self.assertEqual(sc.scrub("token: c2VjcmV0dG9rZW4xMjM0"), "token: [REDACTED]")
+        self.assertEqual(sc.scrub("password: hunter"), "password: [REDACTED]")
+
+    def test_ordinary_words_and_placeholders_are_not_replaced(self):
+        m = v.Mapping(None)
+        m.maps["namespace"] = {"database": "ns-0017", "vcfa": "ns-0026", "widgets-team": "ns-0001"}   # older mapping
+        sc = make(mapping=m)
+        sc.learn_host("vcfa1.corp.example-widgets.com", prefix="vcfa")
+        self.assertIsNone(sc.learn_term("namespace", "volume"))
+        out = run(sc, "vcfa-01: database pods, volume claims, vcfa-gateway; ns widgets-team")
+        self.assertEqual(out, "vcfa-01: database pods, volume claims, vcfa-gateway; ns ns-0001")
+
+    def test_tables_without_a_namespace_column_teach_no_namespaces(self):
+        sc = make()
+        sc.learn_k8s("nsrows", "NAME           ID   VERSION\nvcfa  k1  9.1\nacme-thing  k2  9.1\n")
+        sc.learn_k8s("nsrows", "NAME   READY   STATUS\netcd-node1   1/1   Running\n")
+        self.assertEqual(sc.m.maps.get("namespace", {}), {})
+        sc.learn_k8s("nsrows", "NAMESPACE   NAME   READY\nacme-ns   web-1   1/1\n")
+        self.assertIn("acme-ns", sc.m.maps["namespace"])
+        labels = [c["label"] for g in v.K8S_GROUPS for c in g[2] if c.get("k8s") == "nsrows"]
+        self.assertNotIn("Components", labels)
+        self.assertNotIn("Control-plane component pods", labels)
+
+    def test_log_lines_below_error_level_are_not_counted(self):
+        lines = ('2026 [warn]: #0 failed to flush error_class=Errno::ECONNRESET\n'
+                 '{"severity":"WARNING","error":"not valid json"}\n'
+                 'time=1 level=INFO msg="error finding namespace"\n'
+                 '2026-11-23T13:37:22Z INFO project-service WebClientResponseException\n'
+                 'E1123 13:28:49 status.go:71] error\n{"level":"error","msg":"missing auth token"}\n')
+        r = v.subprocess.run(["sh", "-c", "grep -viE '%s' | grep -vE '%s'" % (v.LOG_BELOW_ERROR_CI, v.LOG_BELOW_ERROR_CS)],
+                             input=lines, capture_output=True, text=True)
+        self.assertEqual(r.stdout.splitlines(), ['E1123 13:28:49 status.go:71] error', '{"level":"error","msg":"missing auth token"}'])
+
+    def test_kubelet_lines_about_gone_log_readers_are_noise(self):
+        out = v.post_kubelet_errors(
+            'Nov 23 13:40:03 n1 kubelet[1]: E1123 "Failed when writing line to log file" err="http2: stream closed"\n'
+            'Nov 23 13:40:04 n1 kubelet[1]: E1123 "Failed when writing line to log file" err="http2: stream closed"\n'
+            'Nov 23 13:41:00 n1 kubelet[1]: E1123 "Error syncing pod" err="boom"\n')
+        self.assertIn("2 log reader disconnected", out)
+        self.assertIn("Error syncing pod", out)
+
+    def test_cut_lists_say_so(self):
+        c = v._TOP % ("seq 1 40", 30, 30, 30, "pod(s) with restarts")
+        out = v.subprocess.run(["sh", "-c", c], capture_output=True, text=True).stdout.splitlines()
+        self.assertEqual((len(out), out[-1]), (31, "(10 more pod(s) with restarts not shown)"))
+
+    def test_restart_bursts(self):
+        rows = "".join("p/c%d  node=n%d  phase=Running  reason=  [m ready=true restarts=2 waiting= "
+                       "last=Error:1@2026-11-20T00:0%d:10Z]\n" % (i, i % 3, i) for i in range(6))
+        rows += "p/z  node=n1  phase=Running  reason=  [m ready=true restarts=1 waiting= last=Completed:0@2026-10-01T22:19:44Z]"
+        out = v.post_problem_containers(rows)
+        self.assertIn("2026-11-20 00:00:10..00:05:10 UTC 6 container(s) on 3 node(s)", out)
+        self.assertEqual(v.KEY_FACTS["Problem containers (not ready, waiting, restarted, last termination)"](out),
+                         [("restart_bursts", "2026-11-20T00:00 (6 containers, 3 nodes)")])
+        t = types.SimpleNamespace(errkind=None, clock_offset=None, sec={}, results=[
+            {"status": "ok", "label": "Problem containers (not ready, waiting, restarted, last termination)", "out": out}])
+        self.assertIn("one cluster-wide event", v.target_findings(t, [])[0][1])
+
+    def test_probe_etcd_and_helmrelease_findings(self):
+        probe = v.post_probe_events(
+            "NAMESPACE   LAST SEEN   TYPE      REASON      OBJECT          MESSAGE\n"
+            "prelude     54m         Warning   Unhealthy   pod/vco-app-0   Readiness probe failed:\n"
+            "prelude     46m         Warning   Unhealthy   pod/vco-app-1   Liveness probe failed:\n")
+        self.assertIn("exec probe exited with an error and printed nothing", probe)
+        etcd = ("| ENDPOINT | ID | DB SIZE | IN USE | QUOTA |\n"
+                "| https://10.0.0.1:2379 | 3a |  1.8 GB |  87 MB | 8.6 GB |\n")
+        hr = v.post_helmreleases(
+            "@@HR vmsp-platform/namespace-config-cert-manager-test gen=8005 observed=8004 ready=False reason=InstallFailed\n"
+            "Helm install failed for release cert-manager-test: 2 errors occurred:\n"
+            "\t* namespaces \"cert-manager-test\" already exists\n"
+            "@@HR vmsp-platform/vmsp-api gen=3 observed=3 ready=True reason=InstallSucceeded\nok\n")
+        self.assertIn("2 HelmRelease(s), 1 not Ready", hr)
+        self.assertIn('* namespaces "cert-manager-test" already exists', hr)
+        t = types.SimpleNamespace(errkind=None, clock_offset=None, sec={}, results=[
+            {"status": "ok", "label": "Probe failures (liveness / readiness)", "out": probe},
+            {"status": "ok", "label": "etcd health and status (leader, database size)", "out": etcd},
+            {"status": "ok", "label": v.HELMRELEASE_LABEL, "out": hr}])
+        found = [(sev, text.split(" - ")[0]) for sev, text, _ in v.target_findings(t, [])]
+        self.assertIn(("med", "liveness probe failures in recent events on 1 pod(s): prelude/vco-app-1"), found)
+        self.assertIn(("low", "readiness probe failures in recent events on 1 pod(s): prelude/vco-app-0"), found)
+        self.assertIn(("low", "etcd database 1.8 GB but only 87.0 MB in use: defragment it to give the space back "
+                              "(etcdctl defrag, one member at a time, followers first, the leader last)"), found)
+        self.assertIn(("med", "HelmRelease vmsp-platform/namespace-config-cert-manager-test not Ready (InstallFailed): "
+                              "Helm install failed for release cert-manager-test: 2 errors occurred:"), found)
+        self.assertEqual(v.KEY_FACTS[v.HELMRELEASE_LABEL](hr), [("helmreleases_not_ready", 1)])

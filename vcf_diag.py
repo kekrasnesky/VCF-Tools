@@ -57,7 +57,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
-VERSION = "1.22.0"
+VERSION = "1.23.0"
 
 # ----------------------------------------------------------------------------
 # Diagnostic catalog
@@ -576,9 +576,17 @@ def _kubelet_not_error(ln):
     return msg.lstrip().startswith("No ") or "No image pull failure found" in ln
 
 
+def _kubelet_reader_gone(ln):
+    """kubelet could not write a log line to a client that stopped reading (kubectl logs ended
+    early, a log shipper reconnected): not a fault of the node or the pod."""
+    return "Failed when writing line to log file" in ln and "stream closed" in ln
+
+
 def post_kubelet_errors(out):
-    """kubelet journal errors: deduplicated; kubelet-watchdog 'No ... found' lines left out."""
-    return post_log_dedup(out, drop=_kubelet_not_error)
+    """kubelet journal errors: deduplicated; kubelet-watchdog 'No ... found' lines left out,
+    lines about log readers that disconnected counted as noise."""
+    return post_log_dedup(out, drop=_kubelet_not_error, noise=_kubelet_reader_gone,
+                          noise_label="log reader disconnected (http2: stream closed, harmless)")
 
 
 def post_events(out):
@@ -777,14 +785,135 @@ def post_exited_containers(out):
                                             "containers and finished jobs)" % old])
 
 
+_RX_LAST_END = re.compile(r"\[(\S+) ready=\S+ restarts=\d+ waiting=\S* last=[^:\]]*:-?\d+@(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)\]")
+BURST_MINUTES = 5           # last terminations this close together count as one event
+BURST_MIN_CONTAINERS = 5
+
+
+def restart_bursts(out):
+    """[(first, last, containers, nodes)]: groups of containers whose last termination fell within
+    BURST_MINUTES of each other. Many containers ending together point to one event (a node
+    restart, controllers losing leader election after an API server or etcd stall), not to faults
+    of the containers themselves."""
+    ends = []
+    for ln in out.splitlines():
+        node = re.search(r"\snode=(\S+)", ln)
+        for m in _RX_LAST_END.finditer(ln):
+            ends.append((m.group(2), node.group(1) if node else "?"))
+    ends.sort()
+    groups, cur = [], []
+    for ts, node in ends:
+        if cur and (_minutes_between(cur[0][0], ts) or 0) > BURST_MINUTES:
+            groups.append(cur)
+            cur = []
+        cur.append((ts, node))
+    if cur:
+        groups.append(cur)
+    return [(g[0][0], g[-1][0], len(g), len(set(n for _, n in g))) for g in groups if len(g) >= BURST_MIN_CONTAINERS]
+
+
 def post_problem_containers(out):
-    """Problem containers: pods of finished jobs (phase=Succeeded) are counted, not listed."""
+    """Problem containers: pods of finished jobs (phase=Succeeded) are counted, not listed; last
+    terminations that happened together are named as one event."""
     lines = out.splitlines()
     done = [ln for ln in lines if "  phase=Succeeded  " in ln]
-    if len(done) < 3:
+    res = [ln for ln in lines if ln not in done] if len(done) >= 3 else list(lines)
+    if len(done) >= 3:
+        res.append("(%d pod(s) of finished jobs (phase=Succeeded) left out)" % len(done))
+    bursts = restart_bursts(out)
+    if bursts:
+        res.append("(last terminations close together, one event each: %s)" % "; ".join(
+            "%s..%s UTC %d container(s) on %d node(s)" % (a.replace("T", " ")[:19], b[11:19], n, nodes)
+            for a, b, n, nodes in bursts))
+    return "\n".join(res) if res != lines else out
+
+
+def post_probe_events(out):
+    """Unhealthy events: an empty message after 'probe failed:' is explained."""
+    if re.search(r"(?m)probe failed:\s*$", out):
+        out = out.rstrip("\n") + ("\n(an empty message after 'probe failed:' means an exec probe exited with an "
+                                  "error and printed nothing: the probe command is in the pod spec)")
+    return out
+
+
+def probe_failures(out):
+    """{'Liveness': [ns/pod ...], 'Readiness': [...], 'Startup': [...]} from Unhealthy events."""
+    res = {}
+    for ln in out.splitlines():
+        cols = ln.split(None, 5)
+        if len(cols) == 6 and cols[3] == "Unhealthy":
+            m = re.match(r"(Liveness|Readiness|Startup) probe", cols[5])
+            if m:
+                pod = "%s/%s" % (cols[0], cols[4].split("/", 1)[-1])
+                if pod not in res.setdefault(m.group(1), []):
+                    res[m.group(1)].append(pod)
+    return res
+
+
+HELMRELEASE_LABEL = "Flux HelmReleases not Ready"
+HELMRELEASE_JSONPATH = ('{range .items[*]}{"@@HR "}{.metadata.namespace}/{.metadata.name}{" gen="}'
+                        '{.metadata.generation}{" observed="}{.status.observedGeneration}'
+                        '{range .status.conditions[?(@.type=="Ready")]}{" ready="}{.status}{" reason="}{.reason}'
+                        '{"\\n"}{.message}{end}{"\\n"}{end}')
+
+
+def parse_helmreleases(out):
+    """[{name, gen, observed, ready, reason, message}] from the @@HR blocks."""
+    rels, cur = [], None
+    for ln in out.splitlines():
+        m = re.match(r"@@HR (\S+) gen=(\d*) observed=(-?\d*)(?: ready=(\S*) reason=(\S*))?", ln)
+        if m:
+            cur = {"name": m.group(1), "gen": int(m.group(2) or 0), "observed": int(m.group(3) or 0),
+                   "ready": m.group(4) or "Unknown", "reason": m.group(5) or "", "message": []}
+            rels.append(cur)
+        elif cur is not None and ln.strip():
+            cur["message"].append(ln.strip())
+    return rels
+
+
+def post_helmreleases(out):
+    if "@@HR " not in out:
         return out
-    return "\n".join([ln for ln in lines if ln not in done] +
-                     ["(%d pod(s) of finished jobs (phase=Succeeded) left out)" % len(done)])
+    rels = parse_helmreleases(out)
+    bad = [r for r in rels if r["ready"] != "True"]
+    lines = ["%d HelmRelease(s), %d not Ready" % (len(rels), len(bad))]
+    for r in bad:
+        churn = (" - the spec was changed %d times: something keeps rewriting it" % r["gen"]) if r["gen"] >= 1000 else ""
+        lines.append("%s ready=%s reason=%s generation %d (observed %d)%s" % (
+            r["name"], r["ready"], r["reason"] or "-", r["gen"], r["observed"], churn))
+        lines += ["   " + x[:300] for x in r["message"][:8]]
+    return "\n".join(lines)
+
+
+def etcd_status(out):
+    """{'size': bytes, 'in_use': bytes, 'quota': bytes, 'unhealthy': n} from the etcdctl output
+    (largest member), or {} when there is no status table."""
+    def size(text):
+        m = re.match(r"([\d.]+)\s*([kMGT]?)i?B", text.strip())
+        return float(m.group(1)) * 1000 ** " kMGT".index(m.group(2) or " ") if m else None
+    head, best = None, {}
+    for ln in out.splitlines():
+        if not ln.startswith("|"):
+            continue
+        cells = [c.strip() for c in ln.strip().strip("|").split("|")]
+        if "DB SIZE" in cells:
+            head = cells
+        elif head and len(cells) == len(head) and cells[0].startswith("http"):
+            row = dict(zip(head, cells))
+            got = {"size": size(row.get("DB SIZE", "")), "in_use": size(row.get("IN USE", "")),
+                   "quota": size(row.get("QUOTA", ""))}
+            if got["size"] and (not best or got["size"] > best["size"]):
+                best = got
+    if best:
+        best["unhealthy"] = len(re.findall(r"(?m) is unhealthy", out))
+    return best
+
+
+def _human(n):
+    for unit in ("B", "kB", "MB", "GB", "TB"):
+        if n < 1000 or unit == "TB":
+            return ("%.1f %s" % (n, unit)) if unit != "B" else "%d B" % n
+        n /= 1000.0
 
 
 _RX_OLD_FAILED = re.compile(r"^(\S+)\s+(\S+)\s+\d+/\d+\s+(?:Error|Failed|ContainerStatusUnknown)\s+\d+"
@@ -896,7 +1025,10 @@ def linux_groups(cert=True):
         ]),
         ("services", "systemd service state", [
             cmd("System state", "systemctl is-system-running 2>&1"),
-            cmd("Failed units", "systemctl --failed --no-pager --no-legend 2>&1 | head -n 40"),
+            cmd("Failed units", "systemctl --failed --no-pager --no-legend 2>&1 | head -n 40;"
+                " for u in $(systemctl --failed --no-pager --no-legend --plain 2>/dev/null | awk '{print $1}'"
+                " | head -n 3); do echo \"== $u: last journal lines (this boot)\";"
+                " journalctl -u \"$u\" -b --no-pager -n 15 2>&1 | cut -c1-300; done", sudo=True),
             cmd("Running services",
                 "systemctl list-units --type=service --state=running --no-pager --no-legend 2>&1"
                 " | awk '{print $1}' | head -n 150"),
@@ -913,9 +1045,10 @@ def linux_groups(cert=True):
             cmd("Routes", "ip route 2>&1 | head -n 60"),
         ]),
         ("accounts", "Password expiry", [
+            # through sudo: reading root's entry in /etc/shadow needs root ("chage: Permission denied")
             cmd("Password ageing",
                 "for u in $(printf '%s\\n' root \"$(id -un)\" | sort -u); do echo \"== $u\";"
-                " chage -l \"$u\" 2>&1 | head -n 4; done"),
+                " chage -l \"$u\" 2>&1 | head -n 4; done", sudo=True),
         ]),
     ]
     if cert:
@@ -1057,6 +1190,11 @@ POD_JSONPATH = ('{range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"  
 NODE_COND_JSONPATH = ('{range .items[*]}{.metadata.name}{range .status.conditions[*]}{"  "}{.type}{"="}{.status}'
                       '{"("}{.reason}{")"}{end}{"\\n"}{end}')
 
+# the first N rows, and a line saying how many more there were: (command, N, N, N, what)
+_TOP = ("out=$(%s); n=$(printf '%%s\\n' \"$out\" | grep -c .); if [ -n \"$out\" ]; then printf '%%s\\n' \"$out\""
+        " | head -n %d; [ \"$n\" -gt %d ] && echo \"($((n - %d)) more %s not shown)\"; true; else echo none; fi")
+
+
 K8S_GROUPS = [
     ("k8s-cluster", "Kubernetes API and nodes", [
         kctl("API server version", "{K} version 2>&1 | head -n 6"),
@@ -1075,8 +1213,8 @@ K8S_GROUPS = [
              " if ($4!=\"Completed\" && ($4!=\"Running\" || a[1]!=a[2])) print}'",
              k8s="nsrows", max_lines=300, post=post_not_ready),
         kctl("Pods with most restarts",
-             "{K} get pods -A --no-headers 2>&1 | awk '$5+0>0' | sort -k5 -n -r | head -n 30",
-             k8s="nsrows"),
+             _TOP % ("{K} get pods -A --no-headers 2>&1 | awk '$5+0>0' | sort -k5 -n -r", 30, 30, 30,
+                     "pod(s) with restarts"), k8s="nsrows"),
         # summarized per namespace; the anonymizer still learns every pod name from the full list
         kctl("All pods (per namespace)", "{K} get pods -A -o wide 2>&1", k8s="nsrows", max_lines=300,
              post=post_all_pods),
@@ -1104,7 +1242,7 @@ K8S_GROUPS = [
              "echo \"$n  allocatable pods=$m cpu=$c memory=$r  running pods=$({K} get pods -A --no-headers "
              "--field-selector spec.nodeName=$n 2>/dev/null | wc -l)\"; done", k8s="firstnode", timeout=90),
         kctl("Control-plane component pods",
-             "{K} -n kube-system get pods -l tier=control-plane -o wide 2>&1", k8s="nsrows"),
+             "{K} -n kube-system get pods -l tier=control-plane -o wide 2>&1"),
         # the etcd image has no shell: etcdctl is run directly, the API version is a flag-free default (v3)
         kctl("etcd health and status (leader, database size)",
              "p=$({K} -n kube-system get pods -l component=etcd -o name 2>/dev/null | head -n 1); "
@@ -1128,13 +1266,14 @@ K8S_GROUPS = [
              "{K} get pods -A --field-selector=status.phase=Failed -o wide 2>&1 | head -n 60", k8s="nsrows"),
         kctl("Probe failures (liveness / readiness)",
              "{K} get events -A --field-selector reason=Unhealthy --sort-by=.lastTimestamp 2>&1 | tail -n 40",
-             k8s="nsrows"),
+             k8s="nsrows", post=post_probe_events),
         kctl("Deployments, StatefulSets and DaemonSets not fully available",
              "{K} get deploy,sts -A --no-headers 2>&1 | awk '{split($3,a,\"/\"); if (a[1]!=a[2]) print}'; "
              "{K} get ds -A --no-headers 2>&1 | awk '$3!=$5 || $3!=$7'", k8s="nsrows"),
         kctl("Volume claims not Bound", "{K} get pvc -A --no-headers 2>&1 | awk '$3!=\"Bound\"' | head -n 50",
              k8s="nsrows"),
         kctl("Top pods by memory", "{K} top pods -A --sort-by=memory 2>&1 | head -n 25", k8s="nsrows"),
+        kctl("Top pods by CPU", "{K} top pods -A --sort-by=cpu 2>&1 | head -n 20", k8s="nsrows"),
         kctl("Previous logs of crashing containers (up to 5 pods)",
              "{K} get pods -A --no-headers 2>/dev/null | awk '$4 ~ /CrashLoopBackOff|Error|OOMKilled/ {print $1\" \"$2}' "
              "| head -n 5 | while read ns pod; do echo \"== $ns/$pod\"; {K} logs -n \"$ns\" \"$pod\" --all-containers "
@@ -1143,8 +1282,13 @@ K8S_GROUPS = [
              harvest=[("k8sns", r"(?m)^@@DEL \S+ ([a-z0-9-]+)/", None), h_user_obj(r"@@DEL \S+ ")]),
     ]),
     ("k8s-vcf", "VCF services runtime objects (best effort)", [
-        kctl("Components", "{K} get components -A 2>&1 | head -n 200", k8s="nsrows"),
+        # components are cluster-scoped: the first column is a component name, not a namespace
+        kctl("Components", "{K} get components -A 2>&1 | head -n 200"),
         kctl("Package installs", "{K} get packageinstalls -A 2>&1 | head -n 200", k8s="nsrows"),
+        # the event table cuts a multi-line Helm error after its first line: the Ready condition has it all
+        kctl(HELMRELEASE_LABEL, "{K} get helmreleases.helm.toolkit.fluxcd.io -A -o jsonpath=%s 2>&1"
+             % shlex.quote(HELMRELEASE_JSONPATH), max_lines=120, post=post_helmreleases,
+             harvest=[("k8sns", r"(?m)^@@HR ([a-z0-9-]+)/", None), h_user_obj("@@HR ")]),
     ]),
 ]
 
@@ -1929,6 +2073,12 @@ _NONE = "out=$(%s); if [ -n \"$out\" ]; then echo \"$out\"; else echo none; fi"
 # finding no collector on :4317, fluentd's multi-line joiner flushing on time, squid noting health
 # probes that close the connection early.
 LOG_NOISE = r":4317|ConcatFilter::TimeoutError|transaction-end-before-headers"
+# Lines logged at a level below error that only mention the word ("level=INFO msg=\"error finding
+# namespace\"", fluentd "[warn]: ... error_class=", "severity":"WARNING"): they are not errors.
+LOG_BELOW_ERROR_CI = (r'"(level|severity|lvl|loglevel)" *: *"(warn|warning|info|debug|trace|notice)"|'
+                      r'(level|severity)=(warn|warning|info|debug|trace|notice)([^a-z]|$)|'
+                      r'\[(warn|warning|info|debug|trace|notice)\]')
+LOG_BELOW_ERROR_CS = r"(^| )(WARN|WARNING|INFO|DEBUG|TRACE|NOTICE)( |$)|^[IWD][0-9]{4} "
 
 
 def _vcfa(label, body, **kw):
@@ -1945,6 +2095,10 @@ def _vcfa(label, body, **kw):
 VCFA_AUTH_LABEL = "Automation authentication chain (users and cluster agents, last 30 min)"
 VCFA_AUTH_PODS = ("authentication-server|agent-gateway-server|api-gateway-server|ccs-vksm-eas|"
                   "account-manager-server|cluster-sync-ingest|cluster-sync-egest|vmsp-identity|vmsp-gateway")
+# An HTTP status in a log line: after a status field ("resp":401, "http.response.status":403,
+# status=401) or as a column of an access log ("GET /x HTTP/1.1" 401 512). A bare number is not
+# enough: "time_ms":177.403 and UUIDs ("-401a-") would match.
+_HTTP_STATUS = "(status|code|resp)[^a-z0-9]+{0}([^0-9]|$)|http.[0-9.]+[^a-z0-9]+{0}([^0-9]|$)"
 # (key, awk regex on the lower-cased line, text). The first match wins, so the specific
 # signatures come before the generic ones.
 VCFA_AUTH_SIGS = (
@@ -1957,36 +2111,54 @@ VCFA_AUTH_SIGS = (
      "token signature or signing key"),
     ("issuer_audience", "invalid issuer|issuer mismatch|invalid audience|audience mismatch", "token issuer or audience"),
     ("tls", "x509|certificate has expired|certificate signed by unknown|tls: ", "TLS or certificate"),
-    ("unauthenticated", "unauthenticated|unauthori[sz]ed|[^0-9]401[^0-9]", "other: unauthenticated / 401"),
-    ("forbidden", "forbidden|permission denied|[^0-9]403[^0-9]", "other: forbidden / 403"),
+    ("unauthenticated", "unauthenticated|unauthori[sz]ed|" + _HTTP_STATUS.format("401"), "other: unauthenticated / 401"),
+    ("forbidden", "forbidden|permission denied|" + _HTTP_STATUS.format("403"), "other: forbidden / 403"),
 )
 _AUTH_SIG_TEXT = dict((k, t) for k, _, t in VCFA_AUTH_SIGS)
+# agent-gateway-server logs each rejected agent call twice: as the server answering the agent and
+# as the client of authentication-server ("component":"client-grpc"). Only the first is counted,
+# so that the count is one per rejected call (authentication-server logs the call once more itself).
+_AUTH_RELAY = '"component" *: *"client-grpc"'
 _AUTH_AWK = ("awk '{l=tolower($0); " + " else ".join(
-    "if (l ~ /%s/) c[\"%s\"]++;" % (rx, key) for key, rx, _ in VCFA_AUTH_SIGS)
+    ("if (l ~ /%s/) { if (l !~ /%s/) c[\"%s\"]++ }" % (rx, _AUTH_RELAY, key)) if key == "agent_token_rejected"
+    else "if (l ~ /%s/) c[\"%s\"]++;" % (rx, key) for key, rx, _ in VCFA_AUTH_SIGS)
     + "} END{for (k in c) print \"@@COUNT \" k, c[k]}'")
 _AUTH_GREP = "|".join(rx for _, rx, _ in VCFA_AUTH_SIGS)
 _AUTH_FIRST = "no such valid token|invalid v1agent token|missing auth token"
 
 VCFA_AUTH_CMD = (
     # pod addresses first, so that the client address of a rejected call can be named as a pod
-    "{K} get pods -A -o jsonpath='{range .items[*]}{\"@@PODIP \"}{.metadata.namespace}/{.metadata.name}"
-    " {.status.podIP} {.status.startTime}{\"\\n\"}{end}' 2>/dev/null;"
-    " found=0; for ns in $NS; do for p in $({K} get pods -n \"$ns\" --field-selector=status.phase=Running -o name"
+    "podips=$({K} get pods -A -o jsonpath='{range .items[*]}{\"@@PODIP \"}{.metadata.namespace}/{.metadata.name}"
+    " {.status.podIP} {.status.startTime}{\"\\n\"}{end}' 2>/dev/null); printf '%s\\n' \"$podips\";"
+    " rej=''; found=0; for ns in $NS; do for p in $({K} get pods -n \"$ns\" --field-selector=status.phase=Running -o name"
     " 2>/dev/null | grep -E '" + VCFA_AUTH_PODS + "'); do found=1;"
     " echo \"@@POD $ns/${p#pod/} $({K} get -n \"$ns\" \"$p\" -o jsonpath='{.status.startTime}"
     " {.status.containerStatuses[*].restartCount}' 2>/dev/null)\";"
     " e=$({K} logs -n \"$ns\" \"$p\" --all-containers --since=30m --tail=50000 2>/dev/null"
     " | grep -iE '" + _AUTH_GREP + "' | grep -v ':4317');"
     " if [ -n \"$e\" ]; then printf '%s\\n' \"$e\" | " + _AUTH_AWK + ";"
-    " printf '%s\\n' \"$e\" | tail -n 200 | cut -c1-800 | sed 's/^/@@LINE /'; fi;"
-    " f=$({K} logs -n \"$ns\" \"$p\" --all-containers --tail=300000 2>/dev/null | grep -m1 -iE '" + _AUTH_FIRST + "'"
-    " | cut -c1-400); if [ -n \"$f\" ]; then echo \"@@FIRST $f\"; fi;"
-    " done; done; if [ \"$found\" = 0 ]; then echo 'no authentication-chain pods found in the Automation namespaces'; fi"
+    " printf '%s\\n' \"$e\" | tail -n 200 | cut -c1-800 | sed 's/^/@@LINE /';"
+    " case \"$p\" in *agent-gateway-server*) rej=\"$rej$(printf '\\n%s' \"$e\" | grep -i 'v1agent token'"
+    " | grep 'server-serve-grpc')\";; esac; fi;"
+    " f=$({K} logs -n \"$ns\" \"$p\" --all-containers --tail=300000 2>/dev/null | grep -iE '" + _AUTH_FIRST + "'"
+    " | sed -n 1p | cut -c1-400); if [ -n \"$f\" ]; then echo \"@@FIRST $f\"; fi;"
+    " done; done; if [ \"$found\" = 0 ]; then echo 'no authentication-chain pods found in the Automation namespaces'; fi;"
+    # a pod in the cluster that relays the rejected agent calls (a proxy) hides the agent: its own
+    # access log names it, so the agent requests it logged are shown as well
+    " for a in $(printf '%s\\n' \"$rej\" | grep -oE '\"(grpc[.])?peer([.]address)?\" *: *\"[^\"]*\"'"
+    " | sed 's/.*\"\\([^\"]*\\)\"$/\\1/; s/:[0-9]*$//' | sort | uniq -c | sort -rn | head -n 3 | awk '{print $2}');"
+    " do pp=$(printf '%s\\n' \"$podips\" | awk -v ip=\"$a\" '$3==ip {print $2}' | sed -n 1p);"
+    " case \"${pp##*/}\" in *envoy*|*gateway*|*proxy*|*ingress*|*nginx*|*haproxy*) echo \"@@PROXY $pp $a\";"
+    " {K} logs -n \"${pp%%/*}\" \"${pp#*/}\" --all-containers --since=30m --tail=20000 2>/dev/null"
+    " | grep -i 'agent' | grep -v ':4317' | tail -n 20 | cut -c1-600 | sed 's/^/@@PLINE /';; esac; done"
 )
 
 _RX_TS = re.compile(r"(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})")
 _RX_AGENT_KEY = re.compile(r'"([\w.\-]*(?:cluster|agent)[\w.\-]*)"\s*:\s*"([^"]{1,200})"', re.I)
 _RX_PEER = re.compile(r'"(?:grpc\.)?peer(?:\.address)?"\s*:\s*"([^"]{1,100})"')
+# fields of a JSON access log (envoy, nginx) that name the calling client
+_RX_ACCESS_KEY = re.compile(r'"([\w.\-]*(?:forwarded|downstream|remote_addr|client|authority|user[_-]?agent|'
+                            r'cluster|agent_name)[\w.\-]*)"\s*:\s*"([^"]{1,120})"', re.I)
 
 
 def _workload(pod):
@@ -2011,8 +2183,17 @@ def _minutes_between(a, b):
 
 def parse_vcfa_auth(out):
     """{'pods': {pod: {...}}, 'counts': {sig: {workload: lines}}} from the raw check output."""
-    pods, cur, ips = {}, None, {}
+    pods, cur, ips, proxies = {}, None, {}, []
     for ln in (out or "").splitlines():
+        if ln.startswith("@@PROXY "):
+            parts = ln.split()
+            proxies.append({"pod": parts[1] if len(parts) > 1 else "?", "addr": parts[2] if len(parts) > 2 else "?",
+                            "lines": []})
+            continue
+        if ln.startswith("@@PLINE "):
+            if proxies:
+                proxies[-1]["lines"].append(ln[8:])
+            continue
         if ln.startswith("@@PODIP "):
             parts = ln.split()
             if len(parts) >= 3:
@@ -2040,7 +2221,7 @@ def parse_vcfa_auth(out):
             counts.setdefault(sig, {}).setdefault(_workload(pod), [0, 0])
             counts[sig][_workload(pod)][0] += n
             counts[sig][_workload(pod)][1] += 1
-    return {"pods": pods, "counts": counts, "ips": ips}
+    return {"pods": pods, "counts": counts, "ips": ips, "proxies": proxies}
 
 
 def vcfa_auth_clients(data):
@@ -2099,8 +2280,17 @@ def vcfa_auth_diagnosis(data):
             if pod and pod.startswith("an earlier pod"):
                 scope = ("one client, %s (%s), which no longer exists: check that the errors have stopped" % (pod, addr))
             elif pod and re.search(r"envoy|gateway|proxy|ingress|haproxy|nginx", pod.split("/")[-1]):
-                scope = ("one client, %s (%s), a proxy in the Automation cluster: the agent is behind it - its "
-                         "access log names the agent" % (pod, addr))
+                proxy = next((x for x in data.get("proxies", []) if x["pod"] == pod), None)
+                if proxy is None:
+                    seen = "its access log names the agent"
+                elif proxy["lines"]:
+                    seen = ("its access log names the agent: see 'agent requests in the access log of %s' below"
+                            % pod)
+                else:
+                    seen = ("its log has no agent requests in the last 30 min (access logging may be off): find "
+                            "the agent from the proxy's configuration or its upstream connections")
+                scope = ("one client, %s (%s), a proxy in the Automation cluster: the agent is behind it - %s"
+                         % (pod, addr, seen))
             elif pod:
                 scope = ("one client, the Automation pod %s (%s): it holds a token Automation no longer knows. "
                          "Restart that pod's workload so it fetches a new token: kubectl -n %s rollout restart "
@@ -2108,9 +2298,21 @@ def vcfa_auth_diagnosis(data):
             else:
                 scope = ("one client at %s, which is not a pod address: an agent outside the Automation cluster "
                          "(a VKS cluster or its load balancer) - re-register that cluster" % addr)
-        res.append(("high", "VCF Automation rejects cluster agent tokens (%d line(s) in 30 min, %d of them for "
-                            "tokens Automation has no record of): the affected agents cannot sync with Automation. "
-                            "Source: %s" % (unknown + rejected, unknown, scope)))
+        # agent-gateway-server logs a rejected call once (relay lines are not counted) and
+        # authentication-server logs the same call again: the two counts describe the same calls
+        if not rejected:
+            what = "%d agent token check(s) in 30 min for tokens Automation has no record of" % unknown
+        elif unknown >= 0.8 * rejected:
+            what = ("%d rejected agent call(s) in 30 min; Automation has no record of the token (%d line(s) at "
+                    "authentication-server): it was deleted or rotated, or comes from an earlier installation"
+                    % (rejected, unknown))
+        elif unknown:
+            what = ("%d rejected agent call(s) in 30 min, %d of them for a token Automation has no record of"
+                    % (rejected, unknown))
+        else:
+            what = "%d rejected agent call(s) in 30 min" % rejected
+        res.append(("high", "VCF Automation rejects cluster agent tokens (%s): the affected agents cannot sync "
+                            "with Automation. Source: %s" % (what, scope)))
         since = vcfa_auth_since(data)
         if since:
             res.append(("info", "oldest agent token error still logged: " + since))
@@ -2196,6 +2398,24 @@ def post_vcfa_auth(out):
         lines.append("callers of agent-gateway-server whose agent tokens were rejected:")
         lines += ["  %s = %s (%d call(s), last %s)" % (a, p or "not a pod in this cluster", n, last or "?")
                   for a, p, n, last in clients[:10]]
+    for proxy in data.get("proxies", []):
+        lines += ["", "agent requests in the access log of %s (%s, last 30 min, latest first, repeats merged):"
+                  % (proxy["pod"], proxy["addr"])]
+        if not proxy["lines"]:
+            lines.append("  none")
+        keys = {}
+        for ln in proxy["lines"]:
+            for m in _RX_ACCESS_KEY.finditer(ln):
+                k = "%s=%s" % m.groups()
+                keys[k] = keys.get(k, 0) + 1
+        if keys:
+            lines.append("  clients and hosts named: " + ", ".join(
+                "%s (%d)" % kv for kv in sorted(keys.items(), key=lambda kv: (-kv[1], kv[0]))[:8]))
+        shown = []
+        for ln in reversed(proxy["lines"]):
+            if log_key(ln) not in [log_key(x) for x in shown]:
+                shown.append(ln)
+        lines += ["  " + ln[:500] for ln in shown[:6]]
     diag = vcfa_auth_diagnosis(data)
     if diag:
         lines.append("")
@@ -2251,9 +2471,9 @@ AUTOMATION_GROUPS = [
         _vcfa("Automation workloads below desired replicas", _NONE % (
               "{K} get deploy,sts -A --no-headers 2>&1 | " + _VCFA_IN +
               " {split($3,a,\"/\"); if (a[1]!=a[2]) print}'"), k8s="nsrows"),
-        _vcfa("Automation pods with restarts", _NONE % (
-              "{K} get pods -A --no-headers 2>&1 | " + _VCFA_IN + " && $5+0>0' | sort -k5 -n -r | head -n 25"),
-              k8s="nsrows"),
+        _vcfa("Automation pods with restarts", _TOP % (
+              "{K} get pods -A --no-headers 2>&1 | " + _VCFA_IN + " && $5+0>0' | sort -k5 -n -r", 25, 25, 25,
+              "pod(s) with restarts"), k8s="nsrows"),
         _vcfa("Automation warning events (latest 60)", _NONE % (
               "{K} get events -A --field-selector type!=Normal --sort-by=.lastTimestamp --no-headers 2>&1 | "
               + _VCFA_IN + "' | tail -n 60"), k8s="nsrows", max_lines=120),
@@ -2273,15 +2493,24 @@ AUTOMATION_GROUPS = [
         _vcfa("Errors in Automation pod logs (last 30 min)", _NONE % (
               "for ns in $NS; do for p in $({K} get pods -n \"$ns\" --field-selector=status.phase=Running -o name"
               " 2>/dev/null); do e=$({K} logs -n \"$ns\" \"$p\" --all-containers --since=30m --tail=5000 2>/dev/null"
-              " | grep -iE '(^|[^a-z])(error|fatal|severe)([^a-z]|$)|exception' | grep -vE '" + LOG_NOISE + "');"
+              " | grep -iE '(^|[^a-z])(error|fatal|severe)([^a-z]|$)|exception' | grep -vE '" + LOG_NOISE + "'"
+              " | grep -viE '" + LOG_BELOW_ERROR_CI + "' | grep -vE '" + LOG_BELOW_ERROR_CS + "');"
               " n=$(printf '%s\\n' \"$e\" | grep -c .);"
               " if [ \"$n\" -gt 0 ]; then echo \"== $ns/${p#pod/}: $n error line(s)\"; printf '%s\\n' \"$e\""
               " | tail -n 2 | cut -c1-300 | sed 's/^/   /'; fi; done; done"),
               k8s="nsslash", timeout=300, max_lines=300, post=post_pod_log_errors),
         _vcfa("Automation ingress hosts and certificates",
+              # VCF Automation 9 publishes its endpoints through Envoy Gateway (Gateway API), older
+              # releases through Ingress: host names are read from both
               "hosts=$(for ns in $NS; do {K} get ingress -n \"$ns\" -o jsonpath='{range .items[*]}"
-              "{range .spec.rules[*]}{.host}{\"\\n\"}{end}{end}' 2>/dev/null; done | grep . | sort -u | head -n 5);"
-              " if [ -z \"$hosts\" ]; then echo 'no ingress objects in the Automation namespaces'; exit 0; fi;"
+              "{range .spec.rules[*]}{.host}{\"\\n\"}{end}{end}' 2>/dev/null;"
+              " {K} get httproutes.gateway.networking.k8s.io -n \"$ns\" -o jsonpath='{range .items[*]}"
+              "{range .spec.hostnames[*]}{@}{\"\\n\"}{end}{end}' 2>/dev/null;"
+              " {K} get gateways.gateway.networking.k8s.io -n \"$ns\" -o jsonpath='{range .items[*]}"
+              "{range .spec.listeners[*]}{.hostname}{\"\\n\"}{end}{end}' 2>/dev/null;"
+              " done | grep . | grep -v '^[*]' | sort -u | head -n 5);"
+              " if [ -z \"$hosts\" ]; then echo 'no ingress objects and no Gateway or HTTPRoute host names in the"
+              " Automation namespaces'; exit 0; fi;"
               " for h in $hosts; do echo \"== $h\"; c=$(echo | timeout 10 openssl s_client -connect \"$h:443\""
               " -servername \"$h\" 2>/dev/null | openssl x509 2>/dev/null); if [ -z \"$c\" ]; then"
               " echo '   no TLS answer on port 443'; continue; fi; printf '%s\\n' \"$c\" | openssl x509 -noout"
@@ -2290,7 +2519,8 @@ AUTOMATION_GROUPS = [
               timeout=120),
         cmd("vracli status (if installed)",
             "if command -v vracli >/dev/null 2>&1; then vracli version 2>&1 | head -n 5; vracli status 2>&1"
-            " | head -n 120; else echo 'vracli is not installed on this node'; fi", timeout=90, sudo=True),
+            " | head -n 120; else echo 'vracli is not installed on this node (expected on VCF Automation 9:"
+            " vracli belongs to VMware Aria Automation 8.x)'; fi", timeout=90, sudo=True),
     ]),    ("vcfa-auth", "VCF Automation authentication chain (login, API and cluster agent tokens)", [
         _vcfa(VCFA_AUTH_LABEL, VCFA_AUTH_CMD, timeout=300, max_lines=120, post=post_vcfa_auth,
               # cluster names in agent log fields are anonymized like any other cluster name
@@ -2652,6 +2882,19 @@ GENERIC_NAMES = set("""localhost localdomain www api ntp dns mail smtp ldap prox
 kube registry vcenter vc vcsa nsx nsxt esx esxi sddc vcf ops auto automation operations logs
 master worker node admin root manager mgmt edge backup time pool default test prod dev lab
 host server cluster vsan vmware photon linux local none null true false""".split())
+# Ordinary words and product names. They are never identifying, but a cluster-scoped object or
+# a namespace can carry one ("database", "volume", "vcfa"), and once learned the word would be
+# replaced everywhere: in commands, in messages, even inside placeholders ("vcfa-01").
+GENERIC_TERMS = set("""database databases db volume volumes storage provisioning platform identity network
+networking gateway ingress egress registry service services system controller controllers operator operators
+agent agents proxy cache metrics logging monitoring observability security policy policies config
+configuration data backup backups restore catalog components component workload workloads tenant tenants
+automation orchestration orchestrator approval approvals blueprint blueprints deployment deployments
+extensibility inventory health telemetry analytics event events messaging broker queue scheduler
+encryption certificate certificates auth authentication authorization iam account accounts user users web
+ui app apps api frontend backend core common shared infra infrastructure cluster clusters node nodes
+compute content migration upgrade install lifecycle relocation project projects vcfa vcf vks vmsp nsx avi
+supervisor fleet ops operations""".split())
 DEFAULT_OBJECT_NAMES = set("""vm network|management network|vmotion|vsan|datastore1|vsandatastore|
 n/a|none|default|true|false|unknown""".replace("\n", "").split("|"))
 SAFE_DN_VALUES = set("""vmware|vmware, inc.|vmware inc.|vmware inc|vmware engineering|us|ca|
@@ -2659,7 +2902,7 @@ california|palo alto|kubernetes|kube-apiserver|kubernetes-ca|kube-ca|etcd-ca|fro
 system:masters|system:nodes|broadcom|broadcom inc|broadcom, inc.|vsphere|local""".replace("\n", "").split("|"))
 EMPTY_VALUES = set(["", "none", "n/a", "na", "not specified", "unknown", "default string", "0",
                     "to be filled by o.e.m.", "not available", "null", "-"])
-DEFAULT_KEEP_NS = (r"default|kube-.*|vmware-.*|vmsp-.*|vcf-.*|vsp-.*|prelude.*|tanzu-.*|tkg-.*|"
+DEFAULT_KEEP_NS = (r"default|kube-.*|vmware-.*|vmsp-.*|vcf-.*|vcfa.*|vsp-.*|prelude.*|tanzu-.*|tkg-.*|"
                    r"svc-.*|cert-manager.*|kapp-controller.*|secretgen-controller|carvel-.*|"
                    r"istio-.*|envoy-gateway.*|contour.*|projectcontour|ingress.*|"
                    r"local-path-storage|velero.*|antrea.*|calico.*|cilium.*|monitoring|"
@@ -2673,7 +2916,7 @@ RX_URLCRED = re.compile(r"(://[^/\s:@]+:)([^/\s@]+)(@)")
 RX_AUTHZ = re.compile(r"(?i)(authorization\s*[:=]\s*(?:bearer|basic|token)\s+)(\S+)")
 RX_KV_SECRET = re.compile(
     r"(?i)((?<![A-Za-z])[\w.-]*(?:password|passwd|pwd|secret|token|apikey|api[_-]key|access[_-]key|"
-    r"private[_-]key|credential)[\w.-]*[\"']?\s*[:=]\s*)(\"[^\"\n]*\"|'[^'\n]*'|[^\s\"',;\[\]{}]+)")
+    r"private[_-]key|credential)[\w.-]*[\"']?[ \t]*[:=][ \t]*)(\"[^\"\n]*\"|'[^'\n]*'|[^\s\"',;\[\]{}]+)")
 # Keys that name a password *setting* (length, history, age ...), not a secret. Their value is
 # kept when it is a plain number, boolean or null, so password policies stay readable.
 RX_KV_POLICY_KEY = re.compile(
@@ -2683,6 +2926,10 @@ RX_KV_PLAIN_VALUE = re.compile(r"(?i)[\"']?(?:-?\d+(?:\.\d+)?|true|false|null|no
 
 
 RX_REFTOKEN_KEY = re.compile(r"(?i)reference[_-]?token[\"']?$")
+# "invalid v1agent token: id 1002", "token: invalid": after a key that is only a token (not a password,
+# secret or key) a short word of letters is message text. Real tokens are long random strings.
+RX_TOKEN_ONLY_KEY = re.compile(r"(?i)(?<![\w.-])token[\"']?$")
+RX_PROSE_WORD = re.compile(r"[A-Za-z]{1,10}")
 RX_REFTOKEN_VALUE = re.compile(r"[\"']?[A-Z0-9]{4,12}[\"']?")
 
 
@@ -2690,6 +2937,8 @@ def _kv_secret_is_setting(m):
     key = m.group(1).rstrip().rstrip(":=").rstrip()
     if RX_REFTOKEN_KEY.search(key) and RX_REFTOKEN_VALUE.fullmatch(m.group(2)):
         return True      # a VCF error reference code that support asks for, not a credential
+    if RX_TOKEN_ONLY_KEY.search(key) and RX_PROSE_WORD.fullmatch(m.group(2)):
+        return True
     return bool(RX_KV_POLICY_KEY.search(key) and RX_KV_PLAIN_VALUE.fullmatch(m.group(2)))
 RX_VMX_NAME = re.compile(r"(?<![\w.-])([A-Za-z0-9][A-Za-z0-9_.-]{1,80}?)\.vmx(?:@|\b)|\bvm=([^\s,;]+)")
 RX_HASH = re.compile(r"\$(?:1|2[aby]?|5|6|y)\$[./A-Za-z0-9$]{20,}")
@@ -2746,6 +2995,7 @@ class Scrubber:
         self._term_rx = []
         self._terms = {}
         self._toks = []
+        self._ph_rx = None
         for d in list(mapping.env_domains) + list(extra_domains):
             self.learn_domain(d)
         for t in terms:
@@ -2781,6 +3031,8 @@ class Scrubber:
         v = value.strip()
         if len(v) < 3 or v.lower() in DEFAULT_OBJECT_NAMES or v.isdigit() or RX_QUANTITY.fullmatch(v):
             return None
+        if cat != "term" and v.lower() in GENERIC_TERMS:
+            return None           # custom terms are the user's own choice and always replaced
         if re.fullmatch(r"(?i)(vSwitch|vmk|vmnic|vusb|eth|ens)\d+", v):
             return None
         if cat == "k8sobj" and self.m.lookup("host", v):
@@ -2800,14 +3052,22 @@ class Scrubber:
     def learn_k8s(self, kind, text, prefix="k8snode"):
         """Learn node names and organisation-specific namespaces from kubectl tables."""
         name_col = 1        # nsrows: column with the object name (1 for tables without a header)
+        namespaced = True   # nsrows: False below a "NAME ..." header (cluster-scoped objects, or
+        #                     a table of one namespace): its first column is not a namespace
         for line in text.splitlines():
             cols = line.split()
             if cols and cols[0] == "NAMESPACE":
                 # a header: only tables with a NAME column right after NAMESPACE carry object
                 # names there (events have LAST SEEN, top pods has NAME, quotas have none ...)
                 name_col = 1 if len(cols) > 1 and cols[1] == "NAME" else None
+                namespaced = True
                 continue
-            if not cols or cols[0] in ("NAME", "No", "Error", "error:"):
+            if cols and cols[0] == "NAME":
+                namespaced = False
+                continue
+            if not cols or cols[0] in ("No", "Error", "error:"):
+                continue
+            if kind == "nsrows" and not namespaced:
                 continue
             if kind == "nodes":
                 if len(cols) >= 3 and cols[1] in ("Ready", "NotReady") or (
@@ -2880,9 +3140,18 @@ class Scrubber:
                 # was learned from a kubectl table: replacing it would hit "10M" in df output
                 if real.isdigit() or RX_QUANTITY.fullmatch(real):
                     continue
+                # ... or an ordinary word / kept namespace learned by an older version ("database")
+                if cat != "term" and (real in GENERIC_TERMS or cat == "namespace" and self.keep_ns_rx.match(real)):
+                    continue
                 loose.setdefault(real, ph)       # a host placeholder wins over an object one
         for ip, ph in self.m.maps.get("ipv4", {}).items():
             digit[ip.replace(".", "-")] = ph
+        # placeholders already written into the text (target names such as "vcfa-01" in findings)
+        # are kept as they are: a learned term must not replace a part of them
+        reals = set(self.m.maps.get("host", {}))
+        phs = sorted((ph for ph in set(self.m.maps.get("host", {}).values()) if ph.lower() not in reals),
+                     key=len, reverse=True)
+        self._ph_rx = re.compile(r"(?i)(?<![\w-])(?:%s)(?![\w-])" % "|".join(map(re.escape, phs))) if phs else None
         self._terms = {}
         self._term_rx = []
         for group, pre, post in ((loose, r"(?<![A-Za-z0-9])", r"(?![A-Za-z0-9])"),
@@ -3057,7 +3326,9 @@ class Scrubber:
         t = self._sub(RX_IQN, lambda m: self._tok(self.m.get("iqn", m.group(0))), t)
         t = self._sub(RX_DEVICE, lambda m: self._tok(
             (m.group(1) or m.group(2)) + "." + self.m.get("device", m.group(0))), t)
-        # 3. names known to belong to the environment
+        # 3. names known to belong to the environment (placeholders already in the text stay)
+        if self._ph_rx:
+            t = self._sub(self._ph_rx, lambda m: self._tok(m.group(0)), t)
         rx = self._get_env_rx()
         if rx:
             t = self._sub(rx, self._r_fqdn_env, t)
@@ -5169,13 +5440,14 @@ The same real value always maps to the same placeholder, in this and in later re
 | Placeholder | Stands for |
 |---|---|
 | `esxi-01`, `vcenter-01`, `nsxmgr-01`, `k8snode-...-01` ... | a host listed in the inventory (prefix = component type and group label) |
+| `endpoint-01` | a VCF management service endpoint listed in the inventory |
 | `host-0001` | another host in the environment's own DNS domains |
 | `exthost-0001` | a host in some other DNS domain |
 | `domain-01` | a DNS domain. `esxi-01.domain-01` is a fully qualified name |
 | `ip-n3-h7` | an IPv4 address: `n3` = the third distinct /24 network seen, `h7` = the seventh address in it |
 | `ip6-0001`, `ip6-ll-0001` | IPv6 address / link-local IPv6 address |
 | `mac-`, `wwn-`, `uuid-`, `serial-`, `thumbprint-`, `license-`, `naa.device-`, `iqn-` | hardware and software identifiers |
-| `datastore-`, `portgroup-`, `dvs-`, `lrouter-`, `ns-`, `k8sobj-`, `cluster-`, `wld-`, `nsxobj-`, `dn-`, `term-` | named objects (`cluster-` vSphere cluster, `wld-` workload domain, `nsxobj-` NSX transport zone or profile), certificate name parts, custom terms |
+| `datastore-`, `portgroup-`, `dvs-`, `vm-`, `lrouter-`, `ns-`, `k8sobj-`, `cluster-`, `wld-`, `vcluster-`, `edgecluster-`, `nsxobj-`, `dn-`, `term-` | named objects (`ns-` Kubernetes namespace, `k8sobj-` other Kubernetes object, `cluster-` vSphere cluster, `wld-` workload domain, `vcluster-` Supervisor, `edgecluster-` NSX Edge cluster, `nsxobj-` NSX transport zone or profile), certificate name parts, custom terms |
 | `[REDACTED...]` | a secret (password, token, key, certificate body) |
 
 An UPPERCASE placeholder means the original was written in upper case. Loopback, link-local,
@@ -5497,7 +5769,38 @@ def _fact_sddc_tasks(out):
     return f
 
 
+def _fact_bursts(out):
+    b = restart_bursts(out)
+    return [("restart_bursts", "; ".join("%s (%d containers, %d nodes)" % (a[:16], n, nodes)
+                                         for a, _, n, nodes in b))] if b else []
+
+
+def _fact_probes(out):
+    p = probe_failures(out)
+    return [("probe_failures", ", ".join("%s %d pod(s)" % (k.lower(), len(v)) for k, v in sorted(p.items())))] if p else []
+
+
+def _fact_etcd(out):
+    e = etcd_status(out)
+    if not e:
+        return []
+    f = [("etcd_db", "%s (%s in use%s)" % (_human(e["size"]), _human(e["in_use"]) if e["in_use"] else "?",
+                                           ", quota %s" % _human(e["quota"]) if e["quota"] else ""))]
+    if e["unhealthy"]:
+        f.append(("etcd_members_unhealthy", e["unhealthy"]))
+    return f
+
+
+def _fact_helmreleases(out):
+    m = re.match(r"(\d+) HelmRelease\(s\), (\d+) not Ready", out)
+    return [("helmreleases_not_ready", int(m.group(2)))] if m else []
+
+
 KEY_FACTS = {
+    "Problem containers (not ready, waiting, restarted, last termination)": _fact_bursts,
+    "Probe failures (liveness / readiness)": _fact_probes,
+    "etcd health and status (leader, database size)": _fact_etcd,
+    HELMRELEASE_LABEL: _fact_helmreleases,
     "Automation pods not Running or not Ready": _vcfa_fact("automation_pods_not_ready", _rows),
     "Automation workloads below desired replicas": _vcfa_fact("automation_workloads_below_desired", _rows),
     "Errors in Automation pod logs (last 30 min)": _vcfa_fact(
@@ -5596,6 +5899,43 @@ def target_findings(t, facts):
         if r["status"] == "ok" and r["label"] in DIAGNOSING_CHECKS:
             for sev, text in re.findall(r"(?m)^DIAGNOSIS \((high|med|low|info)\): (.+)$", r["out"]):
                 res.append((sev, text, r["label"]))
+        if r["status"] == "ok" and r["label"] == "Probe failures (liveness / readiness)":
+            for kind, pods in sorted(probe_failures(r["out"]).items()):
+                names = ", ".join(pods[:4]) + (" +%d more" % (len(pods) - 4) if len(pods) > 4 else "")
+                if kind == "Readiness":
+                    res.append(("low", "readiness probe failures in recent events on %d pod(s): %s - they were taken "
+                                       "out of their services meanwhile" % (len(pods), names), r["label"]))
+                else:
+                    res.append(("med", "%s probe failures in recent events on %d pod(s): %s - the kubelet restarts "
+                                       "a container whose probe keeps failing; compare with the pods' restart counts"
+                                % (kind.lower(), len(pods), names), r["label"]))
+        if r["status"] == "ok" and r["label"] == HELMRELEASE_LABEL:
+            for m in list(re.finditer(r"(?m)^(\S+/\S+) ready=(?!True)(\S+) reason=(\S+) generation (\d+)[^\n]*"
+                                      r"(?:\n   ([^\n]+))?", r["out"]))[:5]:
+                res.append(("med", "HelmRelease %s not Ready (%s)%s%s" % (
+                    m.group(1), m.group(3), ": " + m.group(5) if m.group(5) else "",
+                    " - generation %s: something keeps rewriting its spec" % m.group(4) if int(m.group(4)) >= 1000 else ""),
+                    r["label"]))
+        if r["status"] == "ok" and r["label"] == "etcd health and status (leader, database size)":
+            e = etcd_status(r["out"])
+            if e.get("unhealthy"):
+                res.append(("high", "%d etcd member(s) unhealthy" % e["unhealthy"], r["label"]))
+            if e and e["quota"] and e["size"] >= 0.8 * e["quota"]:
+                res.append(("high", "etcd database %s is at %d%% of its quota %s: the API server turns read-only "
+                                    "when it is full - compact and defragment now" % (
+                                        _human(e["size"]), 100 * e["size"] / e["quota"], _human(e["quota"])), r["label"]))
+            elif e and e["in_use"] and e["size"] >= 500e6 and e["in_use"] <= 0.5 * e["size"]:
+                res.append(("low", "etcd database %s but only %s in use: defragment it to give the space back "
+                                   "(etcdctl defrag, one member at a time, followers first, the leader last)" % (
+                                       _human(e["size"]), _human(e["in_use"])), r["label"]))
+        if r["status"] == "ok" and r["label"] == "Problem containers (not ready, waiting, restarted, last termination)":
+            for a, b, n, nodes in restart_bursts(r["out"]):
+                why = ("probably that node restarted" if nodes == 1 else
+                       "one cluster-wide event: controllers that lose leader election after an API server or etcd "
+                       "stall exit and restart together; check what happened then (backups, snapshots, vMotion, "
+                       "storage or network maintenance, a kube-vip failover)")
+                res.append(("info", "%d containers on %d node(s) last ended between %s and %s UTC: %s" % (
+                    n, nodes, a.replace("T", " ")[:19], b[11:19], why), r["label"]))
         if r["status"] == "ok" and r["label"] == "Transport zones, node profiles and cluster attachments":
             for p in merge_tz_problems(re.findall(r"(?m)^PROBLEM: (.+)$", r["out"])):
                 res.append(("high", "NSX " + p, r["label"]))
@@ -5767,7 +6107,8 @@ def build_report(ctx, done, scrubber, started, max_lines, kind="health", title="
     w("# VCF %s%s report" % ("anonymized " if scrubber.anonymize else "",
                             "follow-up" if kind == "followup" else "diagnostic"))
     w("")
-    w("- Generated: %s UTC" % started.strftime("%Y-%m-%d %H:%M:%S"))
+    w("- Collected: %s to %s UTC (check output carries its own time stamps)" % (
+        started.strftime("%Y-%m-%d %H:%M:%S"), datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S")))
     w("- Tool: vcf_diag %s, Python %s, %s" % (VERSION, sys.version.split()[0], ctx.ssh_banner))
     if kind == "followup":
         w("- Scope: read-only diagnostics requested in an analyst plan%s" % (": " + S(title) if title else ""))
