@@ -493,7 +493,7 @@ class ManagementCluster(unittest.TestCase):
         self.assertEqual(len(labels), 4)     # three endpoints + the Kubernetes lookup
         self.assertNotIn("endpoints", [g[0] for g in v.groups_for("vcfmgmt", custom)])
         self.assertEqual({k for k in keys if v.is_cluster_group(k)},
-                         {"k8s-cluster", "k8s-workloads", "k8s-storage", "k8s-events", "k8s-health", "k8s-vcf", "k8s-nodes",
+                         {"k8s-cluster", "k8s-workloads", "k8s-storage", "k8s-events", "k8s-health", "k8s-resources", "k8s-vcf", "k8s-nodes",
                           "endpoints"})
 
     def test_endpoints_need_a_cluster(self):
@@ -3817,3 +3817,145 @@ class ReportReviewFixes(unittest.TestCase):
         self.assertIn(("med", "HelmRelease vmsp-platform/namespace-config-cert-manager-test not Ready (InstallFailed): "
                               "Helm install failed for release cert-manager-test: 2 errors occurred:"), found)
         self.assertEqual(v.KEY_FACTS[v.HELMRELEASE_LABEL](hr), [("helmreleases_not_ready", 1)])
+
+
+FAKE_RES_KUBECTL = r"""#!/bin/sh
+a="$*"
+case "$a" in
+  "top pods -A --containers --no-headers") printf '%s\n' \
+    'acme-ns web-1 app 1980m 980Mi' 'acme-ns web-1 sidecar 5m 20Mi' 'prelude vco-app-0 vco 300m 3000Mi';;
+  get\ pods\ -A\ --field-selector=status.phase=Running*) printf '%s\n' \
+    '@@P acme-ns/web-1 node1 Burstable' '@@C app|500m|2|512Mi|1Gi' '@@C sidecar|||||' \
+    '@@P prelude/vco-app-0 node2 Burstable' '@@C vco|1|4|2Gi|6Gi' '@@P acme-ns/batch-1 node1 BestEffort' '@@C job|||||';;
+  get\ svc\ -A*) printf '%s\n' 'vmsp-platform prometheus-operated 9090' \
+    'vmsp-platform kube-prometheus-stack-prometheus 9090,8080' 'vmsp-platform kube-prometheus-stack-prometheus-node-exporter 9100';;
+  get\ --raw\ *kube-prometheus-stack-prometheus:9090*count%20by*) echo '{"status":"success","data":{"result":[
+    {"metric":{"__name__":"container_cpu_cfs_periods_total"},"value":[1,"10"]},
+    {"metric":{"__name__":"node_cpu_seconds_total"},"value":[1,"10"]}]}}';;
+  get\ --raw\ *container_cpu_cfs_throttled_periods_total*) echo '{"status":"success","data":{"result":[
+    {"metric":{"namespace":"acme-ns","pod":"web-1","container":"app"},"value":[1,"0.62"]}]}}';;
+  get\ --raw\ *mode%3D%22steal*) echo '{"status":"success","data":{"result":[{"metric":{"instance":"10.0.0.5:9100"},"value":[1,"0.12"]}]}}';;
+  get\ --raw\ *) echo '{"status":"success","data":{"result":[]}}';;
+  *) echo "unhandled: $a" >&2; exit 1;;
+esac
+"""
+
+
+class ResourcePressure(unittest.TestCase):
+    """CPU contention and memory pressure of pods, namespaces and nodes."""
+
+    def run_fake(self, command):
+        with tempfile.TemporaryDirectory() as d:
+            k = os.path.join(d, "kubectl")
+            with open(k, "w") as fh:
+                fh.write(FAKE_RES_KUBECTL)
+            os.chmod(k, 0o755)
+            r = v.subprocess.run(["sh", "-c", command.replace("{K}", k)], capture_output=True, text=True, timeout=60)
+        self.assertEqual((r.returncode, r.stderr), (0, ""))
+        return r.stdout
+
+    def test_quantities(self):
+        self.assertEqual(v.k8s_qty("250m", cpu=True), 0.25)
+        self.assertEqual(v.k8s_qty("1Gi"), 1024 ** 3)
+        self.assertEqual(v.k8s_qty("1500M"), 1.5e9)
+        self.assertEqual(v.k8s_qty("2"), 2)
+        self.assertIsNone(v.k8s_qty(""))
+
+    def test_usage_against_limits_now(self):
+        out = v.post_resources_now(self.run_fake(v.RESOURCES_NOW_CMD))
+        self.assertIn("acme-ns/web-1/app  980Mi of 1024Mi (96%)  node=node1", out)
+        self.assertIn("acme-ns/web-1/app  1980m of 2000m (99%)", out)
+        self.assertIn("acme-ns: CPU 1985m / 500m / 2000m, memory 1000Mi / 512Mi / 1024Mi, 2 of 3 container(s) "
+                      "without a memory limit", out)
+        self.assertIn("BestEffort pods (no requests or limits: first to be evicted, can starve neighbours): 1: "
+                      "acme-ns/batch-1", out)
+        t = types.SimpleNamespace(errkind=None, clock_offset=None, sec={}, results=[
+            {"status": "ok", "label": v.RESOURCES_NOW_LABEL, "out": out}])
+        found = v.target_findings(t, [])
+        self.assertEqual([f[0] for f in found], ["med", "low"])
+        self.assertIn("use 90% or more of their memory limit now (acme-ns/web-1/app 96%)", found[0][1])
+
+    def test_quotas(self):
+        q = {"items": [{"metadata": {"namespace": "acme-ns", "name": "acme-quota"},
+                        "status": {"hard": {"limits.cpu": "4", "requests.memory": "8Gi", "pods": "50", "count/secrets": "9"},
+                                   "used": {"limits.cpu": "3900m", "requests.memory": "2Gi", "pods": "30", "count/secrets": "9"}}}]}
+        out = v.post_quotas(v.json.dumps(q))
+        self.assertIn("acme-ns/acme-quota limits.cpu: 3900m of 4 (98%)", out)
+        self.assertIn("acme-ns/acme-quota pods: 30 of 50 (60%)", out)
+        self.assertNotIn("requests.memory", out)          # 25%: below the reporting line
+        self.assertNotIn("count/secrets", out)
+        self.assertIn("DIAGNOSIS (med): 1 namespace quota line(s) at 90% or more (acme-ns/acme-quota limits.cpu 98%)", out)
+        self.assertEqual(v.post_quotas('{"items": []}'), "no ResourceQuota objects in this cluster")
+
+    def test_prometheus_history(self):
+        raw = self.run_fake(v.PROM_CMD)
+        self.assertIn("@@PROM vmsp-platform/kube-prometheus-stack-prometheus:9090", raw)
+        out = v.post_prom(raw)
+        self.assertIn("acme-ns/web-1/app  62%", out)
+        self.assertIn("metrics not collected here (their queries cannot show anything): "
+                      "container_memory_working_set_bytes, kube_pod_container_resource_limits", out)
+        self.assertIn("DIAGNOSIS (med): CPU throttling over 7d: 1 container(s) were throttled in 25% or more", out)
+        self.assertIn("DIAGNOSIS (med): hypervisor CPU contention over 7d: node VM(s) lost up to 10.0.0.5:9100 12%", out)
+        self.assertEqual(v.post_prom("no Prometheus service in this cluster: no history"),
+                         "no Prometheus service in this cluster: no history")
+        failed = v.post_prom("@@PROM a/b:9090\n@@Q have\nError from server (ServiceUnavailable): no endpoints\n")
+        self.assertIn("Prometheus did not answer: Error from server (ServiceUnavailable)", failed)
+
+    def test_cgroup_counters(self):
+        cid = "a" * 64
+        with tempfile.TemporaryDirectory() as d:
+            c = os.path.join(d, "kubepods.slice", "kubepods-burstable.slice", "kubepods-burstable-pod1.slice",
+                             "cri-containerd-%s.scope" % cid)
+            os.makedirs(c)
+            for name, text in (("cgroup.controllers", "cpu memory\n"),):
+                with open(os.path.join(d, name), "w") as fh:
+                    fh.write(text)
+            files = {"cpu.stat": "usage_usec 9\nnr_periods 1000\nnr_throttled 400\nthrottled_usec 52000000\n",
+                     "memory.current": "1000000000\n", "memory.max": "1073741824\n", "cpu.max": "200000 100000\n",
+                     "memory.events": "low 0\nhigh 0\nmax 12\noom 1\noom_kill 1\n",
+                     "cpu.pressure": "some avg10=1.00 avg60=2.00 avg300=30.00 total=5\nfull avg10=0 avg60=0 avg300=0 total=0\n",
+                     "memory.pressure": "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"}
+            for name, text in files.items():
+                with open(os.path.join(c, name), "w") as fh:
+                    fh.write(text)
+            crictl = os.path.join(d, "crictl")
+            with open(crictl, "w") as fh:
+                fh.write('#!/bin/sh\necho \'{"containers":[{"id":"%s","podSandboxId":"b","labels":{'
+                         '"io.kubernetes.container.name":"app","io.kubernetes.pod.name":"web-1",'
+                         '"io.kubernetes.pod.namespace":"acme-ns"}}]}\'\n' % cid)
+            os.chmod(crictl, 0o755)
+            r = v.subprocess.run(["sh", "-c", v.CGROUP_CMD.replace("/sys/fs/cgroup", d)], capture_output=True,
+                                 text=True, env=dict(os.environ, PATH=d + ":" + os.environ["PATH"]))
+        self.assertEqual(r.stderr, "")
+        out = v.post_cgroups(r.stdout)
+        self.assertIn("acme-ns/web-1/app  40% of 1000 periods, 52 s throttled in all", out)
+        self.assertIn("acme-ns/web-1/app  954Mi of 1024Mi (93%)", out)
+        self.assertIn("acme-ns/web-1/app  limit reached 12 time(s), OOM kills 1", out)
+        self.assertIn("acme-ns/web-1/app  CPU 30%, memory 0%", out)
+        diag = re.findall(r"(?m)^DIAGNOSIS \((\w+)\): (.{40})", out)
+        self.assertEqual([x[0] for x in diag], ["med", "med", "med"])
+
+    def test_node_pressure(self):
+        out = v.post_node_pressure(
+            "@@PSI cpu some avg10=40.00 avg60=35.00 avg300=25.00 total=1\n"
+            "@@PSI memory some avg10=0 avg60=0 avg300=12.00 total=1\n@@PSI memory full avg10=0 avg60=0 avg300=3.00 total=1\n"
+            "@@STAT1 cpu  100 0 100 700 0 0 0 0 0 0\n@@STAT2 cpu  200 0 200 1300 0 0 0 100 0 0\n@@OOM 2\n"
+            "@@KLOG Nov 20 00:00:01 n1 kernel: Memory cgroup out of memory: Killed process 4242 (java)\n")
+        self.assertIn("CPU over 5 s: busy 22%, iowait 0%, steal 11%", out)
+        self.assertIn("kernel OOM kills since boot: 2", out)
+        sev = re.findall(r"(?m)^DIAGNOSIS \((\w+)\)", out)
+        self.assertEqual(sev, ["med", "low", "med", "med"])
+
+    def test_memory_events_become_a_finding(self):
+        t = types.SimpleNamespace(errkind=None, clock_offset=None, sec={}, results=[])
+        found = v.target_findings(t, [("warning_events_by_reason", "Unhealthy 6, Evicted 3, SystemOOM 1")])
+        self.assertIn("memory events in the cluster: Evicted 3, SystemOOM 1", found[0][1])
+
+    def test_checks_are_in_the_catalog(self):
+        labels = [c["label"] for g in v.K8S_GROUPS for c in g[2]]
+        for lab in (v.RESOURCES_NOW_LABEL, v.QUOTA_LABEL, v.PROM_LABEL):
+            self.assertIn(lab, labels)
+        node = [c["label"] for g in v.MGMT_NODE_GROUPS for c in g[2]]
+        self.assertIn(v.NODE_PRESSURE_LABEL, node)
+        self.assertIn(v.CGROUP_LABEL, node)
+        self.assertTrue(v.is_cluster_group("k8s-resources"))

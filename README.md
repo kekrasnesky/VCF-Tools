@@ -261,6 +261,32 @@ expired kubelet certificate takes a node NotReady) and the control-plane certifi
 (`kubeadm certs check-expiration`; where kubeadm refuses, as on the vSphere Supervisor, the
 certificate files under `/etc/kubernetes/pki` are read directly), next to the kubelet and containerd status.
 
+### CPU contention and memory pressure
+
+VCF Operations alerts on pod and namespace CPU or memory come and go, so a snapshot rarely
+catches them. The Kubernetes types (VCF Automation, management cluster, Kubernetes control
+plane, Supervisor) therefore look at the same question three ways:
+
+- **now** (once per cluster): containers at 80% or more of their memory limit or 90% or more of
+  their CPU limit, every namespace's CPU and memory used against what it requested and what its
+  limits allow, containers without a memory limit, BestEffort pods, and ResourceQuota lines at
+  50% or more (90% or more is a finding: new pods are refused there);
+- **history** (once per cluster): when the cluster runs Prometheus (VCF Automation ships
+  kube-prometheus-stack), the last 7 days of CPU throttling per container, peak CPU and memory
+  against the limits, OOM kills, node CPU steal time, node CPU and memory pressure and the lowest
+  memory available. The query goes through the API server's service proxy; metrics the cluster
+  does not collect are named;
+- **counters since start** (on every node reached): each container's cgroup - share of CPU
+  periods throttled, times the memory limit was reached, OOM kills, CPU and memory pressure
+  stall information - and the node's own PSI, CPU steal over 5 seconds and the kernel's OOM
+  messages of the last 7 days.
+
+Steal time is the VM-side view of CPU ready on the ESXi host: when it is high the pods are slow
+because the host is overcommitted, not because of their limits. Kubelet events such as
+SystemOOM, OOMKilling and Evicted become a finding too. On a Supervisor only the control-plane
+VMs are reached over SSH: vSphere Pods and VKS cluster nodes are covered by the cluster-wide
+checks (and by a `[k8s]` group for a VKS cluster you can log in to).
+
 ### SSO and stale passwords
 
 Expired or out-of-sync passwords and SSO certificate problems are among the most common causes of

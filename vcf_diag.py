@@ -57,7 +57,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
-VERSION = "1.23.0"
+VERSION = "1.24.0"
 
 # ----------------------------------------------------------------------------
 # Diagnostic catalog
@@ -1190,6 +1190,507 @@ POD_JSONPATH = ('{range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"  
 NODE_COND_JSONPATH = ('{range .items[*]}{.metadata.name}{range .status.conditions[*]}{"  "}{.type}{"="}{.status}'
                       '{"("}{.reason}{")"}{end}{"\\n"}{end}')
 
+# --- CPU contention and memory pressure ------------------------------------------------------
+# VCF Operations raises pod and namespace CPU / memory alerts that come and go. A snapshot rarely
+# catches the moment, so the checks below read what is cumulative or historical as well:
+#   * now:      usage against limits (kubectl top), namespace usage and ResourceQuota consumption;
+#   * history:  the cluster's own Prometheus (VCF Automation runs kube-prometheus-stack), last 7 days;
+#   * counters: each container's cgroup since it started (throttled periods, limit hits, OOM kills,
+#               pressure stall information) and the node's PSI, steal time and kernel OOM kills.
+_UNITS = {"": 1, "k": 1e3, "M": 1e6, "G": 1e9, "T": 1e12, "P": 1e15, "E": 1e18,
+          "Ki": 1024, "Mi": 1024 ** 2, "Gi": 1024 ** 3, "Ti": 1024 ** 4, "Pi": 1024 ** 5, "Ei": 1024 ** 6}
+
+
+def k8s_qty(text, cpu=False):
+    """'250m' -> 0.25 (cpu), '1Gi' -> 1073741824, '1e3' -> 1000; None when empty or unreadable."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    m = re.fullmatch(r"([0-9.]+(?:[eE][+-]?\d+)?)(m|n|u|Ki|Mi|Gi|Ti|Pi|Ei|k|M|G|T|P|E)?", t)
+    if not m:
+        return None
+    v, unit = float(m.group(1)), m.group(2) or ""
+    if unit in ("m", "n", "u"):
+        return v / {"m": 1e3, "u": 1e6, "n": 1e9}[unit]
+    return v * _UNITS[unit]
+
+
+def _mib(b):
+    return "%.0fMi" % (b / 1048576.0) if b < 10 * 1024 ** 3 else "%.1fGi" % (b / 1024.0 ** 3)
+
+
+def _cores(c):
+    return "%dm" % round(c * 1000) if c < 10 else "%.1f" % c
+
+
+RESOURCES_NOW_LABEL = "CPU and memory against limits and requests (now)"
+_JP_POD_RES = ('{range .items[*]}{"@@P "}{.metadata.namespace}/{.metadata.name} {.spec.nodeName} {.status.qosClass}'
+               '{"\\n"}{range .spec.containers[*]}{"@@C "}{.name}|{.resources.requests.cpu}|{.resources.limits.cpu}|'
+               '{.resources.requests.memory}|{.resources.limits.memory}{"\\n"}{end}{end}')
+RESOURCES_NOW_CMD = ("echo '@@TOP'; {K} top pods -A --containers --no-headers 2>&1; echo '@@SPEC'; "
+                     "{K} get pods -A --field-selector=status.phase=Running -o jsonpath=%s 2>&1"
+                     % shlex.quote(_JP_POD_RES))
+
+
+def parse_resources_now(out):
+    """{'usage': {(ns, pod, c): (cpu, mem)}, 'spec': {(ns, pod, c): {...}}, 'pods': {(ns, pod): (node, qos)}}"""
+    usage, spec, pods, mode, cur = {}, {}, {}, None, None
+    for ln in out.splitlines():
+        if ln in ("@@TOP", "@@SPEC"):
+            mode = ln
+            continue
+        if mode == "@@TOP":
+            c = ln.split()
+            if len(c) == 5:
+                cpu, mem = k8s_qty(c[3], cpu=True), k8s_qty(c[4])
+                if cpu is not None and mem is not None:
+                    usage[(c[0], c[1], c[2])] = (cpu, mem)
+        elif ln.startswith("@@P "):
+            c = ln[4:].split()
+            ns, _, pod = c[0].partition("/")
+            cur = (ns, pod)
+            pods[cur] = (c[1] if len(c) > 1 else "?", c[2] if len(c) > 2 else "?")
+        elif ln.startswith("@@C ") and cur:
+            f = (ln[4:].split("|") + [""] * 5)[:5]
+            spec[cur + (f[0],)] = {"req_cpu": k8s_qty(f[1], True), "lim_cpu": k8s_qty(f[2], True),
+                                   "req_mem": k8s_qty(f[3]), "lim_mem": k8s_qty(f[4])}
+    return {"usage": usage, "spec": spec, "pods": pods}
+
+
+def post_resources_now(out):
+    if "@@SPEC" not in out:
+        return out
+    d = parse_resources_now(out)
+    usage, spec, pods = d["usage"], d["spec"], d["pods"]
+    lines = ["%d running container(s), %d measured by kubectl top (a moment in time; history and counters "
+             "since start are in the checks that follow)" % (len(spec), len(usage))]
+    if not usage:
+        lines.append("no usage figures: the metrics API (metrics-server) did not answer - see the output of "
+                     "'Node resource usage'")
+    mem_hot, cpu_hot = [], []
+    for key, (cpu, mem) in usage.items():
+        s = spec.get(key, {})
+        if s.get("lim_mem") and mem >= 0.8 * s["lim_mem"]:
+            mem_hot.append((mem / s["lim_mem"], key, mem, s["lim_mem"]))
+        if s.get("lim_cpu") and cpu >= 0.9 * s["lim_cpu"]:
+            cpu_hot.append((cpu / s["lim_cpu"], key, cpu, s["lim_cpu"]))
+    for title, rows, fmt in (("memory at 80% of its limit or more", mem_hot, _mib),
+                             ("CPU at 90% of its limit or more (throttled at this moment)", cpu_hot, _cores)):
+        if rows:
+            lines += ["", "%s: %d container(s)" % (title, len(rows))]
+            for pct, (ns, pod, c), used, lim in sorted(rows, reverse=True)[:15]:
+                lines.append("  %s/%s/%s  %s of %s (%d%%)  node=%s" % (
+                    ns, pod, c, fmt(used), fmt(lim), round(100 * pct), pods.get((ns, pod), ("?",))[0]))
+    # per namespace: what runs against what was asked for and what is allowed
+    per = {}
+    for key, s in spec.items():
+        n = per.setdefault(key[0], {"cpu": 0.0, "mem": 0.0, "rc": 0.0, "lc": 0.0, "rm": 0.0, "lm": 0.0,
+                                    "nolim": 0, "n": 0})
+        u = usage.get(key)
+        if u:
+            n["cpu"] += u[0]
+            n["mem"] += u[1]
+        n["rc"] += s["req_cpu"] or 0
+        n["lc"] += s["lim_cpu"] or 0
+        n["rm"] += s["req_mem"] or 0
+        n["lm"] += s["lim_mem"] or 0
+        n["n"] += 1
+        n["nolim"] += 0 if s["lim_mem"] else 1
+    if per and usage:
+        lines += ["", "per namespace, by memory used (used / requested / limit; limit 0 = no limits set):"]
+        for ns, n in sorted(per.items(), key=lambda kv: -kv[1]["mem"])[:12]:
+            lines.append("  %s: CPU %s / %s / %s, memory %s / %s / %s%s" % (
+                ns, _cores(n["cpu"]), _cores(n["rc"]), _cores(n["lc"]), _mib(n["mem"]), _mib(n["rm"]), _mib(n["lm"]),
+                ", %d of %d container(s) without a memory limit" % (n["nolim"], n["n"]) if n["nolim"] else ""))
+    best = sorted(set("%s/%s" % p for p, (_, q) in pods.items() if q == "BestEffort"))
+    if best:
+        lines += ["", "BestEffort pods (no requests or limits: first to be evicted, can starve neighbours): %d: %s"
+                  % (len(best), ", ".join(best[:10]) + (" +%d more" % (len(best) - 10) if len(best) > 10 else ""))]
+    diag = []
+    if [r for r in mem_hot if r[0] >= 0.9]:
+        top = sorted(mem_hot, reverse=True)
+        diag.append(("med", "%d container(s) use 90%% or more of their memory limit now (%s): the next peak gets "
+                            "them OOMKilled - raise the limit or find what grows" % (
+                                len([r for r in mem_hot if r[0] >= 0.9]),
+                                ", ".join("%s/%s/%s %d%%" % (r[1] + (round(100 * r[0]),)) for r in top[:3]))))
+    if cpu_hot:
+        top = sorted(cpu_hot, reverse=True)
+        diag.append(("low", "%d container(s) run at their CPU limit now and are throttled (%s): a CPU contention "
+                            "alert on their pods or namespaces is expected while this lasts" % (
+                                len(cpu_hot), ", ".join("%s/%s/%s" % r[1] for r in top[:3]))))
+    if diag:
+        lines.append("")
+        lines += ["DIAGNOSIS (%s): %s" % x for x in diag]
+    return "\n".join(lines)
+
+
+QUOTA_LABEL = "Namespace resource quotas (used against hard limits)"
+
+
+def post_quotas(out):
+    """kubectl get resourcequota -A -o json: every CPU / memory / pods line at 50% or more."""
+    try:
+        items = json.loads(out).get("items", [])
+    except ValueError:
+        return out
+    if not items:
+        return "no ResourceQuota objects in this cluster"
+    rows, diag = [], []
+    for q in items:
+        name = "%s/%s" % (q["metadata"].get("namespace"), q["metadata"].get("name"))
+        hard, used = q.get("status", {}).get("hard", {}), q.get("status", {}).get("used", {})
+        for res in sorted(hard):
+            if not re.search(r"cpu|memory|^pods$|ephemeral-storage", res):
+                continue
+            cpu = "cpu" in res
+            h, u = k8s_qty(hard[res], cpu), k8s_qty(used.get(res, "0"), cpu)
+            if not h or u is None:
+                continue
+            pct = 100.0 * u / h
+            if pct >= 50:
+                rows.append((pct, name, res, used.get(res, "0"), hard[res]))
+    lines = ["%d ResourceQuota object(s); resources at 50%% or more of their quota:" % len(items)]
+    lines += ["  %s %s: %s of %s (%d%%)" % (n, r, u, h, round(p)) for p, n, r, u, h in sorted(rows, reverse=True)[:25]]
+    if not rows:
+        lines.append("  none")
+    full = [r for r in rows if r[0] >= 90]
+    if full:
+        diag.append(("med", "%d namespace quota line(s) at 90%% or more (%s): new pods or larger requests in those "
+                            "namespaces are refused once the quota is used up" % (
+                                len(full), ", ".join("%s %s %d%%" % (n, r, round(p)) for p, n, r, _, _ in
+                                                     sorted(full, reverse=True)[:3]))))
+    if diag:
+        lines += [""] + ["DIAGNOSIS (%s): %s" % x for x in diag]
+    return "\n".join(lines)
+
+
+# Prometheus queries: (key, PromQL, what one value means). Values are fractions unless noted.
+PROM_WINDOW = "7d"
+_C = 'container!="",container!="POD"'
+PROM_QUERIES = (
+    ("have", 'count by (__name__) ({__name__=~"container_cpu_cfs_periods_total|container_memory_working_set_bytes|'
+             'kube_pod_container_resource_limits|container_oom_events_total|node_cpu_seconds_total|'
+             'node_pressure_cpu_waiting_seconds_total|node_memory_MemAvailable_bytes"})', "metrics present"),
+    ("throttle", "topk(15, sum by (namespace,pod,container) (increase(container_cpu_cfs_throttled_periods_total{%s}[%s]))"
+                 " / sum by (namespace,pod,container) (increase(container_cpu_cfs_periods_total{%s}[%s])) > 0.05)"
+                 % (_C, PROM_WINDOW, _C, PROM_WINDOW), "share of CPU periods throttled"),
+    ("cpu_peak", "topk(15, max by (namespace,pod,container) (max_over_time(rate(container_cpu_usage_seconds_total{%s}[5m])"
+                 "[%s:5m])) / max by (namespace,pod,container) (kube_pod_container_resource_limits{resource=\"cpu\"})"
+                 " > 0.8)" % (_C, PROM_WINDOW), "peak 5-minute CPU use against the CPU limit"),
+    ("mem_peak", "topk(15, max by (namespace,pod,container) (max_over_time(container_memory_working_set_bytes{%s}[%s]))"
+                 " / max by (namespace,pod,container) (kube_pod_container_resource_limits{resource=\"memory\"}) > 0.8)"
+                 % (_C, PROM_WINDOW), "peak memory (working set) against the memory limit"),
+    ("oom", "topk(15, sum by (namespace,pod,container) (increase(container_oom_events_total{%s}[%s])) >= 1)"
+            % (_C, PROM_WINDOW), "OOM kills (count)"),
+    ("steal", "topk(10, max_over_time(avg by (instance) (rate(node_cpu_seconds_total{mode=\"steal\"}[5m]))[%s:5m]))"
+              % PROM_WINDOW, "peak CPU steal time of the node VM (the hypervisor gave the CPU to another VM)"),
+    ("node_cpu_psi", "topk(10, max_over_time(rate(node_pressure_cpu_waiting_seconds_total[5m])[%s:5m]))"
+                     % PROM_WINDOW, "peak share of time tasks waited for CPU (PSI)"),
+    ("node_mem_psi", "topk(10, max_over_time(rate(node_pressure_memory_waiting_seconds_total[5m])[%s:5m]))"
+                     % PROM_WINDOW, "peak share of time tasks waited for memory (PSI)"),
+    ("node_mem_min", "bottomk(10, min_over_time((node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)[%s:5m]))"
+                     % PROM_WINDOW, "lowest memory available on the node"),
+)
+PROM_LABEL = "CPU and memory pressure history from Prometheus (last %s)" % PROM_WINDOW
+PROM_CMD = (
+    "s=$({K} get svc -A --no-headers -o custom-columns='N:.metadata.namespace,S:.metadata.name,P:.spec.ports[*].port'"
+    " 2>/dev/null | awk '$2 ~ /(^|-)prometheus$/ || $2 == \"prometheus-operated\" {n=split($3,a,\",\"); p=a[1];"
+    " for (i=1;i<=n;i++) if (a[i]==9090) p=9090; print ($2 == \"prometheus-operated\" ? 1 : 0), $1, $2, p}'"
+    " | sort -n | sed -n 1p); if [ -z \"$s\" ]; then echo 'no Prometheus service in this cluster: no history'; exit 0; fi;"
+    " set -- $s; echo \"@@PROM $2/$3:$4\";"
+    + "".join(" echo '@@Q %s'; {K} get --raw '/api/v1/namespaces/'\"$2\"'/services/'\"$3:$4\"'/proxy/api/v1/query?query=%s'"
+              " 2>&1 | head -c 30000; echo;" % (key, urllib.parse.quote(q, safe=""))
+              for key, q, _ in PROM_QUERIES))
+
+
+def _prom_name(metric):
+    if "container" in metric:
+        return "%s/%s/%s" % (metric.get("namespace", "?"), metric.get("pod", "?"), metric["container"])
+    return metric.get("instance") or metric.get("node") or metric.get("__name__") or "?"
+
+
+def parse_prom(out):
+    """{'source': 'ns/svc:port', 'results': {key: [(name, value)] or 'error text'}}"""
+    res, src, key, buf = {}, None, None, []
+
+    def flush():
+        if key is None:
+            return
+        text = "\n".join(buf).strip()
+        try:
+            data = json.loads(text)
+        except ValueError:
+            res[key] = (text.splitlines() or ["no answer"])[0][:200]
+            return
+        if data.get("status") != "success":
+            res[key] = str(data.get("error") or data.get("status"))[:200]
+            return
+        rows = []
+        for r in data.get("data", {}).get("result", []):
+            try:
+                rows.append((_prom_name(r.get("metric", {})) if key != "have" else r["metric"].get("__name__", "?"),
+                             float(r["value"][1])))
+            except (KeyError, ValueError, IndexError, TypeError):
+                pass
+        res[key] = rows
+    for ln in out.splitlines():
+        if ln.startswith("@@PROM "):
+            src = ln[7:].strip()
+        elif ln.startswith("@@Q "):
+            flush()
+            key, buf = ln[4:].strip(), []
+        elif key is not None:
+            buf.append(ln)
+    flush()
+    return {"source": src, "results": res}
+
+
+def post_prom(out):
+    if "@@PROM " not in out:
+        return out
+    d = parse_prom(out)
+    r = d["results"]
+    lines = ["source: Prometheus service %s (window %s, 5-minute resolution for rates)" % (d["source"], PROM_WINDOW)]
+    have = r.get("have")
+    if isinstance(have, str):
+        lines.append("Prometheus did not answer: %s" % have)
+        return "\n".join(lines)
+    present = set(n for n, _ in have or [])
+    missing = [w for w in ("container_cpu_cfs_periods_total", "container_memory_working_set_bytes",
+                           "kube_pod_container_resource_limits", "container_oom_events_total", "node_cpu_seconds_total",
+                           "node_pressure_cpu_waiting_seconds_total", "node_memory_MemAvailable_bytes")
+               if w not in present]
+    if missing:
+        lines.append("metrics not collected here (their queries cannot show anything): " + ", ".join(missing))
+    titles = dict((k, t) for k, _, t in PROM_QUERIES)
+    for key in ("throttle", "cpu_peak", "mem_peak", "oom", "steal", "node_cpu_psi", "node_mem_psi", "node_mem_min"):
+        v = r.get(key)
+        lines += ["", "%s:" % titles[key]]
+        if isinstance(v, str):
+            lines.append("  query failed: %s" % v)
+        elif not v:
+            lines.append("  none above the threshold")
+        else:
+            for name, val in sorted(v, key=lambda x: x[1], reverse=key != "node_mem_min")[:12]:
+                lines.append("  %s  %s" % (name, "%d" % val if key == "oom" else "%.0f%%" % (100 * val)))
+    diag = []
+
+    def rows(key, test):
+        v = r.get(key)
+        return [x for x in v if test(x[1])] if isinstance(v, list) else []
+
+    def names(rs, fmt="%.0f%%", scale=100):
+        rs = sorted(rs, key=lambda x: -x[1])
+        return ", ".join(("%s " + fmt) % (n, val * scale) for n, val in rs[:3]) + (
+            " +%d more" % (len(rs) - 3) if len(rs) > 3 else "")
+    t = rows("throttle", lambda x: x >= 0.25)
+    if t:
+        diag.append(("med", "CPU throttling over %s: %d container(s) were throttled in 25%% or more of their CPU "
+                            "periods (%s) - the likely source of intermittent pod and namespace CPU alerts; raise "
+                            "their CPU limit (or drop it and keep the request)" % (PROM_WINDOW, len(t), names(t))))
+    m = rows("mem_peak", lambda x: x >= 0.9)
+    if m:
+        diag.append(("med", "memory peaks over %s: %d container(s) reached 90%% or more of their memory limit (%s)"
+                            % (PROM_WINDOW, len(m), names(m))))
+    o = rows("oom", lambda x: x >= 1)
+    if o:
+        diag.append(("med", "%d container(s) were OOM killed in the last %s (%s)" % (
+            len(o), PROM_WINDOW, names(o, "%d x", 1))))
+    s = rows("steal", lambda x: x >= 0.05)
+    if s:
+        diag.append(("med", "hypervisor CPU contention over %s: node VM(s) lost up to %s of their CPU time to "
+                            "steal (CPU ready on the ESXi host): the pods are slow because the host is "
+                            "overcommitted, not because of their limits - check the VMs' CPU ready and the host "
+                            "in vCenter" % (PROM_WINDOW, names(s))))
+    p = rows("node_cpu_psi", lambda x: x >= 0.25)
+    if p:
+        diag.append(("low", "nodes where tasks waited for CPU 25%% or more of the time in some 5-minute span (%s): "
+                            "more CPU demand than the node has" % names(p)))
+    p = rows("node_mem_psi", lambda x: x >= 0.1)
+    n = rows("node_mem_min", lambda x: x < 0.1)
+    if p or n:
+        diag.append(("med", "node memory pressure over %s: %s" % (PROM_WINDOW, "; ".join(x for x in (
+            ("tasks waited for memory up to " + names(p)) if p else "",
+            ("memory available fell to " + names(n)) if n else "") if x))))
+    if diag:
+        lines += [""] + ["DIAGNOSIS (%s): %s" % x for x in diag]
+    return "\n".join(lines)
+
+
+NODE_PRESSURE_LABEL = "CPU and memory pressure on this node (PSI, steal time, kernel OOM kills)"
+NODE_PRESSURE_CMD = (
+    "if [ -r /proc/pressure/cpu ]; then for r in cpu memory io; do sed \"s/^/@@PSI $r /\" /proc/pressure/$r; done;"
+    " else echo 'pressure stall information (PSI) is not available on this kernel'; fi;"
+    " echo \"@@STAT1 $(head -n 1 /proc/stat)\"; sleep 5; echo \"@@STAT2 $(head -n 1 /proc/stat)\";"
+    " echo \"@@OOM $(awk '$1 == \"oom_kill\" {print $2}' /proc/vmstat)\";"
+    " journalctl -k --since '-7d' --no-pager 2>/dev/null | grep -iE 'out of memory|oom-kill|killed process'"
+    " | tail -n 20 | cut -c1-300 | sed 's/^/@@KLOG /'")
+
+
+def post_node_pressure(out):
+    if "@@STAT1 " not in out:
+        return out
+    psi, s1, s2, oom, klog, other = {}, None, None, None, [], []
+    for ln in out.splitlines():
+        if ln.startswith("@@PSI "):
+            c = ln.split()
+            psi[(c[1], c[2])] = dict(x.split("=", 1) for x in c[3:] if "=" in x)
+        elif ln.startswith("@@STAT1 "):
+            s1 = [int(x) for x in ln.split()[2:]]
+        elif ln.startswith("@@STAT2 "):
+            s2 = [int(x) for x in ln.split()[2:]]
+        elif ln.startswith("@@OOM "):
+            oom = ln[6:].strip()
+        elif ln.startswith("@@KLOG "):
+            klog.append(ln[7:])
+        elif ln.strip():
+            other.append(ln)
+    lines = list(other)
+    diag = []
+    if s1 and s2 and len(s1) >= 8 and len(s2) >= 8:
+        d = [b - a for a, b in zip(s1, s2)]
+        tot = float(sum(d[:8])) or 1.0
+        busy = 100 * (tot - d[3] - d[4] - d[7]) / tot       # steal is time the VM did not get
+        lines.append("CPU over 5 s: busy %.0f%%, iowait %.0f%%, steal %.0f%%" % (busy, 100 * d[4] / tot, 100 * d[7] / tot))
+        if d[7] / tot >= 0.05:
+            diag.append(("med", "this node VM loses %.0f%% of its CPU time to steal right now: the ESXi host is "
+                                "overcommitted (CPU ready) - VCF Operations reports this as CPU contention"
+                         % (100 * d[7] / tot)))
+    for (res, kind), v in sorted(psi.items()):
+        lines.append("PSI %s %s: avg10 %s%%, avg60 %s%%, avg300 %s%%" % (res, kind, v.get("avg10"), v.get("avg60"),
+                                                                         v.get("avg300")))
+    a = lambda res, kind: float(psi.get((res, kind), {}).get("avg300", 0) or 0)  # noqa: E731
+    if a("cpu", "some") >= 20:
+        diag.append(("low", "tasks on this node waited for CPU %.0f%% of the last 5 minutes (PSI): more CPU demand "
+                            "than the node has" % a("cpu", "some")))
+    if a("memory", "full") >= 2 or a("memory", "some") >= 10:
+        diag.append(("med", "memory pressure on this node: tasks stalled on memory %.0f%% (some) / %.0f%% (full) of "
+                            "the last 5 minutes (PSI)" % (a("memory", "some"), a("memory", "full"))))
+    if oom not in (None, ""):
+        lines.append("kernel OOM kills since boot: %s" % oom)
+    if klog:
+        kills = [ln for ln in klog if re.search(r"(?i)killed process|oom-kill", ln)]
+        lines.append("kernel OOM messages, last 7 days (%d line(s), latest):" % len(klog))
+        lines += ["  " + ln for ln in klog[-6:]]
+        if kills:
+            diag.append(("med", "the kernel OOM killer ran on this node in the last 7 days (%d line(s)): a container "
+                                "hit its memory limit or the node ran out of memory - see the kernel lines"
+                         % len(kills)))
+    if diag:
+        lines += [""] + ["DIAGNOSIS (%s): %s" % x for x in diag]
+    return "\n".join(lines)
+
+
+CGROUP_LABEL = "Container CPU throttling and memory limits on this node (cgroup counters since each container started)"
+CGROUP_CMD = (
+    "if [ -f /sys/fs/cgroup/cgroup.controllers ]; then v=2; root=/sys/fs/cgroup; else v=1;"
+    " root=/sys/fs/cgroup/cpu,cpuacct; [ -d \"$root\" ] || root=/sys/fs/cgroup/cpu; fi; echo \"@@CGV $v\";"
+    " find \"$root\" -path '*kubepods*' -name cpu.stat 2>/dev/null | while read -r f; do d=${f%/cpu.stat};"
+    " id=${d##*/}; id=${id#cri-containerd-}; id=${id#docker-}; id=${id%.scope}; [ ${#id} -eq 64 ] || continue;"
+    " case \"$id\" in *[!0-9a-f]*) continue;; esac;"
+    " if [ $v = 2 ]; then x=\"mem=$(cat \"$d/memory.current\" 2>/dev/null) max=$(cat \"$d/memory.max\" 2>/dev/null)"
+    " cpumax=$(tr ' ' / < \"$d/cpu.max\" 2>/dev/null) $(awk '{printf \"ev_%s=%s \", $1, $2}' \"$d/memory.events\""
+    " 2>/dev/null)$(awk '{for (i=2;i<=NF;i++) printf \"cpu_%s_%s \", $1, $i}' \"$d/cpu.pressure\" 2>/dev/null)"
+    "$(awk '{for (i=2;i<=NF;i++) printf \"mem_%s_%s \", $1, $i}' \"$d/memory.pressure\" 2>/dev/null)\";"
+    " else m=$(echo \"$d\" | sed 's#/cpu,cpuacct/#/memory/#; s#/cpu/#/memory/#'); x=\"mem=$(cat \"$m/memory.usage_in_bytes\""
+    " 2>/dev/null) max=$(cat \"$m/memory.limit_in_bytes\" 2>/dev/null) ev_max=$(cat \"$m/memory.failcnt\" 2>/dev/null)"
+    " $(awk '$1 == \"oom_kill\" {print \"ev_oom_kill=\" $2}' \"$m/memory.oom_control\" 2>/dev/null)\"; fi;"
+    " echo \"@@CG $id $(awk '{printf \"%s=%s \", $1, $2}' \"$f\")$x\"; done;"
+    " echo '@@CRI'; crictl ps -o json 2>/dev/null"
+    " | grep -oE '\"(id|io[.]kubernetes[.](container[.]name|pod[.]name|pod[.]namespace))\": *\"[^\"]*\"'")
+
+
+def parse_cgroups(out):
+    """[{'name': ns/pod/container, counters...}] from the @@CG records joined with crictl's names."""
+    recs, names, cur, mode = [], {}, None, None
+    for ln in out.splitlines():
+        if ln.startswith("@@CG "):
+            c = ln.split()
+            d = {"id": c[1]}
+            for kv in c[2:]:
+                k, _, val = kv.partition("=")
+                d[k] = val
+            recs.append(d)
+        elif ln == "@@CRI":
+            mode = "cri"
+        elif mode == "cri":
+            m = re.match(r'"([\w.]+)": *"([^"]*)"', ln)
+            if not m:
+                continue
+            if m.group(1) == "id":
+                cur = names.setdefault(m.group(2), {})
+            elif cur is not None:
+                cur[m.group(1).rsplit(".", 1)[-1] if "container" not in m.group(1) else "container"] = m.group(2)
+    num = lambda d, k: float(d[k]) if re.fullmatch(r"\d+(?:\.\d+)?", d.get(k, "") or "") else None  # noqa: E731
+    res = []
+    for d in recs:
+        n = names.get(d["id"], {})
+        name = "%s/%s/%s" % (n.get("namespace", "?"), n.get("name", "?"), n.get("container", "?")) if n else d["id"][:12]
+        periods, thr = num(d, "nr_periods"), num(d, "nr_throttled")
+        tus = num(d, "throttled_usec")
+        if tus is None and num(d, "throttled_time") is not None:
+            tus = num(d, "throttled_time") / 1000.0
+        mem, mx = num(d, "mem"), num(d, "max")
+        if mx and mx >= 2 ** 62:
+            mx = None                                   # cgroup v1 "no limit"
+        res.append({"name": name, "periods": periods or 0, "throttled": thr or 0, "throttled_s": (tus or 0) / 1e6,
+                    "mem": mem, "max": mx, "hits": num(d, "ev_max") or 0, "oom": num(d, "ev_oom_kill") or 0,
+                    "cpu_psi": num(d, "cpu_some_avg300"), "mem_psi": num(d, "mem_some_avg300"),
+                    "known": bool(n)})
+    return res
+
+
+def post_cgroups(out):
+    if "@@CGV " not in out:
+        return out
+    cs = parse_cgroups(out)
+    lines = ["%d container cgroup(s) on this node (counters run since each container started)" % len(cs)]
+    if not cs:
+        return lines[0] + ": none found under kubepods"
+    thr = [c for c in cs if c["periods"] >= 100 and c["throttled"] / c["periods"] >= 0.1]
+    near = [c for c in cs if c["max"] and c["mem"] is not None and c["mem"] >= 0.8 * c["max"]]
+    hits = [c for c in cs if c["hits"] > 0 or c["oom"] > 0]
+    waits = [c for c in cs if (c["cpu_psi"] or 0) >= 10 or (c["mem_psi"] or 0) >= 5]
+    if thr:
+        lines += ["", "throttled in 10%% or more of their CPU periods: %d container(s)" % len(thr)]
+        for c in sorted(thr, key=lambda c: -c["throttled"] / c["periods"])[:15]:
+            lines.append("  %s  %.0f%% of %d periods, %.0f s throttled in all" % (
+                c["name"], 100 * c["throttled"] / c["periods"], c["periods"], c["throttled_s"]))
+    if near:
+        lines += ["", "memory at 80%% of the limit or more: %d container(s)" % len(near)]
+        for c in sorted(near, key=lambda c: -c["mem"] / c["max"])[:15]:
+            lines.append("  %s  %s of %s (%d%%)" % (c["name"], _mib(c["mem"]), _mib(c["max"]),
+                                                    round(100 * c["mem"] / c["max"])))
+    if hits:
+        lines += ["", "reached the memory limit (reclaim forced) or OOM killed: %d container(s)" % len(hits)]
+        for c in sorted(hits, key=lambda c: (-c["oom"], -c["hits"]))[:15]:
+            lines.append("  %s  limit reached %d time(s), OOM kills %d" % (c["name"], c["hits"], c["oom"]))
+    if waits:
+        lines += ["", "waiting for CPU or memory over the last 5 minutes (PSI some avg300): %d container(s)" % len(waits)]
+        for c in sorted(waits, key=lambda c: -((c["cpu_psi"] or 0) + (c["mem_psi"] or 0)))[:10]:
+            lines.append("  %s  CPU %.0f%%, memory %.0f%%" % (c["name"], c["cpu_psi"] or 0, c["mem_psi"] or 0))
+    if not (thr or near or hits or waits):
+        lines.append("no container throttled 10% or more, near its memory limit, OOM killed or stalled")
+    diag = []
+    heavy = [c for c in thr if c["throttled"] / c["periods"] >= 0.25]
+    if heavy:
+        diag.append(("med", "%d container(s) on this node were throttled in 25%% or more of their CPU periods since "
+                            "they started (%s): their CPU limit is too low for their peaks" % (
+                                len(heavy), ", ".join("%s %.0f%%" % (c["name"], 100 * c["throttled"] / c["periods"])
+                                                      for c in sorted(heavy, key=lambda c: -c["throttled"] / c["periods"])[:3]))))
+    ooms = [c for c in cs if c["oom"] > 0]
+    if ooms:
+        diag.append(("med", "%d container(s) on this node were OOM killed by their memory limit (%s)" % (
+            len(ooms), ", ".join("%s %d x" % (c["name"], c["oom"]) for c in ooms[:3]))))
+    full = [c for c in near if c["mem"] >= 0.9 * c["max"]]
+    if full:
+        diag.append(("med", "%d container(s) on this node use 90%% or more of their memory limit (%s)" % (
+            len(full), ", ".join(c["name"] for c in full[:3]))))
+    if diag:
+        lines += [""] + ["DIAGNOSIS (%s): %s" % x for x in diag]
+    return "\n".join(lines)
+
+
 # the first N rows, and a line saying how many more there were: (command, N, N, N, what)
 _TOP = ("out=$(%s); n=$(printf '%%s\\n' \"$out\" | grep -c .); if [ -n \"$out\" ]; then printf '%%s\\n' \"$out\""
         " | head -n %d; [ \"$n\" -gt %d ] && echo \"($((n - %d)) more %s not shown)\"; true; else echo none; fi")
@@ -1280,6 +1781,11 @@ K8S_GROUPS = [
              "--previous --tail=40 2>&1 | tail -n 40; done", k8s="nsslash", timeout=120, max_lines=250),
         kctl(STUCK_DELETE_LABEL, STUCK_DELETE_CMD, timeout=120, max_lines=120, post=post_stuck_deleting,
              harvest=[("k8sns", r"(?m)^@@DEL \S+ ([a-z0-9-]+)/", None), h_user_obj(r"@@DEL \S+ ")]),
+    ]),
+    ("k8s-resources", "CPU contention and memory pressure of pods and namespaces", [
+        kctl(RESOURCES_NOW_LABEL, RESOURCES_NOW_CMD, timeout=90, max_lines=120, post=post_resources_now),
+        kctl(QUOTA_LABEL, "{K} get resourcequota -A -o json 2>&1", max_lines=60, post=post_quotas),
+        kctl(PROM_LABEL, PROM_CMD, timeout=240, max_lines=150, post=post_prom),
     ]),
     ("k8s-vcf", "VCF services runtime objects (best effort)", [
         # components are cluster-scoped: the first column is a component name, not a namespace
@@ -1586,6 +2092,10 @@ NODE_K8S_GROUPS = [
 ]
 
 MGMT_NODE_GROUPS = [
+    ("node-pressure", "CPU and memory pressure on this node and its containers", [
+        cmd(NODE_PRESSURE_LABEL, NODE_PRESSURE_CMD, timeout=45, sudo=True, max_lines=60, post=post_node_pressure),
+        cmd(CGROUP_LABEL, CGROUP_CMD, timeout=90, sudo=True, max_lines=80, post=post_cgroups),
+    ]),
     ("node-runtime", "Kubernetes node agents (kubelet, containerd)", [
         cmd("kubelet and containerd", "systemctl status kubelet containerd --no-pager --lines=0 2>&1 | head -n 200",
             sudo=True, post=post_systemctl_status, max_lines=60),
@@ -5875,7 +6385,8 @@ def key_facts(t):
 # ----------------------------------------------------------------------------
 SEVERITIES = ("high", "med", "low", "info")
 # checks whose summarizer ends with "DIAGNOSIS (<severity>): <text>" lines: each becomes a finding
-DIAGNOSING_CHECKS = (VCFA_AUTH_LABEL, VKS_ADDON_LABEL, STUCK_DELETE_LABEL)
+DIAGNOSING_CHECKS = (VCFA_AUTH_LABEL, VKS_ADDON_LABEL, STUCK_DELETE_LABEL, RESOURCES_NOW_LABEL, QUOTA_LABEL,
+                     PROM_LABEL, NODE_PRESSURE_LABEL, CGROUP_LABEL)
 
 
 def _pct(s):
@@ -6009,6 +6520,12 @@ def target_findings(t, facts):
         res.append(("med", "account %s password expires in %s days" % m.groups(), "Local users and password expiry"))
     if isinstance(f.get("core_dumps"), int) and f["core_dumps"] > 0:
         res.append(("low", "%d core dump file(s) present" % f["core_dumps"], "Core dumps"))
+    mem_events = [(r, int(n)) for r, n in re.findall(r"(\w+) (\d+)", str(f.get("warning_events_by_reason", "")))
+                  if r in ("OOMKilling", "SystemOOM", "Evicted", "EvictionThresholdMet", "NodeHasInsufficientMemory")]
+    if mem_events:
+        res.append(("med", "memory events in the cluster: %s - the node ran short of memory and the kubelet or the "
+                           "kernel killed or evicted pods" % ", ".join("%s %d" % e for e in mem_events),
+                    "Latest warning events"))
     if f.get("failed_units") not in (None, "none"):
         res.append(("info", "failed systemd unit(s): %s" % f["failed_units"], "Failed units"))
     if f.get("ssh_root_login") == "enabled":
